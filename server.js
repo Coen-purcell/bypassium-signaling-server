@@ -37,6 +37,7 @@ wss.on("connection", (socket) => {
     if (message.type === "register") registerClient(socket, message);
     if (message.type === "watch-contacts") sendContactStatuses(socket, message.contacts);
     if (message.type === "direct-signal") relayDirectSignal(socket, message);
+    if (message.type === "direct-message") relayDirectMessage(socket, message);
     if (message.type === "create-room") createRoom(socket);
     if (message.type === "join-room") joinRoom(socket, message.code);
     if (message.type === "signal") relayRoomSignal(socket, message);
@@ -62,7 +63,7 @@ function registerClient(socket, message) {
   socket.publicKeyJwk = message.publicKeyJwk;
   if (!clients.has(byPassiumId)) clients.set(byPassiumId, new Set());
   clients.get(byPassiumId).add(socket);
-  send(socket, { type: "registered", peerId: byPassiumId });
+  send(socket, { type: "registered", peerId: byPassiumId, features: { encryptedRelay: true } });
 }
 
 // Removes a browser session from the online directory.
@@ -83,19 +84,26 @@ function sendContactStatuses(socket, contacts = []) {
   send(socket, { type: "contact-statuses", statuses });
 }
 
-// Relays WebRTC setup messages between permanent IDs without storing chat data.
-function relayDirectSignal(socket, message) {
+function getDirectTargets(socket, message) {
   if (!socket.bypassiumId) {
     send(socket, { type: "error", message: "Register before sending direct signals." });
-    return;
+    return null;
   }
 
   const targetId = String(message.to || "").trim();
   const targets = clients.get(targetId);
   if (!targets?.size) {
     send(socket, { type: "peer-offline", peerId: targetId });
-    return;
+    return null;
   }
+
+  return targets;
+}
+
+// Relays WebRTC setup messages between permanent IDs without storing chat data.
+function relayDirectSignal(socket, message) {
+  const targets = getDirectTargets(socket, message);
+  if (!targets) return;
 
   for (const target of targets) {
     if (target !== socket && target.readyState === 1) {
@@ -105,6 +113,24 @@ function relayDirectSignal(socket, message) {
         publicKeyJwk: socket.publicKeyJwk,
         signalType: message.signalType,
         payload: message.payload
+      });
+    }
+  }
+}
+
+// Relays encrypted message envelopes when WebRTC is still reconnecting.
+function relayDirectMessage(socket, message) {
+  const targets = getDirectTargets(socket, message);
+  if (!targets) return;
+
+  for (const target of targets) {
+    if (target !== socket && target.readyState === 1) {
+      send(target, {
+        type: "direct-message",
+        from: socket.bypassiumId,
+        publicKeyJwk: socket.publicKeyJwk,
+        encrypted: message.encrypted,
+        sentAt: message.sentAt
       });
     }
   }
