@@ -4,11 +4,12 @@ import { WebSocketServer } from "ws";
 const PORT = Number(process.env.PORT || 10000);
 const ROOM_TTL_MS = 10 * 60 * 1000;
 const rooms = new Map();
+const clients = new Map();
 
 const server = http.createServer((request, response) => {
   if (request.url === "/health") {
     response.writeHead(200, { "content-type": "application/json" });
-    response.end(JSON.stringify({ ok: true, rooms: rooms.size }));
+    response.end(JSON.stringify({ ok: true, rooms: rooms.size, onlineClients: clients.size }));
     return;
   }
 
@@ -20,6 +21,8 @@ const wss = new WebSocketServer({ server });
 
 wss.on("connection", (socket) => {
   socket.peerId = crypto.randomUUID();
+  socket.bypassiumId = null;
+  socket.publicKeyJwk = null;
   socket.roomCode = null;
 
   socket.on("message", (raw) => {
@@ -31,14 +34,81 @@ wss.on("connection", (socket) => {
       return;
     }
 
+    if (message.type === "register") registerClient(socket, message);
+    if (message.type === "watch-contacts") sendContactStatuses(socket, message.contacts);
+    if (message.type === "direct-signal") relayDirectSignal(socket, message);
     if (message.type === "create-room") createRoom(socket);
     if (message.type === "join-room") joinRoom(socket, message.code);
-    if (message.type === "signal") relaySignal(socket, message);
+    if (message.type === "signal") relayRoomSignal(socket, message);
     if (message.type === "leave-room") leaveRoom(socket);
   });
 
-  socket.on("close", () => leaveRoom(socket));
+  socket.on("close", () => {
+    leaveRoom(socket);
+    unregisterClient(socket);
+  });
 });
+
+// Registers a permanent Bypassium ID while this browser session is online.
+function registerClient(socket, message) {
+  const byPassiumId = String(message.peerId || "").trim();
+  if (!/^\d{6}$/.test(byPassiumId) || !message.publicKeyJwk) {
+    send(socket, { type: "error", message: "Registration requires a 6-digit ID and public key." });
+    return;
+  }
+
+  unregisterClient(socket);
+  socket.bypassiumId = byPassiumId;
+  socket.publicKeyJwk = message.publicKeyJwk;
+  if (!clients.has(byPassiumId)) clients.set(byPassiumId, new Set());
+  clients.get(byPassiumId).add(socket);
+  send(socket, { type: "registered", peerId: byPassiumId });
+}
+
+// Removes a browser session from the online directory.
+function unregisterClient(socket) {
+  if (!socket.bypassiumId) return;
+  const sockets = clients.get(socket.bypassiumId);
+  if (sockets) {
+    sockets.delete(socket);
+    if (sockets.size === 0) clients.delete(socket.bypassiumId);
+  }
+  socket.bypassiumId = null;
+}
+
+// Reports which saved contacts are currently reachable through the signaling server.
+function sendContactStatuses(socket, contacts = []) {
+  const statuses = {};
+  for (const contactId of contacts) statuses[contactId] = clients.has(String(contactId)) ? "online" : "offline";
+  send(socket, { type: "contact-statuses", statuses });
+}
+
+// Relays WebRTC setup messages between permanent IDs without storing chat data.
+function relayDirectSignal(socket, message) {
+  if (!socket.bypassiumId) {
+    send(socket, { type: "error", message: "Register before sending direct signals." });
+    return;
+  }
+
+  const targetId = String(message.to || "").trim();
+  const targets = clients.get(targetId);
+  if (!targets?.size) {
+    send(socket, { type: "peer-offline", peerId: targetId });
+    return;
+  }
+
+  for (const target of targets) {
+    if (target !== socket && target.readyState === 1) {
+      send(target, {
+        type: "direct-signal",
+        from: socket.bypassiumId,
+        publicKeyJwk: socket.publicKeyJwk,
+        signalType: message.signalType,
+        payload: message.payload
+      });
+    }
+  }
+}
 
 // Creates a temporary six-digit room for two peers to exchange WebRTC setup data.
 function createRoom(socket) {
@@ -70,8 +140,8 @@ function joinRoom(socket, code) {
   broadcast(room, { type: "peer-ready" });
 }
 
-// Relays WebRTC setup messages to the other peer in the same room.
-function relaySignal(socket, message) {
+// Relays WebRTC setup messages to the other peer in the same temporary code room.
+function relayRoomSignal(socket, message) {
   const room = rooms.get(socket.roomCode);
   if (!room) {
     send(socket, { type: "error", message: "You are not in a connection room." });
