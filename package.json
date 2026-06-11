@@ -1,0 +1,16 @@
+{
+  "name": "bypassium-signaling-server",
+  "version": "1.0.0",
+  "description": "Temporary WebSocket signaling server for Bypassium Messenger WebRTC pairing.",
+  "main": "server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "ws": "^8.17.1"
+  }
+}
