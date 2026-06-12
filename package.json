@@ -1,7 +1,7 @@
 {
   "name": "bypassium-signaling-server",
   "version": "1.0.0",
-  "description": "Temporary WebSocket signaling server for Bypassium Messenger WebRTC pairing.",
+  "description": "Encrypted relay and persistent offline inbox server for Bypassium Messenger.",
   "main": "server.js",
   "type": "module",
   "scripts": {
@@ -11,6 +11,7 @@
     "node": ">=20"
   },
   "dependencies": {
+    "ioredis": "^5.4.1",
     "ws": "^8.17.1"
   }
 }
