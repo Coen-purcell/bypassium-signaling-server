@@ -6,17 +6,20 @@ const PORT = Number(process.env.PORT || 10000);
 const OFFLINE_MESSAGE_TTL_SECONDS = 7 * 24 * 60 * 60;
 const MAX_OFFLINE_MESSAGES_PER_USER = 100;
 const REDIS_URL = process.env.REDIS_URL || process.env.RENDER_REDIS_URL || process.env.KEY_VALUE_URL || "";
+const UPSTASH_REST_URL = process.env.UPSTASH_REDIS_REST_URL || "";
+const UPSTASH_REST_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN || "";
 const clients = new Map();
 const memoryPublicKeys = new Map();
 const memoryOfflineMessages = new Map();
 const redis = createRedisClient();
+const upstashRestEnabled = Boolean(!redis && UPSTASH_REST_URL && UPSTASH_REST_TOKEN);
 
 const server = http.createServer(async (request, response) => {
   if (request.url === "/health") {
     response.writeHead(200, { "content-type": "application/json" });
     response.end(JSON.stringify({
       ok: true,
-      storage: redis ? "redis" : "memory",
+      storage: storageMode(),
       onlineClients: clients.size,
       knownPublicKeys: await countKnownPublicKeys(),
       queuedUsers: await countQueuedUsers()
@@ -84,7 +87,7 @@ async function registerClient(socket, message) {
     features: {
       encryptedRelay: true,
       offlineInbox: true,
-      persistentOfflineInbox: Boolean(redis),
+      persistentOfflineInbox: storageMode() !== "memory",
       publicKeyDirectory: true
     }
   });
@@ -146,7 +149,7 @@ async function relayDirectMessage(socket, message) {
 
   if (!targets?.size) {
     await queueOfflineMessage(targetId, envelope);
-    send(socket, { type: "message-queued", peerId: targetId, sentAt: envelope.sentAt, persistent: Boolean(redis) });
+    send(socket, { type: "message-queued", peerId: targetId, sentAt: envelope.sentAt, persistent: storageMode() !== "memory" });
     return;
   }
 
@@ -163,6 +166,14 @@ async function queueOfflineMessage(targetId, envelope) {
     await redis.rpush(key, JSON.stringify({ ...envelope, queuedAt: Date.now() }));
     await redis.ltrim(key, -MAX_OFFLINE_MESSAGES_PER_USER, -1);
     await redis.expire(key, OFFLINE_MESSAGE_TTL_SECONDS);
+    return;
+  }
+
+  if (upstashRestEnabled) {
+    const key = inboxKey(targetId);
+    await upstashCommand(["RPUSH", key, JSON.stringify({ ...envelope, queuedAt: Date.now() })]);
+    await upstashCommand(["LTRIM", key, -MAX_OFFLINE_MESSAGES_PER_USER, -1]);
+    await upstashCommand(["EXPIRE", key, OFFLINE_MESSAGE_TTL_SECONDS]);
     return;
   }
 
@@ -184,6 +195,10 @@ async function getOfflineMessages(targetId) {
     const stored = await redis.lrange(inboxKey(targetId), 0, -1);
     return stored.map((item) => JSON.parse(item));
   }
+  if (upstashRestEnabled) {
+    const stored = await upstashCommand(["LRANGE", inboxKey(targetId), 0, -1]);
+    return stored.map((item) => JSON.parse(item));
+  }
   return memoryOfflineMessages.get(targetId) || [];
 }
 
@@ -192,18 +207,24 @@ async function deleteOfflineMessages(targetId) {
     await redis.del(inboxKey(targetId));
     return;
   }
+  if (upstashRestEnabled) {
+    await upstashCommand(["DEL", inboxKey(targetId)]);
+    return;
+  }
   memoryOfflineMessages.delete(targetId);
 }
 
 async function setPublicKey(peerId, publicKeyJwk) {
   memoryPublicKeys.set(peerId, publicKeyJwk);
   if (redis) await redis.set(publicKeyKey(peerId), JSON.stringify(publicKeyJwk));
+  if (upstashRestEnabled) await upstashCommand(["SET", publicKeyKey(peerId), JSON.stringify(publicKeyJwk)]);
 }
 
 async function getPublicKey(peerId) {
   if (memoryPublicKeys.has(peerId)) return memoryPublicKeys.get(peerId);
-  if (!redis) return null;
-  const stored = await redis.get(publicKeyKey(peerId));
+  let stored = null;
+  if (redis) stored = await redis.get(publicKeyKey(peerId));
+  if (upstashRestEnabled) stored = await upstashCommand(["GET", publicKeyKey(peerId)]);
   if (!stored) return null;
   const publicKeyJwk = JSON.parse(stored);
   memoryPublicKeys.set(peerId, publicKeyJwk);
@@ -211,16 +232,18 @@ async function getPublicKey(peerId) {
 }
 
 async function countKnownPublicKeys() {
-  if (!redis) return memoryPublicKeys.size;
+  if (!redis && !upstashRestEnabled) return memoryPublicKeys.size;
   return countKeys("bypassium:public-key:*");
 }
 
 async function countQueuedUsers() {
-  if (!redis) return memoryOfflineMessages.size;
+  if (!redis && !upstashRestEnabled) return memoryOfflineMessages.size;
   return countKeys("bypassium:inbox:*");
 }
 
 async function countKeys(pattern) {
+  if (upstashRestEnabled) return countUpstashKeys(pattern);
+
   let cursor = "0";
   let count = 0;
   do {
@@ -229,6 +252,39 @@ async function countKeys(pattern) {
     count += keys.length;
   } while (cursor !== "0");
   return count;
+}
+
+async function countUpstashKeys(pattern) {
+  let cursor = "0";
+  let count = 0;
+  do {
+    const [nextCursor, keys] = await upstashCommand(["SCAN", cursor, "MATCH", pattern, "COUNT", 100]);
+    cursor = String(nextCursor);
+    count += keys.length;
+  } while (cursor !== "0");
+  return count;
+}
+
+async function upstashCommand(command) {
+  const response = await fetch(UPSTASH_REST_URL, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${UPSTASH_REST_TOKEN}`,
+      "content-type": "application/json"
+    },
+    body: JSON.stringify(command)
+  });
+  const payload = await response.json();
+  if (!response.ok || payload.error) {
+    throw new Error(payload.error || `Upstash command failed with ${response.status}`);
+  }
+  return payload.result;
+}
+
+function storageMode() {
+  if (redis) return "redis";
+  if (upstashRestEnabled) return "upstash-rest";
+  return "memory";
 }
 
 function publicKeyKey(peerId) {
