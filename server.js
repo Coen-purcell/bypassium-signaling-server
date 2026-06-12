@@ -3,13 +3,16 @@ import { WebSocketServer } from "ws";
 
 const PORT = Number(process.env.PORT || 10000);
 const ROOM_TTL_MS = 10 * 60 * 1000;
+const OFFLINE_MESSAGE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const MAX_OFFLINE_MESSAGES_PER_USER = 100;
 const rooms = new Map();
 const clients = new Map();
+const offlineMessages = new Map();
 
 const server = http.createServer((request, response) => {
   if (request.url === "/health") {
     response.writeHead(200, { "content-type": "application/json" });
-    response.end(JSON.stringify({ ok: true, rooms: rooms.size, onlineClients: clients.size }));
+    response.end(JSON.stringify({ ok: true, rooms: rooms.size, onlineClients: clients.size, queuedUsers: offlineMessages.size }));
     return;
   }
 
@@ -63,7 +66,8 @@ function registerClient(socket, message) {
   socket.publicKeyJwk = message.publicKeyJwk;
   if (!clients.has(byPassiumId)) clients.set(byPassiumId, new Set());
   clients.get(byPassiumId).add(socket);
-  send(socket, { type: "registered", peerId: byPassiumId, features: { encryptedRelay: true } });
+  send(socket, { type: "registered", peerId: byPassiumId, features: { encryptedRelay: true, offlineInbox: true } });
+  deliverOfflineMessages(socket);
 }
 
 // Removes a browser session from the online directory.
@@ -100,6 +104,14 @@ function getDirectTargets(socket, message) {
   return targets;
 }
 
+function getRegisteredSender(socket) {
+  if (!socket.bypassiumId) {
+    send(socket, { type: "error", message: "Register before sending direct messages." });
+    return null;
+  }
+  return socket.bypassiumId;
+}
+
 // Relays WebRTC setup messages between permanent IDs without storing chat data.
 function relayDirectSignal(socket, message) {
   const targets = getDirectTargets(socket, message);
@@ -120,20 +132,45 @@ function relayDirectSignal(socket, message) {
 
 // Relays encrypted message envelopes when WebRTC is still reconnecting.
 function relayDirectMessage(socket, message) {
-  const targets = getDirectTargets(socket, message);
-  if (!targets) return;
+  const senderId = getRegisteredSender(socket);
+  if (!senderId) return;
+
+  const targetId = String(message.to || "").trim();
+  const targets = clients.get(targetId);
+  const envelope = {
+    type: "direct-message",
+    from: senderId,
+    publicKeyJwk: socket.publicKeyJwk,
+    encrypted: message.encrypted,
+    sentAt: message.sentAt || new Date().toISOString()
+  };
+
+  if (!targets?.size) {
+    queueOfflineMessage(targetId, envelope);
+    send(socket, { type: "message-queued", peerId: targetId });
+    return;
+  }
 
   for (const target of targets) {
     if (target !== socket && target.readyState === 1) {
-      send(target, {
-        type: "direct-message",
-        from: socket.bypassiumId,
-        publicKeyJwk: socket.publicKeyJwk,
-        encrypted: message.encrypted,
-        sentAt: message.sentAt
-      });
+      send(target, envelope);
     }
   }
+  send(socket, { type: "message-relayed", peerId: targetId });
+}
+
+function queueOfflineMessage(targetId, envelope) {
+  if (!/^\d{6}$/.test(targetId) || !envelope.encrypted) return;
+  const queue = offlineMessages.get(targetId) || [];
+  queue.push({ ...envelope, queuedAt: Date.now() });
+  offlineMessages.set(targetId, queue.slice(-MAX_OFFLINE_MESSAGES_PER_USER));
+}
+
+function deliverOfflineMessages(socket) {
+  const queue = offlineMessages.get(socket.bypassiumId) || [];
+  const fresh = queue.filter((message) => Date.now() - message.queuedAt <= OFFLINE_MESSAGE_TTL_MS);
+  for (const message of fresh) send(socket, message);
+  offlineMessages.delete(socket.bypassiumId);
 }
 
 // Creates a temporary six-digit room for two peers to exchange WebRTC setup data.
