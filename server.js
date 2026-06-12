@@ -1,21 +1,25 @@
 import http from "node:http";
+import Redis from "ioredis";
 import { WebSocketServer } from "ws";
 
 const PORT = Number(process.env.PORT || 10000);
-const OFFLINE_MESSAGE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const OFFLINE_MESSAGE_TTL_SECONDS = 7 * 24 * 60 * 60;
 const MAX_OFFLINE_MESSAGES_PER_USER = 100;
+const REDIS_URL = process.env.REDIS_URL || process.env.RENDER_REDIS_URL || process.env.KEY_VALUE_URL || "";
 const clients = new Map();
-const publicKeys = new Map();
-const offlineMessages = new Map();
+const memoryPublicKeys = new Map();
+const memoryOfflineMessages = new Map();
+const redis = createRedisClient();
 
-const server = http.createServer((request, response) => {
+const server = http.createServer(async (request, response) => {
   if (request.url === "/health") {
     response.writeHead(200, { "content-type": "application/json" });
     response.end(JSON.stringify({
       ok: true,
+      storage: redis ? "redis" : "memory",
       onlineClients: clients.size,
-      knownPublicKeys: publicKeys.size,
-      queuedUsers: offlineMessages.size
+      knownPublicKeys: await countKnownPublicKeys(),
+      queuedUsers: await countQueuedUsers()
     }));
     return;
   }
@@ -30,7 +34,7 @@ wss.on("connection", (socket) => {
   socket.bypassiumId = null;
   socket.publicKeyJwk = null;
 
-  socket.on("message", (raw) => {
+  socket.on("message", async (raw) => {
     let message;
     try {
       message = JSON.parse(raw.toString());
@@ -39,16 +43,29 @@ wss.on("connection", (socket) => {
       return;
     }
 
-    if (message.type === "register") registerClient(socket, message);
-    if (message.type === "watch-contacts") sendContactStatuses(socket, message.contacts);
-    if (message.type === "direct-message") relayDirectMessage(socket, message);
+    if (message.type === "register") await registerClient(socket, message);
+    if (message.type === "watch-contacts") await sendContactStatuses(socket, message.contacts);
+    if (message.type === "direct-message") await relayDirectMessage(socket, message);
   });
 
   socket.on("close", () => unregisterClient(socket));
 });
 
-// Registers a permanent Bypassium ID and keeps its public key available for encrypted relay messages.
-function registerClient(socket, message) {
+function createRedisClient() {
+  if (!REDIS_URL) return null;
+  const client = new Redis(REDIS_URL, {
+    lazyConnect: false,
+    maxRetriesPerRequest: 2,
+    enableReadyCheck: true
+  });
+  client.on("error", (error) => {
+    console.error("Redis storage error:", error.message);
+  });
+  return client;
+}
+
+// Registers a permanent Bypassium ID and persists its public key for encrypted relay messages.
+async function registerClient(socket, message) {
   const byPassiumId = String(message.peerId || "").trim();
   if (!/^\d{6}$/.test(byPassiumId) || !message.publicKeyJwk) {
     send(socket, { type: "error", message: "Registration requires a 6-digit ID and public key." });
@@ -58,7 +75,7 @@ function registerClient(socket, message) {
   unregisterClient(socket);
   socket.bypassiumId = byPassiumId;
   socket.publicKeyJwk = message.publicKeyJwk;
-  publicKeys.set(byPassiumId, message.publicKeyJwk);
+  await setPublicKey(byPassiumId, message.publicKeyJwk);
   if (!clients.has(byPassiumId)) clients.set(byPassiumId, new Set());
   clients.get(byPassiumId).add(socket);
   send(socket, {
@@ -67,13 +84,14 @@ function registerClient(socket, message) {
     features: {
       encryptedRelay: true,
       offlineInbox: true,
+      persistentOfflineInbox: Boolean(redis),
       publicKeyDirectory: true
     }
   });
-  deliverOfflineMessages(socket);
+  await deliverOfflineMessages(socket);
 }
 
-// Removes a browser session from the online directory without deleting its known public key.
+// Removes a browser session from the online directory without deleting its persisted public key.
 function unregisterClient(socket) {
   if (!socket.bypassiumId) return;
   const sockets = clients.get(socket.bypassiumId);
@@ -84,15 +102,16 @@ function unregisterClient(socket) {
   socket.bypassiumId = null;
 }
 
-// Reports which saved contacts are online and returns public keys that are known to the server.
-function sendContactStatuses(socket, contacts = []) {
+// Reports which saved contacts are online and returns public keys known to the server.
+async function sendContactStatuses(socket, contacts = []) {
   const statuses = {};
   const knownKeys = {};
   for (const rawContactId of contacts) {
     const contactId = String(rawContactId || "").trim();
     if (!/^\d{6}$/.test(contactId)) continue;
     statuses[contactId] = clients.has(contactId) ? "online" : "offline";
-    if (publicKeys.has(contactId)) knownKeys[contactId] = publicKeys.get(contactId);
+    const publicKeyJwk = await getPublicKey(contactId);
+    if (publicKeyJwk) knownKeys[contactId] = publicKeyJwk;
   }
   send(socket, { type: "contact-statuses", statuses, publicKeys: knownKeys });
 }
@@ -106,7 +125,7 @@ function getRegisteredSender(socket) {
 }
 
 // Relays encrypted message envelopes or queues them until the receiver reconnects.
-function relayDirectMessage(socket, message) {
+async function relayDirectMessage(socket, message) {
   const senderId = getRegisteredSender(socket);
   if (!senderId) return;
 
@@ -126,8 +145,8 @@ function relayDirectMessage(socket, message) {
   const targets = clients.get(targetId);
 
   if (!targets?.size) {
-    queueOfflineMessage(targetId, envelope);
-    send(socket, { type: "message-queued", peerId: targetId, sentAt: envelope.sentAt });
+    await queueOfflineMessage(targetId, envelope);
+    send(socket, { type: "message-queued", peerId: targetId, sentAt: envelope.sentAt, persistent: Boolean(redis) });
     return;
   }
 
@@ -137,19 +156,87 @@ function relayDirectMessage(socket, message) {
   send(socket, { type: "message-relayed", peerId: targetId, sentAt: envelope.sentAt });
 }
 
-// Stores encrypted messages only. The server cannot decrypt message text.
-function queueOfflineMessage(targetId, envelope) {
-  const queue = offlineMessages.get(targetId) || [];
+// Stores encrypted messages only. Redis makes them survive Render service restarts.
+async function queueOfflineMessage(targetId, envelope) {
+  if (redis) {
+    const key = inboxKey(targetId);
+    await redis.rpush(key, JSON.stringify({ ...envelope, queuedAt: Date.now() }));
+    await redis.ltrim(key, -MAX_OFFLINE_MESSAGES_PER_USER, -1);
+    await redis.expire(key, OFFLINE_MESSAGE_TTL_SECONDS);
+    return;
+  }
+
+  const queue = memoryOfflineMessages.get(targetId) || [];
   queue.push({ ...envelope, queuedAt: Date.now() });
-  offlineMessages.set(targetId, queue.slice(-MAX_OFFLINE_MESSAGES_PER_USER));
+  memoryOfflineMessages.set(targetId, queue.slice(-MAX_OFFLINE_MESSAGES_PER_USER));
 }
 
-// Delivers queued messages with their original sentAt time, then deletes them from memory.
-function deliverOfflineMessages(socket) {
-  const queue = offlineMessages.get(socket.bypassiumId) || [];
-  const fresh = queue.filter((message) => Date.now() - message.queuedAt <= OFFLINE_MESSAGE_TTL_MS);
+// Delivers queued messages with their original sentAt time, then deletes them from storage.
+async function deliverOfflineMessages(socket) {
+  const queue = await getOfflineMessages(socket.bypassiumId);
+  const fresh = queue.filter((message) => Date.now() - message.queuedAt <= OFFLINE_MESSAGE_TTL_SECONDS * 1000);
   for (const message of fresh) send(socket, message);
-  offlineMessages.delete(socket.bypassiumId);
+  await deleteOfflineMessages(socket.bypassiumId);
+}
+
+async function getOfflineMessages(targetId) {
+  if (redis) {
+    const stored = await redis.lrange(inboxKey(targetId), 0, -1);
+    return stored.map((item) => JSON.parse(item));
+  }
+  return memoryOfflineMessages.get(targetId) || [];
+}
+
+async function deleteOfflineMessages(targetId) {
+  if (redis) {
+    await redis.del(inboxKey(targetId));
+    return;
+  }
+  memoryOfflineMessages.delete(targetId);
+}
+
+async function setPublicKey(peerId, publicKeyJwk) {
+  memoryPublicKeys.set(peerId, publicKeyJwk);
+  if (redis) await redis.set(publicKeyKey(peerId), JSON.stringify(publicKeyJwk));
+}
+
+async function getPublicKey(peerId) {
+  if (memoryPublicKeys.has(peerId)) return memoryPublicKeys.get(peerId);
+  if (!redis) return null;
+  const stored = await redis.get(publicKeyKey(peerId));
+  if (!stored) return null;
+  const publicKeyJwk = JSON.parse(stored);
+  memoryPublicKeys.set(peerId, publicKeyJwk);
+  return publicKeyJwk;
+}
+
+async function countKnownPublicKeys() {
+  if (!redis) return memoryPublicKeys.size;
+  return countKeys("bypassium:public-key:*");
+}
+
+async function countQueuedUsers() {
+  if (!redis) return memoryOfflineMessages.size;
+  return countKeys("bypassium:inbox:*");
+}
+
+async function countKeys(pattern) {
+  let cursor = "0";
+  let count = 0;
+  do {
+    const [nextCursor, keys] = await redis.scan(cursor, "MATCH", pattern, "COUNT", 100);
+    cursor = nextCursor;
+    count += keys.length;
+  } while (cursor !== "0");
+  return count;
+}
+
+function publicKeyKey(peerId) {
+  return `bypassium:public-key:${peerId}`;
+}
+
+function inboxKey(peerId) {
+  return `bypassium:inbox:${peerId}`;
 }
 
 function send(socket, message) {
