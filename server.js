@@ -5,12 +5,15 @@ import { WebSocketServer } from "ws";
 
 const PORT = Number(process.env.PORT || 10000);
 const OFFLINE_MESSAGE_TTL_SECONDS = 7 * 24 * 60 * 60;
-const MAX_OFFLINE_MESSAGES_PER_USER = 100;
+const MAX_OFFLINE_MESSAGES_PER_USER = 50;
+const MAX_PROFILE_PICTURE_CHARS = 18000;
 const REDIS_URL = process.env.REDIS_URL || process.env.RENDER_REDIS_URL || process.env.KEY_VALUE_URL || "";
 const UPSTASH_REST_URL = process.env.UPSTASH_REDIS_REST_URL || "";
 const UPSTASH_REST_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN || "";
 const clients = new Map();
 const memoryPublicKeys = new Map();
+const memoryProfiles = new Map();
+const memoryGroups = new Map();
 const memoryOfflineMessages = new Map();
 const redis = createRedisClient();
 const upstashRestEnabled = Boolean(!redis && UPSTASH_REST_URL && UPSTASH_REST_TOKEN);
@@ -23,6 +26,7 @@ const server = http.createServer(async (request, response) => {
       storage: storageMode(),
       onlineClients: clients.size,
       knownPublicKeys: await countKnownPublicKeys(),
+      groups: await countGroups(),
       queuedUsers: await countQueuedUsers()
     }));
     return;
@@ -49,7 +53,13 @@ wss.on("connection", (socket) => {
 
     if (message.type === "register") await registerClient(socket, message);
     if (message.type === "watch-contacts") await sendContactStatuses(socket, message.contacts);
+    if (message.type === "publish-profile") await publishProfile(socket, message.profile);
+    if (message.type === "create-group") await createGroup(socket, message);
+    if (message.type === "rename-group") await renameGroup(socket, message);
+    if (message.type === "add-group-members") await addGroupMembers(socket, message);
+    if (message.type === "leave-group") await leaveGroup(socket, message);
     if (message.type === "direct-message") await relayDirectMessage(socket, message);
+    if (message.type === "group-message") await relayGroupMessage(socket, message);
     if (message.type === "ack-message") await acknowledgeMessage(socket, message);
   });
 
@@ -86,12 +96,15 @@ async function registerClient(socket, message) {
   send(socket, {
     type: "registered",
     peerId: byPassiumId,
+    groups: await getGroupsForMember(byPassiumId),
     features: {
       encryptedRelay: true,
       offlineInbox: true,
       ackedOfflineInbox: true,
       persistentOfflineInbox: storageMode() !== "memory",
-      publicKeyDirectory: true
+      publicKeyDirectory: true,
+      profiles: true,
+      groups: true
     }
   });
   await deliverOfflineMessages(socket);
@@ -112,14 +125,19 @@ function unregisterClient(socket) {
 async function sendContactStatuses(socket, contacts = []) {
   const statuses = {};
   const knownKeys = {};
+  const profiles = {};
+  socket.watchedContacts = new Set();
   for (const rawContactId of contacts) {
     const contactId = String(rawContactId || "").trim();
     if (!/^\d{6}$/.test(contactId)) continue;
+    socket.watchedContacts.add(contactId);
     statuses[contactId] = clients.has(contactId) ? "online" : "offline";
     const publicKeyJwk = await getPublicKey(contactId);
     if (publicKeyJwk) knownKeys[contactId] = publicKeyJwk;
+    const profile = await getProfile(contactId);
+    if (profile) profiles[contactId] = profile;
   }
-  send(socket, { type: "contact-statuses", statuses, publicKeys: knownKeys });
+  send(socket, { type: "contact-statuses", statuses, publicKeys: knownKeys, profiles });
 }
 
 function getRegisteredSender(socket) {
@@ -145,6 +163,7 @@ async function relayDirectMessage(socket, message) {
     type: "direct-message",
     messageId: message.messageId || randomUUID(),
     from: senderId,
+    profile: sanitizeProfile(await getProfile(senderId)),
     publicKeyJwk: socket.publicKeyJwk,
     encrypted: message.encrypted,
     sentAt: message.sentAt || new Date().toISOString()
@@ -163,6 +182,44 @@ async function relayDirectMessage(socket, message) {
   send(socket, { type: "message-relayed", peerId: targetId, sentAt: envelope.sentAt });
 }
 
+// Relays one encrypted group message copy per recipient and queues each copy until acked.
+async function relayGroupMessage(socket, message) {
+  const senderId = getRegisteredSender(socket);
+  if (!senderId) return;
+  const group = await getGroup(message.groupId);
+  if (!group || !group.members.includes(senderId)) {
+    send(socket, { type: "error", message: "You are not a member of this group." });
+    return;
+  }
+  const recipients = Array.isArray(message.recipients) ? message.recipients : [];
+  const sentAt = message.sentAt || new Date().toISOString();
+  const messageId = message.messageId || randomUUID();
+  for (const recipient of recipients) {
+    const targetId = String(recipient.to || "").trim();
+    if (targetId === senderId || !group.members.includes(targetId) || !recipient.encrypted) continue;
+    const envelope = {
+      type: "group-message",
+      messageId,
+      groupId: group.id,
+      groupName: group.name,
+      members: group.members,
+      from: senderId,
+      profile: sanitizeProfile(await getProfile(senderId)),
+      publicKeyJwk: socket.publicKeyJwk,
+      encrypted: recipient.encrypted,
+      sentAt
+    };
+    await queueOfflineMessage(targetId, envelope);
+    const targets = clients.get(targetId);
+    if (targets?.size) {
+      for (const target of targets) {
+        if (target !== socket && target.readyState === 1) send(target, envelope);
+      }
+    }
+  }
+  send(socket, { type: "message-relayed", peerId: group.id, sentAt });
+}
+
 // Deletes a queued encrypted message only after the recipient extension saved it locally.
 async function acknowledgeMessage(socket, message) {
   const targetId = getRegisteredSender(socket);
@@ -174,6 +231,67 @@ async function acknowledgeMessage(socket, message) {
   }
   await removeOfflineMessage(targetId, messageId);
   send(socket, { type: "message-acknowledged", messageId });
+}
+
+// Stores a user's public profile so contacts can display their current picture.
+async function publishProfile(socket, profile = {}) {
+  const peerId = getRegisteredSender(socket);
+  if (!peerId) return;
+  const cleanProfile = sanitizeProfile(profile, true);
+  await setProfile(peerId, cleanProfile);
+  broadcastProfileUpdate(peerId, cleanProfile);
+}
+
+async function createGroup(socket, message) {
+  const creatorId = getRegisteredSender(socket);
+  if (!creatorId) return;
+  const members = normalizeMembers([creatorId, ...(message.members || [])]);
+  const group = {
+    id: randomUUID(),
+    name: String(message.name || "New group").slice(0, 80),
+    members,
+    createdBy: creatorId,
+    updatedAt: new Date().toISOString()
+  };
+  await setGroup(group);
+  broadcastGroupUpdate(group);
+}
+
+async function renameGroup(socket, message) {
+  const peerId = getRegisteredSender(socket);
+  if (!peerId) return;
+  const group = await getGroup(message.groupId);
+  if (!group || !group.members.includes(peerId)) return;
+  group.name = String(message.name || group.name).slice(0, 80);
+  group.updatedAt = new Date().toISOString();
+  await setGroup(group);
+  broadcastGroupUpdate(group);
+}
+
+async function addGroupMembers(socket, message) {
+  const peerId = getRegisteredSender(socket);
+  if (!peerId) return;
+  const group = await getGroup(message.groupId);
+  if (!group || !group.members.includes(peerId)) return;
+  group.members = normalizeMembers([...group.members, ...(message.members || [])]);
+  group.updatedAt = new Date().toISOString();
+  await setGroup(group);
+  broadcastGroupUpdate(group);
+}
+
+async function leaveGroup(socket, message) {
+  const peerId = getRegisteredSender(socket);
+  if (!peerId) return;
+  const group = await getGroup(message.groupId);
+  if (!group || !group.members.includes(peerId)) return;
+  group.members = group.members.filter((member) => member !== peerId);
+  group.updatedAt = new Date().toISOString();
+  if (group.members.length) {
+    await setGroup(group);
+    broadcastGroupUpdate(group, [peerId]);
+  } else {
+    await deleteGroup(group.id);
+  }
 }
 
 // Stores encrypted messages only. Redis makes them survive Render service restarts.
@@ -265,9 +383,94 @@ async function getPublicKey(peerId) {
   return publicKeyJwk;
 }
 
+async function setProfile(peerId, profile) {
+  memoryProfiles.set(peerId, profile);
+  if (redis) await redis.set(profileKey(peerId), JSON.stringify(profile));
+  if (upstashRestEnabled) await upstashCommand(["SET", profileKey(peerId), JSON.stringify(profile)]);
+}
+
+async function getProfile(peerId) {
+  if (memoryProfiles.has(peerId)) return memoryProfiles.get(peerId);
+  let stored = null;
+  if (redis) stored = await redis.get(profileKey(peerId));
+  if (upstashRestEnabled) stored = await upstashCommand(["GET", profileKey(peerId)]);
+  if (!stored) return null;
+  const profile = JSON.parse(stored);
+  memoryProfiles.set(peerId, profile);
+  return profile;
+}
+
+async function setGroup(group) {
+  memoryGroups.set(group.id, group);
+  if (redis) await redis.set(groupKey(group.id), JSON.stringify(group));
+  if (upstashRestEnabled) await upstashCommand(["SET", groupKey(group.id), JSON.stringify(group)]);
+}
+
+async function getGroup(groupId) {
+  const cleanGroupId = String(groupId || "").trim();
+  if (!cleanGroupId) return null;
+  if (memoryGroups.has(cleanGroupId)) return memoryGroups.get(cleanGroupId);
+  let stored = null;
+  if (redis) stored = await redis.get(groupKey(cleanGroupId));
+  if (upstashRestEnabled) stored = await upstashCommand(["GET", groupKey(cleanGroupId)]);
+  if (!stored) return null;
+  const group = JSON.parse(stored);
+  memoryGroups.set(group.id, group);
+  return group;
+}
+
+async function deleteGroup(groupId) {
+  memoryGroups.delete(groupId);
+  if (redis) await redis.del(groupKey(groupId));
+  if (upstashRestEnabled) await upstashCommand(["DEL", groupKey(groupId)]);
+}
+
+async function getGroupsForMember(peerId) {
+  const groups = await getAllGroups();
+  return groups.filter((group) => group.members.includes(peerId));
+}
+
+async function getAllGroups() {
+  if (!redis && !upstashRestEnabled) return [...memoryGroups.values()];
+  const keys = await listKeys("bypassium:group:*");
+  const groups = [];
+  for (const key of keys) {
+    let stored = null;
+    if (redis) stored = await redis.get(key);
+    if (upstashRestEnabled) stored = await upstashCommand(["GET", key]);
+    if (stored) groups.push(JSON.parse(stored));
+  }
+  return groups;
+}
+
+function broadcastGroupUpdate(group, extraMemberIds = []) {
+  for (const memberId of normalizeMembers([...group.members, ...extraMemberIds])) {
+    const sockets = clients.get(memberId);
+    if (!sockets) continue;
+    for (const socket of sockets) send(socket, { type: "group-updated", group });
+  }
+}
+
+function broadcastProfileUpdate(peerId, profile) {
+  for (const sockets of clients.values()) {
+    for (const socket of sockets) {
+      if (socket.watchedContacts?.has(peerId)) send(socket, { type: "profile-updated", peerId, profile });
+    }
+  }
+}
+
+function normalizeMembers(members) {
+  return [...new Set(members.map((member) => String(member || "").trim()).filter((member) => /^\d{6}$/.test(member)))];
+}
+
 async function countKnownPublicKeys() {
   if (!redis && !upstashRestEnabled) return memoryPublicKeys.size;
   return countKeys("bypassium:public-key:*");
+}
+
+async function countGroups() {
+  if (!redis && !upstashRestEnabled) return memoryGroups.size;
+  return countKeys("bypassium:group:*");
 }
 
 async function countQueuedUsers() {
@@ -276,27 +479,32 @@ async function countQueuedUsers() {
 }
 
 async function countKeys(pattern) {
+  const keys = await listKeys(pattern);
+  return keys.length;
+}
+
+async function listKeys(pattern) {
   if (upstashRestEnabled) return countUpstashKeys(pattern);
 
   let cursor = "0";
-  let count = 0;
+  let found = [];
   do {
     const [nextCursor, keys] = await redis.scan(cursor, "MATCH", pattern, "COUNT", 100);
     cursor = nextCursor;
-    count += keys.length;
+    found = found.concat(keys);
   } while (cursor !== "0");
-  return count;
+  return found;
 }
 
 async function countUpstashKeys(pattern) {
   let cursor = "0";
-  let count = 0;
+  let found = [];
   do {
     const [nextCursor, keys] = await upstashCommand(["SCAN", cursor, "MATCH", pattern, "COUNT", 100]);
     cursor = String(nextCursor);
-    count += keys.length;
+    found = found.concat(keys);
   } while (cursor !== "0");
-  return count;
+  return found;
 }
 
 async function upstashCommand(command) {
@@ -321,8 +529,33 @@ function storageMode() {
   return "memory";
 }
 
+function sanitizeProfile(profile = {}, stampUpdate = false) {
+  const cleanProfile = {
+    displayName: String(profile?.displayName || "").slice(0, 80),
+    profilePicture: sanitizeProfilePicture(profile?.profilePicture)
+  };
+  if (stampUpdate) cleanProfile.updatedAt = new Date().toISOString();
+  else if (profile?.updatedAt) cleanProfile.updatedAt = String(profile.updatedAt).slice(0, 40);
+  return cleanProfile;
+}
+
+function sanitizeProfilePicture(value = "") {
+  const picture = String(value || "");
+  if (!picture) return "";
+  if (!picture.startsWith("data:image/")) return "";
+  return picture.slice(0, MAX_PROFILE_PICTURE_CHARS);
+}
+
 function publicKeyKey(peerId) {
   return `bypassium:public-key:${peerId}`;
+}
+
+function profileKey(peerId) {
+  return `bypassium:profile:${peerId}`;
+}
+
+function groupKey(groupId) {
+  return `bypassium:group:${groupId}`;
 }
 
 function inboxKey(peerId) {
