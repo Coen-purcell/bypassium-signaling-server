@@ -61,6 +61,8 @@ wss.on("connection", (socket) => {
     if (message.type === "direct-message") await relayDirectMessage(socket, message);
     if (message.type === "group-message") await relayGroupMessage(socket, message);
     if (message.type === "ack-message") await acknowledgeMessage(socket, message);
+    if (message.type === "typing") await relayTyping(socket, message);
+    if (message.type === "read-receipt") await relayReadReceipt(socket, message);
   });
 
   socket.on("close", () => unregisterClient(socket));
@@ -231,6 +233,48 @@ async function acknowledgeMessage(socket, message) {
   }
   await removeOfflineMessage(targetId, messageId);
   send(socket, { type: "message-acknowledged", messageId });
+}
+
+async function relayTyping(socket, message) {
+  const senderId = getRegisteredSender(socket);
+  if (!senderId) return;
+  const groupId = String(message.groupId || "").trim();
+  if (groupId) {
+    const group = await getGroup(groupId);
+    if (!group || !group.members.includes(senderId)) return;
+    for (const memberId of group.members) {
+      if (memberId === senderId) continue;
+      sendToClient(memberId, {
+        type: "typing",
+        from: senderId,
+        groupId,
+        isTyping: Boolean(message.isTyping)
+      }, socket);
+    }
+    return;
+  }
+
+  const targetId = String(message.to || "").trim();
+  if (!/^\d{6}$/.test(targetId)) return;
+  sendToClient(targetId, {
+    type: "typing",
+    from: senderId,
+    isTyping: Boolean(message.isTyping)
+  }, socket);
+}
+
+async function relayReadReceipt(socket, message) {
+  const senderId = getRegisteredSender(socket);
+  if (!senderId) return;
+  const targetId = String(message.to || "").trim();
+  const messageId = String(message.messageId || "").trim();
+  if (!/^\d{6}$/.test(targetId) || !messageId) return;
+  sendToClient(targetId, {
+    type: "read-receipt",
+    from: senderId,
+    messageId,
+    readAt: message.readAt || new Date().toISOString()
+  }, socket);
 }
 
 // Stores a user's public profile so contacts can display their current picture.
@@ -560,6 +604,14 @@ function groupKey(groupId) {
 
 function inboxKey(peerId) {
   return `bypassium:inbox:${peerId}`;
+}
+
+function sendToClient(peerId, message, exceptSocket = null) {
+  const sockets = clients.get(peerId);
+  if (!sockets) return;
+  for (const socket of sockets) {
+    if (socket !== exceptSocket && socket.readyState === 1) send(socket, message);
+  }
 }
 
 function send(socket, message) {
