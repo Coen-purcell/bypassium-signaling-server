@@ -1,4 +1,5 @@
 import http from "node:http";
+import { randomUUID } from "node:crypto";
 import Redis from "ioredis";
 import { WebSocketServer } from "ws";
 
@@ -49,6 +50,7 @@ wss.on("connection", (socket) => {
     if (message.type === "register") await registerClient(socket, message);
     if (message.type === "watch-contacts") await sendContactStatuses(socket, message.contacts);
     if (message.type === "direct-message") await relayDirectMessage(socket, message);
+    if (message.type === "ack-message") await acknowledgeMessage(socket, message);
   });
 
   socket.on("close", () => unregisterClient(socket));
@@ -87,6 +89,7 @@ async function registerClient(socket, message) {
     features: {
       encryptedRelay: true,
       offlineInbox: true,
+      ackedOfflineInbox: true,
       persistentOfflineInbox: storageMode() !== "memory",
       publicKeyDirectory: true
     }
@@ -140,15 +143,16 @@ async function relayDirectMessage(socket, message) {
 
   const envelope = {
     type: "direct-message",
+    messageId: message.messageId || randomUUID(),
     from: senderId,
     publicKeyJwk: socket.publicKeyJwk,
     encrypted: message.encrypted,
     sentAt: message.sentAt || new Date().toISOString()
   };
   const targets = clients.get(targetId);
+  await queueOfflineMessage(targetId, envelope);
 
   if (!targets?.size) {
-    await queueOfflineMessage(targetId, envelope);
     send(socket, { type: "message-queued", peerId: targetId, sentAt: envelope.sentAt, persistent: storageMode() !== "memory" });
     return;
   }
@@ -157,6 +161,19 @@ async function relayDirectMessage(socket, message) {
     if (target !== socket && target.readyState === 1) send(target, envelope);
   }
   send(socket, { type: "message-relayed", peerId: targetId, sentAt: envelope.sentAt });
+}
+
+// Deletes a queued encrypted message only after the recipient extension saved it locally.
+async function acknowledgeMessage(socket, message) {
+  const targetId = getRegisteredSender(socket);
+  if (!targetId) return;
+  const messageId = String(message.messageId || "").trim();
+  if (!messageId) {
+    send(socket, { type: "error", message: "Acknowledgement requires a message ID." });
+    return;
+  }
+  await removeOfflineMessage(targetId, messageId);
+  send(socket, { type: "message-acknowledged", messageId });
 }
 
 // Stores encrypted messages only. Redis makes them survive Render service restarts.
@@ -182,12 +199,12 @@ async function queueOfflineMessage(targetId, envelope) {
   memoryOfflineMessages.set(targetId, queue.slice(-MAX_OFFLINE_MESSAGES_PER_USER));
 }
 
-// Delivers queued messages with their original sentAt time, then deletes them from storage.
+// Delivers queued messages with their original sentAt time. Messages stay queued until acked.
 async function deliverOfflineMessages(socket) {
   const queue = await getOfflineMessages(socket.bypassiumId);
   const fresh = queue.filter((message) => Date.now() - message.queuedAt <= OFFLINE_MESSAGE_TTL_SECONDS * 1000);
   for (const message of fresh) send(socket, message);
-  await deleteOfflineMessages(socket.bypassiumId);
+  if (fresh.length !== queue.length) await replaceOfflineMessages(socket.bypassiumId, fresh);
 }
 
 async function getOfflineMessages(targetId) {
@@ -202,16 +219,33 @@ async function getOfflineMessages(targetId) {
   return memoryOfflineMessages.get(targetId) || [];
 }
 
-async function deleteOfflineMessages(targetId) {
+async function removeOfflineMessage(targetId, messageId) {
+  const queue = await getOfflineMessages(targetId);
+  const remaining = queue.filter((message) => message.messageId !== messageId);
+  if (remaining.length !== queue.length) await replaceOfflineMessages(targetId, remaining);
+}
+
+async function replaceOfflineMessages(targetId, messages) {
   if (redis) {
-    await redis.del(inboxKey(targetId));
+    const key = inboxKey(targetId);
+    await redis.del(key);
+    if (messages.length) {
+      await redis.rpush(key, ...messages.map((message) => JSON.stringify(message)));
+      await redis.expire(key, OFFLINE_MESSAGE_TTL_SECONDS);
+    }
     return;
   }
   if (upstashRestEnabled) {
-    await upstashCommand(["DEL", inboxKey(targetId)]);
+    const key = inboxKey(targetId);
+    await upstashCommand(["DEL", key]);
+    if (messages.length) {
+      await upstashCommand(["RPUSH", key, ...messages.map((message) => JSON.stringify(message))]);
+      await upstashCommand(["EXPIRE", key, OFFLINE_MESSAGE_TTL_SECONDS]);
+    }
     return;
   }
-  memoryOfflineMessages.delete(targetId);
+  if (messages.length) memoryOfflineMessages.set(targetId, messages);
+  else memoryOfflineMessages.delete(targetId);
 }
 
 async function setPublicKey(peerId, publicKeyJwk) {
