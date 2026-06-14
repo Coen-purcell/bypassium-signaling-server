@@ -5,8 +5,10 @@ import { WebSocketServer } from "ws";
 
 const PORT = Number(process.env.PORT || 10000);
 const OFFLINE_MESSAGE_TTL_SECONDS = 7 * 24 * 60 * 60;
-const MAX_OFFLINE_MESSAGES_PER_USER = 50;
+const MAX_OFFLINE_MESSAGES_PER_USER = 30;
 const MAX_PROFILE_PICTURE_CHARS = 18000;
+const MAX_UPSTASH_RPUSH_ITEMS = 4;
+const MAX_UPSTASH_RPUSH_CHARS = 6_000_000;
 const REDIS_URL = process.env.REDIS_URL || process.env.RENDER_REDIS_URL || process.env.KEY_VALUE_URL || "";
 const UPSTASH_REST_URL = process.env.UPSTASH_REDIS_REST_URL || "";
 const UPSTASH_REST_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN || "";
@@ -51,18 +53,24 @@ wss.on("connection", (socket) => {
       return;
     }
 
-    if (message.type === "register") await registerClient(socket, message);
-    if (message.type === "watch-contacts") await sendContactStatuses(socket, message.contacts);
-    if (message.type === "publish-profile") await publishProfile(socket, message.profile);
-    if (message.type === "create-group") await createGroup(socket, message);
-    if (message.type === "rename-group") await renameGroup(socket, message);
-    if (message.type === "add-group-members") await addGroupMembers(socket, message);
-    if (message.type === "leave-group") await leaveGroup(socket, message);
-    if (message.type === "direct-message") await relayDirectMessage(socket, message);
-    if (message.type === "group-message") await relayGroupMessage(socket, message);
-    if (message.type === "ack-message") await acknowledgeMessage(socket, message);
-    if (message.type === "typing") await relayTyping(socket, message);
-    if (message.type === "read-receipt") await relayReadReceipt(socket, message);
+    try {
+      if (message.type === "register") await registerClient(socket, message);
+      if (message.type === "watch-contacts") await sendContactStatuses(socket, message.contacts);
+      if (message.type === "publish-profile") await publishProfile(socket, message.profile);
+      if (message.type === "create-group") await createGroup(socket, message);
+      if (message.type === "rename-group") await renameGroup(socket, message);
+      if (message.type === "add-group-members") await addGroupMembers(socket, message);
+      if (message.type === "leave-group") await leaveGroup(socket, message);
+      if (message.type === "direct-message") await relayDirectMessage(socket, message);
+      if (message.type === "group-message") await relayGroupMessage(socket, message);
+      if (message.type === "ack-message") await acknowledgeMessage(socket, message);
+      if (message.type === "typing") await relayTyping(socket, message);
+      if (message.type === "read-receipt") await relayReadReceipt(socket, message);
+      if (message.type === "reaction") await relayReaction(socket, message);
+    } catch (error) {
+      console.error("Message handler failed:", error.message);
+      send(socket, { type: "error", message: "The message server could not process that request. Try again in a moment." });
+    }
   });
 
   socket.on("close", () => unregisterClient(socket));
@@ -277,6 +285,48 @@ async function relayReadReceipt(socket, message) {
   }, socket);
 }
 
+async function relayReaction(socket, message) {
+  const senderId = getRegisteredSender(socket);
+  if (!senderId) return;
+  const messageId = String(message.messageId || "").trim();
+  const emoji = String(message.emoji || "").slice(0, 8);
+  if (!messageId || !emoji) return;
+
+  const groupId = String(message.groupId || "").trim();
+  if (groupId) {
+    const group = await getGroup(groupId);
+    if (!group || !group.members.includes(senderId)) return;
+    for (const memberId of group.members) {
+      if (memberId === senderId) continue;
+      const envelope = {
+        type: "reaction",
+        queueId: randomUUID(),
+        from: senderId,
+        groupId,
+        messageId,
+        emoji,
+        reactedAt: new Date().toISOString()
+      };
+      await queueOfflineMessage(memberId, envelope);
+      sendToClient(memberId, envelope, socket);
+    }
+    return;
+  }
+
+  const targetId = String(message.to || "").trim();
+  if (!/^\d{6}$/.test(targetId)) return;
+  const envelope = {
+    type: "reaction",
+    queueId: randomUUID(),
+    from: senderId,
+    messageId,
+    emoji,
+    reactedAt: new Date().toISOString()
+  };
+  await queueOfflineMessage(targetId, envelope);
+  sendToClient(targetId, envelope, socket);
+}
+
 // Stores a user's public profile so contacts can display their current picture.
 async function publishProfile(socket, profile = {}) {
   const peerId = getRegisteredSender(socket);
@@ -293,6 +343,7 @@ async function createGroup(socket, message) {
   const group = {
     id: randomUUID(),
     name: String(message.name || "New group").slice(0, 80),
+    avatar: sanitizeProfilePicture(message.avatar),
     members,
     createdBy: creatorId,
     updatedAt: new Date().toISOString()
@@ -383,7 +434,7 @@ async function getOfflineMessages(targetId) {
 
 async function removeOfflineMessage(targetId, messageId) {
   const queue = await getOfflineMessages(targetId);
-  const remaining = queue.filter((message) => message.messageId !== messageId);
+  const remaining = queue.filter((message) => (message.queueId || message.messageId) !== messageId);
   if (remaining.length !== queue.length) await replaceOfflineMessages(targetId, remaining);
 }
 
@@ -401,7 +452,7 @@ async function replaceOfflineMessages(targetId, messages) {
     const key = inboxKey(targetId);
     await upstashCommand(["DEL", key]);
     if (messages.length) {
-      await upstashCommand(["RPUSH", key, ...messages.map((message) => JSON.stringify(message))]);
+      await upstashPushList(key, messages.map((message) => JSON.stringify(message)));
       await upstashCommand(["EXPIRE", key, OFFLINE_MESSAGE_TTL_SECONDS]);
     }
     return;
@@ -565,6 +616,23 @@ async function upstashCommand(command) {
     throw new Error(payload.error || `Upstash command failed with ${response.status}`);
   }
   return payload.result;
+}
+
+async function upstashPushList(key, items) {
+  let chunk = [];
+  let chunkSize = 0;
+  for (const item of items) {
+    if (chunk.length && (chunk.length >= MAX_UPSTASH_RPUSH_ITEMS || chunkSize + item.length > MAX_UPSTASH_RPUSH_CHARS)) {
+      await upstashCommand(["RPUSH", key, ...chunk]);
+      chunk = [];
+      chunkSize = 0;
+    }
+    chunk.push(item);
+    chunkSize += item.length;
+  }
+  if (chunk.length) {
+    await upstashCommand(["RPUSH", key, ...chunk]);
+  }
 }
 
 function storageMode() {
