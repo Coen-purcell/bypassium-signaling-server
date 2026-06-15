@@ -9,6 +9,9 @@ const MAX_OFFLINE_MESSAGES_PER_USER = 30;
 const MAX_PROFILE_PICTURE_CHARS = 18000;
 const MAX_UPSTASH_RPUSH_ITEMS = 4;
 const MAX_UPSTASH_RPUSH_CHARS = 6_000_000;
+const MAX_UPSTASH_COMMAND_CHARS = 8_500_000;
+const MAX_QUEUED_ENVELOPE_CHARS = 4_500_000;
+const MAX_WEBSOCKET_PAYLOAD_CHARS = 6_000_000;
 const REDIS_URL = process.env.REDIS_URL || process.env.RENDER_REDIS_URL || process.env.KEY_VALUE_URL || "";
 const UPSTASH_REST_URL = process.env.UPSTASH_REDIS_REST_URL || "";
 const UPSTASH_REST_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN || "";
@@ -38,7 +41,7 @@ const server = http.createServer(async (request, response) => {
   response.end("Bypassium message server is running.");
 });
 
-const wss = new WebSocketServer({ server });
+const wss = new WebSocketServer({ server, maxPayload: MAX_WEBSOCKET_PAYLOAD_CHARS });
 
 wss.on("connection", (socket) => {
   socket.bypassiumId = null;
@@ -391,74 +394,166 @@ async function leaveGroup(socket, message) {
 
 // Stores encrypted messages only. Redis makes them survive Render service restarts.
 async function queueOfflineMessage(targetId, envelope) {
+  const queueId = String(envelope.queueId || envelope.messageId || randomUUID());
+  const queuedMessage = { ...envelope, queueId, queuedAt: Date.now() };
+  const serialized = JSON.stringify(queuedMessage);
+  if (serialized.length > MAX_QUEUED_ENVELOPE_CHARS) {
+    throw new Error("That message is too large for offline delivery. Try a smaller image or GIF.");
+  }
+
   if (redis) {
-    const key = inboxKey(targetId);
-    await redis.rpush(key, JSON.stringify({ ...envelope, queuedAt: Date.now() }));
-    await redis.ltrim(key, -MAX_OFFLINE_MESSAGES_PER_USER, -1);
-    await redis.expire(key, OFFLINE_MESSAGE_TTL_SECONDS);
+    const indexKey = inboxIndexKey(targetId);
+    await redis.set(queuedMessageKey(targetId, queueId), serialized, "EX", OFFLINE_MESSAGE_TTL_SECONDS);
+    await redis.lrem(indexKey, 0, queueId);
+    await redis.rpush(indexKey, queueId);
+    await redis.ltrim(indexKey, -MAX_OFFLINE_MESSAGES_PER_USER, -1);
+    await redis.expire(indexKey, OFFLINE_MESSAGE_TTL_SECONDS);
     return;
   }
 
   if (upstashRestEnabled) {
-    const key = inboxKey(targetId);
-    await upstashCommand(["RPUSH", key, JSON.stringify({ ...envelope, queuedAt: Date.now() })]);
-    await upstashCommand(["LTRIM", key, -MAX_OFFLINE_MESSAGES_PER_USER, -1]);
-    await upstashCommand(["EXPIRE", key, OFFLINE_MESSAGE_TTL_SECONDS]);
+    const indexKey = inboxIndexKey(targetId);
+    await upstashCommand(["SET", queuedMessageKey(targetId, queueId), serialized, "EX", OFFLINE_MESSAGE_TTL_SECONDS]);
+    await upstashCommand(["LREM", indexKey, 0, queueId]);
+    await upstashCommand(["RPUSH", indexKey, queueId]);
+    await upstashCommand(["LTRIM", indexKey, -MAX_OFFLINE_MESSAGES_PER_USER, -1]);
+    await upstashCommand(["EXPIRE", indexKey, OFFLINE_MESSAGE_TTL_SECONDS]);
     return;
   }
 
   const queue = memoryOfflineMessages.get(targetId) || [];
-  queue.push({ ...envelope, queuedAt: Date.now() });
-  memoryOfflineMessages.set(targetId, queue.slice(-MAX_OFFLINE_MESSAGES_PER_USER));
+  const deduped = queue.filter((message) => (message.queueId || message.messageId) !== queueId);
+  deduped.push(queuedMessage);
+  memoryOfflineMessages.set(targetId, deduped.slice(-MAX_OFFLINE_MESSAGES_PER_USER));
 }
 
 // Delivers queued messages with their original sentAt time. Messages stay queued until acked.
 async function deliverOfflineMessages(socket) {
   const queue = await getOfflineMessages(socket.bypassiumId);
-  const fresh = queue.filter((message) => Date.now() - message.queuedAt <= OFFLINE_MESSAGE_TTL_SECONDS * 1000);
+  const legacyQueue = await getLegacyOfflineMessages(socket.bypassiumId);
+  const seen = new Set();
+  const expiredIds = [];
+  const fresh = [];
+  for (const message of [...queue, ...legacyQueue]) {
+    const id = String(message.queueId || message.messageId || "");
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    if (Date.now() - message.queuedAt > OFFLINE_MESSAGE_TTL_SECONDS * 1000) {
+      expiredIds.push(id);
+      continue;
+    }
+    fresh.push(message);
+  }
   for (const message of fresh) send(socket, message);
-  if (fresh.length !== queue.length) await replaceOfflineMessages(socket.bypassiumId, fresh);
+  for (const id of expiredIds) await removeOfflineMessage(socket.bypassiumId, id);
+  if (legacyQueue.length) await deleteLegacyInbox(socket.bypassiumId);
 }
 
 async function getOfflineMessages(targetId) {
-  if (redis) {
-    const stored = await redis.lrange(inboxKey(targetId), 0, -1);
-    return stored.map((item) => JSON.parse(item));
+  if (!redis && !upstashRestEnabled) return memoryOfflineMessages.get(targetId) || [];
+  const ids = await getInboxIds(targetId);
+  const uniqueIds = [...new Set(ids)].slice(-MAX_OFFLINE_MESSAGES_PER_USER);
+  const messages = [];
+  const keptIds = [];
+  for (const id of uniqueIds) {
+    const stored = await getQueuedMessage(targetId, id);
+    if (!stored) continue;
+    try {
+      messages.push(JSON.parse(stored));
+      keptIds.push(id);
+    } catch {
+      await deleteQueuedMessage(targetId, id);
+    }
   }
-  if (upstashRestEnabled) {
-    const stored = await upstashCommand(["LRANGE", inboxKey(targetId), 0, -1]);
-    return stored.map((item) => JSON.parse(item));
-  }
-  return memoryOfflineMessages.get(targetId) || [];
+  if (keptIds.length !== ids.length) await replaceInboxIds(targetId, keptIds);
+  return messages;
 }
 
 async function removeOfflineMessage(targetId, messageId) {
-  const queue = await getOfflineMessages(targetId);
-  const remaining = queue.filter((message) => (message.queueId || message.messageId) !== messageId);
-  if (remaining.length !== queue.length) await replaceOfflineMessages(targetId, remaining);
+  await deleteQueuedMessage(targetId, messageId);
+  await removeInboxId(targetId, messageId);
 }
 
-async function replaceOfflineMessages(targetId, messages) {
+async function getInboxIds(targetId) {
   if (redis) {
-    const key = inboxKey(targetId);
+    return redis.lrange(inboxIndexKey(targetId), 0, -1);
+  }
+  if (upstashRestEnabled) {
+    return upstashCommand(["LRANGE", inboxIndexKey(targetId), 0, -1]);
+  }
+  return [];
+}
+
+async function getQueuedMessage(targetId, messageId) {
+  if (redis) return redis.get(queuedMessageKey(targetId, messageId));
+  if (upstashRestEnabled) return upstashCommand(["GET", queuedMessageKey(targetId, messageId)]);
+  return null;
+}
+
+async function deleteQueuedMessage(targetId, messageId) {
+  if (redis) {
+    await redis.del(queuedMessageKey(targetId, messageId));
+    return;
+  }
+  if (upstashRestEnabled) {
+    await upstashCommand(["DEL", queuedMessageKey(targetId, messageId)]);
+    return;
+  }
+  const queue = memoryOfflineMessages.get(targetId) || [];
+  const remaining = queue.filter((message) => (message.queueId || message.messageId) !== messageId);
+  if (remaining.length) memoryOfflineMessages.set(targetId, remaining);
+  else memoryOfflineMessages.delete(targetId);
+}
+
+async function removeInboxId(targetId, messageId) {
+  if (redis) {
+    await redis.lrem(inboxIndexKey(targetId), 0, messageId);
+    return;
+  }
+  if (upstashRestEnabled) {
+    await upstashCommand(["LREM", inboxIndexKey(targetId), 0, messageId]);
+  }
+}
+
+async function replaceInboxIds(targetId, ids) {
+  if (redis) {
+    const key = inboxIndexKey(targetId);
     await redis.del(key);
-    if (messages.length) {
-      await redis.rpush(key, ...messages.map((message) => JSON.stringify(message)));
+    if (ids.length) {
+      await redis.rpush(key, ...ids);
       await redis.expire(key, OFFLINE_MESSAGE_TTL_SECONDS);
     }
     return;
   }
   if (upstashRestEnabled) {
-    const key = inboxKey(targetId);
+    const key = inboxIndexKey(targetId);
     await upstashCommand(["DEL", key]);
-    if (messages.length) {
-      await upstashPushList(key, messages.map((message) => JSON.stringify(message)));
+    if (ids.length) {
+      await upstashPushList(key, ids);
       await upstashCommand(["EXPIRE", key, OFFLINE_MESSAGE_TTL_SECONDS]);
     }
+  }
+}
+
+async function getLegacyOfflineMessages(targetId) {
+  if (!redis && !upstashRestEnabled) return [];
+  try {
+    const stored = redis
+      ? await redis.lrange(legacyInboxKey(targetId), 0, -1)
+      : await upstashCommand(["LRANGE", legacyInboxKey(targetId), 0, -1]);
+    return stored.map((item) => JSON.parse(item));
+  } catch (error) {
+    console.error("Legacy inbox read failed:", error.message);
+    return [];
+  }
+}
+
+async function deleteLegacyInbox(targetId) {
+  if (redis) {
+    await redis.del(legacyInboxKey(targetId));
     return;
   }
-  if (messages.length) memoryOfflineMessages.set(targetId, messages);
-  else memoryOfflineMessages.delete(targetId);
+  if (upstashRestEnabled) await upstashCommand(["DEL", legacyInboxKey(targetId)]);
 }
 
 async function setPublicKey(peerId, publicKeyJwk) {
@@ -570,7 +665,7 @@ async function countGroups() {
 
 async function countQueuedUsers() {
   if (!redis && !upstashRestEnabled) return memoryOfflineMessages.size;
-  return countKeys("bypassium:inbox:*");
+  return countKeys("bypassium:inbox-index:*");
 }
 
 async function countKeys(pattern) {
@@ -603,13 +698,17 @@ async function countUpstashKeys(pattern) {
 }
 
 async function upstashCommand(command) {
+  const body = JSON.stringify(command);
+  if (body.length > MAX_UPSTASH_COMMAND_CHARS) {
+    throw new Error("Upstash command would exceed the safe request size limit.");
+  }
   const response = await fetch(UPSTASH_REST_URL, {
     method: "POST",
     headers: {
       authorization: `Bearer ${UPSTASH_REST_TOKEN}`,
       "content-type": "application/json"
     },
-    body: JSON.stringify(command)
+    body
   });
   const payload = await response.json();
   if (!response.ok || payload.error) {
@@ -670,8 +769,16 @@ function groupKey(groupId) {
   return `bypassium:group:${groupId}`;
 }
 
-function inboxKey(peerId) {
+function legacyInboxKey(peerId) {
   return `bypassium:inbox:${peerId}`;
+}
+
+function inboxIndexKey(peerId) {
+  return `bypassium:inbox-index:${peerId}`;
+}
+
+function queuedMessageKey(peerId, messageId) {
+  return `bypassium:queued:${peerId}:${messageId}`;
 }
 
 function sendToClient(peerId, message, exceptSocket = null) {
