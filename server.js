@@ -62,7 +62,11 @@ wss.on("connection", (socket) => {
       if (message.type === "publish-profile") await publishProfile(socket, message.profile);
       if (message.type === "create-group") await createGroup(socket, message);
       if (message.type === "rename-group") await renameGroup(socket, message);
+      if (message.type === "update-group") await updateGroupDetails(socket, message);
       if (message.type === "add-group-members") await addGroupMembers(socket, message);
+      if (message.type === "set-group-admin") await setGroupAdmin(socket, message);
+      if (message.type === "transfer-group-ownership") await transferGroupOwnership(socket, message);
+      if (message.type === "remove-group-member") await removeGroupMember(socket, message);
       if (message.type === "leave-group") await leaveGroup(socket, message);
       if (message.type === "direct-message") await relayDirectMessage(socket, message);
       if (message.type === "group-message") await relayGroupMessage(socket, message);
@@ -70,6 +74,7 @@ wss.on("connection", (socket) => {
       if (message.type === "typing") await relayTyping(socket, message);
       if (message.type === "read-receipt") await relayReadReceipt(socket, message);
       if (message.type === "reaction") await relayReaction(socket, message);
+      if (message.type === "sync") await syncClient(socket);
     } catch (error) {
       console.error("Message handler failed:", error.message);
       send(socket, { type: "error", message: "The message server could not process that request. Try again in a moment." });
@@ -117,9 +122,23 @@ async function registerClient(socket, message) {
       persistentOfflineInbox: storageMode() !== "memory",
       publicKeyDirectory: true,
       profiles: true,
-      groups: true
+      groups: true,
+      deliveryStatus: true,
+      groupRoles: true
     }
   });
+  await deliverOfflineMessages(socket);
+}
+
+async function syncClient(socket) {
+  const peerId = getRegisteredSender(socket);
+  if (!peerId) return;
+  send(socket, {
+    type: "sync-complete",
+    groups: await getGroupsForMember(peerId),
+    syncedAt: new Date().toISOString()
+  });
+  await sendContactStatuses(socket, [...(socket.watchedContacts || [])]);
   await deliverOfflineMessages(socket);
 }
 
@@ -183,6 +202,13 @@ async function relayDirectMessage(socket, message) {
   };
   const targets = clients.get(targetId);
   await queueOfflineMessage(targetId, envelope);
+  send(socket, {
+    type: "message-status",
+    messageId: envelope.messageId,
+    peerId: targetId,
+    status: "sent",
+    updatedAt: new Date().toISOString()
+  });
 
   if (!targets?.size) {
     send(socket, { type: "message-queued", peerId: targetId, sentAt: envelope.sentAt, persistent: storageMode() !== "memory" });
@@ -192,7 +218,7 @@ async function relayDirectMessage(socket, message) {
   for (const target of targets) {
     if (target !== socket && target.readyState === 1) send(target, envelope);
   }
-  send(socket, { type: "message-relayed", peerId: targetId, sentAt: envelope.sentAt });
+  send(socket, { type: "message-relayed", messageId: envelope.messageId, peerId: targetId, sentAt: envelope.sentAt });
 }
 
 // Relays one encrypted group message copy per recipient and queues each copy until acked.
@@ -207,9 +233,9 @@ async function relayGroupMessage(socket, message) {
   const recipients = Array.isArray(message.recipients) ? message.recipients : [];
   const sentAt = message.sentAt || new Date().toISOString();
   const messageId = message.messageId || randomUUID();
-  for (const recipient of recipients) {
+  const deliveries = recipients.map(async (recipient) => {
     const targetId = String(recipient.to || "").trim();
-    if (targetId === senderId || !group.members.includes(targetId) || !recipient.encrypted) continue;
+    if (targetId === senderId || !group.members.includes(targetId) || !recipient.encrypted) return null;
     const envelope = {
       type: "group-message",
       messageId,
@@ -229,8 +255,18 @@ async function relayGroupMessage(socket, message) {
         if (target !== socket && target.readyState === 1) send(target, envelope);
       }
     }
-  }
-  send(socket, { type: "message-relayed", peerId: group.id, sentAt });
+    return targetId;
+  });
+  const deliveredTo = (await Promise.all(deliveries)).filter(Boolean);
+  send(socket, {
+    type: "message-status",
+    messageId,
+    groupId: group.id,
+    status: "sent",
+    recipientCount: deliveredTo.length,
+    updatedAt: new Date().toISOString()
+  });
+  send(socket, { type: "message-relayed", messageId, peerId: group.id, sentAt });
 }
 
 // Deletes a queued encrypted message only after the recipient extension saved it locally.
@@ -242,7 +278,18 @@ async function acknowledgeMessage(socket, message) {
     send(socket, { type: "error", message: "Acknowledgement requires a message ID." });
     return;
   }
+  const envelope = await getOfflineMessage(targetId, messageId);
   await removeOfflineMessage(targetId, messageId);
+  if (envelope?.from && (envelope.type === "direct-message" || envelope.type === "group-message")) {
+    sendToClient(envelope.from, {
+      type: "message-status",
+      messageId: envelope.messageId || messageId,
+      groupId: envelope.groupId || "",
+      peerId: targetId,
+      status: "delivered",
+      updatedAt: new Date().toISOString()
+    });
+  }
   send(socket, { type: "message-acknowledged", messageId });
 }
 
@@ -280,12 +327,21 @@ async function relayReadReceipt(socket, message) {
   const targetId = String(message.to || "").trim();
   const messageId = String(message.messageId || "").trim();
   if (!/^\d{6}$/.test(targetId) || !messageId) return;
-  sendToClient(targetId, {
+  const groupId = String(message.groupId || "").trim();
+  if (groupId) {
+    const group = await getGroup(groupId);
+    if (!group || !group.members.includes(senderId) || !group.members.includes(targetId)) return;
+  }
+  const envelope = {
     type: "read-receipt",
+    queueId: randomUUID(),
     from: senderId,
+    groupId,
     messageId,
     readAt: message.readAt || new Date().toISOString()
-  }, socket);
+  };
+  await queueOfflineMessage(targetId, envelope);
+  sendToClient(targetId, envelope, socket);
 }
 
 async function relayReaction(socket, message) {
@@ -308,6 +364,7 @@ async function relayReaction(socket, message) {
         groupId,
         messageId,
         emoji,
+        active: message.active !== false,
         reactedAt: new Date().toISOString()
       };
       await queueOfflineMessage(memberId, envelope);
@@ -324,6 +381,7 @@ async function relayReaction(socket, message) {
     from: senderId,
     messageId,
     emoji,
+    active: message.active !== false,
     reactedAt: new Date().toISOString()
   };
   await queueOfflineMessage(targetId, envelope);
@@ -349,6 +407,8 @@ async function createGroup(socket, message) {
     avatar: sanitizeProfilePicture(message.avatar),
     members,
     createdBy: creatorId,
+    ownerId: creatorId,
+    admins: [creatorId],
     updatedAt: new Date().toISOString()
   };
   await setGroup(group);
@@ -356,11 +416,23 @@ async function createGroup(socket, message) {
 }
 
 async function renameGroup(socket, message) {
+  return updateGroupDetails(socket, message);
+}
+
+async function updateGroupDetails(socket, message) {
   const peerId = getRegisteredSender(socket);
   if (!peerId) return;
   const group = await getGroup(message.groupId);
-  if (!group || !group.members.includes(peerId)) return;
-  group.name = String(message.name || group.name).slice(0, 80);
+  if (!group || !canAdministerGroup(group, peerId)) {
+    send(socket, { type: "error", message: "Only the group owner or an administrator can change group details." });
+    return;
+  }
+  if (typeof message.name === "string" && message.name.trim()) {
+    group.name = message.name.trim().slice(0, 80);
+  }
+  if (typeof message.avatar === "string") {
+    group.avatar = sanitizeProfilePicture(message.avatar);
+  }
   group.updatedAt = new Date().toISOString();
   await setGroup(group);
   broadcastGroupUpdate(group);
@@ -370,11 +442,69 @@ async function addGroupMembers(socket, message) {
   const peerId = getRegisteredSender(socket);
   if (!peerId) return;
   const group = await getGroup(message.groupId);
-  if (!group || !group.members.includes(peerId)) return;
+  if (!group || !canAdministerGroup(group, peerId)) {
+    send(socket, { type: "error", message: "Only the group owner or an administrator can add members." });
+    return;
+  }
   group.members = normalizeMembers([...group.members, ...(message.members || [])]);
   group.updatedAt = new Date().toISOString();
   await setGroup(group);
   broadcastGroupUpdate(group);
+}
+
+async function setGroupAdmin(socket, message) {
+  const peerId = getRegisteredSender(socket);
+  if (!peerId) return;
+  const group = await getGroup(message.groupId);
+  const memberId = String(message.memberId || "").trim();
+  if (!group || group.ownerId !== peerId || !group.members.includes(memberId) || memberId === group.ownerId) {
+    send(socket, { type: "error", message: "Only the group owner can change administrator permissions." });
+    return;
+  }
+  const admins = new Set(group.admins || []);
+  if (message.isAdmin === false) admins.delete(memberId);
+  else admins.add(memberId);
+  admins.add(group.ownerId);
+  group.admins = [...admins].filter((id) => group.members.includes(id));
+  group.updatedAt = new Date().toISOString();
+  await setGroup(group);
+  broadcastGroupUpdate(group);
+}
+
+async function transferGroupOwnership(socket, message) {
+  const peerId = getRegisteredSender(socket);
+  if (!peerId) return;
+  const group = await getGroup(message.groupId);
+  const memberId = String(message.memberId || "").trim();
+  if (!group || group.ownerId !== peerId || !group.members.includes(memberId) || memberId === peerId) {
+    send(socket, { type: "error", message: "Choose another current group member to become the owner." });
+    return;
+  }
+  group.ownerId = memberId;
+  group.admins = normalizeMembers([memberId, peerId, ...(group.admins || [])]).filter((id) => group.members.includes(id));
+  group.updatedAt = new Date().toISOString();
+  await setGroup(group);
+  broadcastGroupUpdate(group);
+}
+
+async function removeGroupMember(socket, message) {
+  const peerId = getRegisteredSender(socket);
+  if (!peerId) return;
+  const group = await getGroup(message.groupId);
+  const memberId = String(message.memberId || "").trim();
+  if (!group || !canAdministerGroup(group, peerId) || !group.members.includes(memberId) || memberId === group.ownerId) {
+    send(socket, { type: "error", message: "That member cannot be removed by this account." });
+    return;
+  }
+  if (group.admins.includes(memberId) && group.ownerId !== peerId) {
+    send(socket, { type: "error", message: "Only the owner can remove another administrator." });
+    return;
+  }
+  group.members = group.members.filter((id) => id !== memberId);
+  group.admins = group.admins.filter((id) => id !== memberId);
+  group.updatedAt = new Date().toISOString();
+  await setGroup(group);
+  broadcastGroupUpdate(group, [memberId]);
 }
 
 async function leaveGroup(socket, message) {
@@ -382,7 +512,12 @@ async function leaveGroup(socket, message) {
   if (!peerId) return;
   const group = await getGroup(message.groupId);
   if (!group || !group.members.includes(peerId)) return;
+  if (group.ownerId === peerId && group.members.length > 1) {
+    send(socket, { type: "error", message: "Transfer group ownership before leaving." });
+    return;
+  }
   group.members = group.members.filter((member) => member !== peerId);
+  group.admins = (group.admins || []).filter((member) => member !== peerId);
   group.updatedAt = new Date().toISOString();
   if (group.members.length) {
     await setGroup(group);
@@ -413,11 +548,13 @@ async function queueOfflineMessage(targetId, envelope) {
 
   if (upstashRestEnabled) {
     const indexKey = inboxIndexKey(targetId);
-    await upstashCommand(["SET", queuedMessageKey(targetId, queueId), serialized, "EX", OFFLINE_MESSAGE_TTL_SECONDS]);
-    await upstashCommand(["LREM", indexKey, 0, queueId]);
-    await upstashCommand(["RPUSH", indexKey, queueId]);
-    await upstashCommand(["LTRIM", indexKey, -MAX_OFFLINE_MESSAGES_PER_USER, -1]);
-    await upstashCommand(["EXPIRE", indexKey, OFFLINE_MESSAGE_TTL_SECONDS]);
+    await upstashPipeline([
+      ["SET", queuedMessageKey(targetId, queueId), serialized, "EX", OFFLINE_MESSAGE_TTL_SECONDS],
+      ["LREM", indexKey, 0, queueId],
+      ["RPUSH", indexKey, queueId],
+      ["LTRIM", indexKey, -MAX_OFFLINE_MESSAGES_PER_USER, -1],
+      ["EXPIRE", indexKey, OFFLINE_MESSAGE_TTL_SECONDS]
+    ]);
     return;
   }
 
@@ -472,6 +609,20 @@ async function getOfflineMessages(targetId) {
 async function removeOfflineMessage(targetId, messageId) {
   await deleteQueuedMessage(targetId, messageId);
   await removeInboxId(targetId, messageId);
+}
+
+async function getOfflineMessage(targetId, messageId) {
+  if (!redis && !upstashRestEnabled) {
+    return (memoryOfflineMessages.get(targetId) || [])
+      .find((message) => (message.queueId || message.messageId) === messageId) || null;
+  }
+  const stored = await getQueuedMessage(targetId, messageId);
+  if (!stored) return null;
+  try {
+    return typeof stored === "string" ? JSON.parse(stored) : stored;
+  } catch {
+    return null;
+  }
 }
 
 async function getInboxIds(targetId) {
@@ -591,20 +742,21 @@ async function getProfile(peerId) {
 }
 
 async function setGroup(group) {
-  memoryGroups.set(group.id, group);
-  if (redis) await redis.set(groupKey(group.id), JSON.stringify(group));
-  if (upstashRestEnabled) await upstashCommand(["SET", groupKey(group.id), JSON.stringify(group)]);
+  const normalized = normalizeGroup(group);
+  memoryGroups.set(normalized.id, normalized);
+  if (redis) await redis.set(groupKey(normalized.id), JSON.stringify(normalized));
+  if (upstashRestEnabled) await upstashCommand(["SET", groupKey(normalized.id), JSON.stringify(normalized)]);
 }
 
 async function getGroup(groupId) {
   const cleanGroupId = String(groupId || "").trim();
   if (!cleanGroupId) return null;
-  if (memoryGroups.has(cleanGroupId)) return memoryGroups.get(cleanGroupId);
+  if (memoryGroups.has(cleanGroupId)) return normalizeGroup(memoryGroups.get(cleanGroupId));
   let stored = null;
   if (redis) stored = await redis.get(groupKey(cleanGroupId));
   if (upstashRestEnabled) stored = await upstashCommand(["GET", groupKey(cleanGroupId)]);
   if (!stored) return null;
-  const group = JSON.parse(stored);
+  const group = normalizeGroup(JSON.parse(stored));
   memoryGroups.set(group.id, group);
   return group;
 }
@@ -621,14 +773,14 @@ async function getGroupsForMember(peerId) {
 }
 
 async function getAllGroups() {
-  if (!redis && !upstashRestEnabled) return [...memoryGroups.values()];
+  if (!redis && !upstashRestEnabled) return [...memoryGroups.values()].map(normalizeGroup);
   const keys = await listKeys("bypassium:group:*");
   const groups = [];
   for (const key of keys) {
     let stored = null;
     if (redis) stored = await redis.get(key);
     if (upstashRestEnabled) stored = await upstashCommand(["GET", key]);
-    if (stored) groups.push(JSON.parse(stored));
+    if (stored) groups.push(normalizeGroup(JSON.parse(stored)));
   }
   return groups;
 }
@@ -651,6 +803,23 @@ function broadcastProfileUpdate(peerId, profile) {
 
 function normalizeMembers(members) {
   return [...new Set(members.map((member) => String(member || "").trim()).filter((member) => /^\d{6}$/.test(member)))];
+}
+
+function normalizeGroup(group = {}) {
+  const members = normalizeMembers(group.members || []);
+  const preferredOwner = String(group.ownerId || group.createdBy || "").trim();
+  const ownerId = members.includes(preferredOwner) ? preferredOwner : members[0] || "";
+  const admins = normalizeMembers([ownerId, ...(group.admins || [])]).filter((id) => members.includes(id));
+  return {
+    ...group,
+    members,
+    ownerId,
+    admins
+  };
+}
+
+function canAdministerGroup(group, peerId) {
+  return group.ownerId === peerId || (group.admins || []).includes(peerId);
 }
 
 async function countKnownPublicKeys() {
@@ -715,6 +884,27 @@ async function upstashCommand(command) {
     throw new Error(payload.error || `Upstash command failed with ${response.status}`);
   }
   return payload.result;
+}
+
+async function upstashPipeline(commands) {
+  const body = JSON.stringify(commands);
+  if (body.length > MAX_UPSTASH_COMMAND_CHARS) {
+    throw new Error("Upstash pipeline would exceed the safe request size limit.");
+  }
+  const response = await fetch(`${UPSTASH_REST_URL.replace(/\/$/, "")}/pipeline`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${UPSTASH_REST_TOKEN}`,
+      "content-type": "application/json"
+    },
+    body
+  });
+  const payload = await response.json();
+  const failed = Array.isArray(payload) && payload.find((result) => result?.error);
+  if (!response.ok || !Array.isArray(payload) || failed) {
+    throw new Error(failed?.error || payload?.error || `Upstash pipeline failed with ${response.status}`);
+  }
+  return payload.map((result) => result.result);
 }
 
 async function upstashPushList(key, items) {
