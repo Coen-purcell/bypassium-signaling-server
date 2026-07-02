@@ -24,8 +24,19 @@ const redis = createRedisClient();
 const upstashRestEnabled = Boolean(!redis && UPSTASH_REST_URL && UPSTASH_REST_TOKEN);
 
 const server = http.createServer(async (request, response) => {
+  const corsHeaders = {
+    "access-control-allow-origin": "*",
+    "access-control-allow-methods": "GET, OPTIONS",
+    "access-control-allow-headers": "content-type"
+  };
+  if (request.method === "OPTIONS") {
+    response.writeHead(204, corsHeaders);
+    response.end();
+    return;
+  }
+
   if (request.url === "/health") {
-    response.writeHead(200, { "content-type": "application/json" });
+    response.writeHead(200, { ...corsHeaders, "content-type": "application/json" });
     response.end(JSON.stringify({
       ok: true,
       storage: storageMode(),
@@ -37,7 +48,7 @@ const server = http.createServer(async (request, response) => {
     return;
   }
 
-  response.writeHead(200, { "content-type": "text/plain" });
+  response.writeHead(200, { ...corsHeaders, "content-type": "text/plain" });
   response.end("Bypassium message server is running.");
 });
 
@@ -442,8 +453,8 @@ async function addGroupMembers(socket, message) {
   const peerId = getRegisteredSender(socket);
   if (!peerId) return;
   const group = await getGroup(message.groupId);
-  if (!group || !canAdministerGroup(group, peerId)) {
-    send(socket, { type: "error", message: "Only the group owner or an administrator can add members." });
+  if (!group || !group.members.includes(peerId)) {
+    send(socket, { type: "error", message: "Only current group members can add people." });
     return;
   }
   group.members = normalizeMembers([...group.members, ...(message.members || [])]);
@@ -533,7 +544,7 @@ async function queueOfflineMessage(targetId, envelope) {
   const queuedMessage = { ...envelope, queueId, queuedAt: Date.now() };
   const serialized = JSON.stringify(queuedMessage);
   if (serialized.length > MAX_QUEUED_ENVELOPE_CHARS) {
-    throw new Error("That message is too large for offline delivery. Try a smaller image or GIF.");
+    throw new Error("That message is too large for offline delivery. Try a smaller attachment.");
   }
 
   if (redis) {
