@@ -18,6 +18,7 @@ const UPSTASH_REST_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN || "";
 const clients = new Map();
 const memoryPublicKeys = new Map();
 const memoryProfiles = new Map();
+const memoryDirectory = new Map();
 const memoryGroups = new Map();
 const memoryOfflineMessages = new Map();
 const redis = createRedisClient();
@@ -71,6 +72,7 @@ wss.on("connection", (socket) => {
       if (message.type === "register") await registerClient(socket, message);
       if (message.type === "watch-contacts") await sendContactStatuses(socket, message.contacts);
       if (message.type === "publish-profile") await publishProfile(socket, message.profile);
+      if (message.type === "quick-add-request") await sendQuickAddResults(socket, message);
       if (message.type === "create-group") await createGroup(socket, message);
       if (message.type === "rename-group") await renameGroup(socket, message);
       if (message.type === "update-group") await updateGroupDetails(socket, message);
@@ -80,6 +82,7 @@ wss.on("connection", (socket) => {
       if (message.type === "remove-group-member") await removeGroupMember(socket, message);
       if (message.type === "leave-group") await leaveGroup(socket, message);
       if (message.type === "direct-message") await relayDirectMessage(socket, message);
+      if (message.type === "direct-setting") await relayDirectSetting(socket, message);
       if (message.type === "group-message") await relayGroupMessage(socket, message);
       if (message.type === "ack-message") await acknowledgeMessage(socket, message);
       if (message.type === "typing") await relayTyping(socket, message);
@@ -135,7 +138,9 @@ async function registerClient(socket, message) {
       profiles: true,
       groups: true,
       deliveryStatus: true,
-      groupRoles: true
+      groupRoles: true,
+      encryptedChatSettings: true,
+      quickAddDirectory: true
     }
   });
   await deliverOfflineMessages(socket);
@@ -230,6 +235,30 @@ async function relayDirectMessage(socket, message) {
     if (target !== socket && target.readyState === 1) send(target, envelope);
   }
   send(socket, { type: "message-relayed", messageId: envelope.messageId, peerId: targetId, sentAt: envelope.sentAt });
+}
+
+// Relays an encrypted per-conversation setting without adding it to chat history.
+async function relayDirectSetting(socket, message) {
+  const senderId = registeredPeerId(socket);
+  if (!senderId) return;
+  const targetId = String(message.to || "").trim();
+  if (!/^\d{6}$/.test(targetId) || !message.encrypted) {
+    send(socket, { type: "error", message: "Setting target or encrypted payload is invalid." });
+    return;
+  }
+  const envelope = {
+    type: "direct-setting",
+    messageId: message.messageId || randomUUID(),
+    from: senderId,
+    profile: sanitizeProfile(await getProfile(senderId)),
+    publicKeyJwk: socket.publicKeyJwk,
+    encrypted: message.encrypted,
+    sentAt: message.sentAt || new Date().toISOString()
+  };
+  await queueOfflineMessage(targetId, envelope);
+  const target = clients.get(targetId);
+  if (target) send(target, envelope);
+  send(socket, { type: "setting-relayed", messageId: envelope.messageId, peerId: targetId });
 }
 
 // Relays one encrypted group message copy per recipient and queues each copy until acked.
@@ -403,9 +432,51 @@ async function relayReaction(socket, message) {
 async function publishProfile(socket, profile = {}) {
   const peerId = getRegisteredSender(socket);
   if (!peerId) return;
-  const cleanProfile = sanitizeProfile(profile, true);
+  const existing = await getProfile(peerId);
+  const cleanProfile = sanitizeProfile({
+    ...profile,
+    joinedAt: existing?.joinedAt || new Date().toISOString()
+  }, true);
   await setProfile(peerId, cleanProfile);
+  await updateQuickAddDirectory(peerId, cleanProfile);
   broadcastProfileUpdate(peerId, cleanProfile);
+}
+
+// Returns a paginated, sanitized directory of customized public profiles.
+async function sendQuickAddResults(socket, message = {}) {
+  const peerId = getRegisteredSender(socket);
+  if (!peerId) return;
+  const now = Date.now();
+  if (now - Number(socket.lastQuickAddRequestAt || 0) < 200) return;
+  socket.lastQuickAddRequestAt = now;
+  const query = String(message.query || "").trim().toLowerCase().slice(0, 50);
+  const offset = Math.min(5000, Math.max(0, Number(message.offset) || 0));
+  const limit = Math.min(50, Math.max(10, Number(message.limit) || 30));
+  const requestedExclusions = Array.isArray(message.exclude) ? message.exclude.slice(0, 1000) : [];
+  const excluded = new Set(normalizeMembers([peerId, ...requestedExclusions]));
+  const entries = await getQuickAddDirectoryEntries();
+  const matches = [];
+  for (const { id, profile } of entries) {
+    if (excluded.has(id)) continue;
+    if (!isDiscoverableProfile(profile)) continue;
+    if (query && !String(profile.displayName || "").toLowerCase().includes(query) && !id.includes(query)) continue;
+    matches.push({
+      id,
+      displayName: profile.displayName || "Bypassium User",
+      profilePicture: profile.profilePicture,
+      joinedAt: profile.joinedAt || profile.updatedAt || "",
+      status: clients.has(id) ? "online" : "offline"
+    });
+  }
+  const results = matches.slice(offset, offset + limit);
+  send(socket, {
+    type: "quick-add-results",
+    results,
+    offset,
+    nextOffset: offset + results.length,
+    hasMore: offset + results.length < matches.length,
+    query
+  });
 }
 
 async function createGroup(socket, message) {
@@ -752,6 +823,71 @@ async function getProfile(peerId) {
   return profile;
 }
 
+async function updateQuickAddDirectory(peerId, profile) {
+  const key = quickAddDirectoryKey();
+  if (!isDiscoverableProfile(profile)) {
+    memoryDirectory.delete(peerId);
+    if (redis) {
+      await redis.zrem(key, peerId);
+      await redis.hdel(quickAddProfilesKey(), peerId);
+    }
+    if (upstashRestEnabled) {
+      await upstashPipeline([
+        ["ZREM", key, peerId],
+        ["HDEL", quickAddProfilesKey(), peerId]
+      ]);
+    }
+    return;
+  }
+  const joinedAt = profile.joinedAt || new Date().toISOString();
+  const score = Number.isFinite(Date.parse(joinedAt)) ? Date.parse(joinedAt) : Date.now();
+  memoryDirectory.set(peerId, { score, profile });
+  if (redis) {
+    await redis.zadd(key, score, peerId);
+    await redis.hset(quickAddProfilesKey(), peerId, JSON.stringify(profile));
+  }
+  if (upstashRestEnabled) {
+    await upstashPipeline([
+      ["ZADD", key, score, peerId],
+      ["HSET", quickAddProfilesKey(), peerId, JSON.stringify(profile)]
+    ]);
+  }
+}
+
+async function getQuickAddDirectoryEntries() {
+  if (redis) {
+    const ids = await redis.zrevrange(quickAddDirectoryKey(), 0, 999);
+    if (!ids.length) return [];
+    const stored = await redis.hmget(quickAddProfilesKey(), ...ids);
+    return ids.map((id, index) => ({ id, profile: parseStoredProfile(stored[index]) })).filter((entry) => entry.profile);
+  }
+  if (upstashRestEnabled) {
+    const ids = await upstashCommand(["ZREVRANGE", quickAddDirectoryKey(), 0, 999]);
+    if (!ids.length) return [];
+    const stored = await upstashCommand(["HMGET", quickAddProfilesKey(), ...ids]);
+    return ids.map((id, index) => ({ id, profile: parseStoredProfile(stored[index]) })).filter((entry) => entry.profile);
+  }
+  return [...memoryDirectory.entries()]
+    .sort((first, second) => second[1].score - first[1].score)
+    .map(([id, entry]) => ({ id, profile: entry.profile }));
+}
+
+function parseStoredProfile(value) {
+  try {
+    return value ? sanitizeProfile(JSON.parse(value)) : null;
+  } catch {
+    return null;
+  }
+}
+
+function isDiscoverableProfile(profile = {}) {
+  const displayName = String(profile.displayName || "").trim();
+  return Boolean(
+    profile.profilePicture
+    || (displayName && displayName.toLowerCase() !== "local user")
+  );
+}
+
 async function setGroup(group) {
   const normalized = normalizeGroup(group);
   memoryGroups.set(normalized.id, normalized);
@@ -944,7 +1080,8 @@ function storageMode() {
 function sanitizeProfile(profile = {}, stampUpdate = false) {
   const cleanProfile = {
     displayName: String(profile?.displayName || "").slice(0, 80),
-    profilePicture: sanitizeProfilePicture(profile?.profilePicture)
+    profilePicture: sanitizeProfilePicture(profile?.profilePicture),
+    joinedAt: String(profile?.joinedAt || "").slice(0, 40)
   };
   if (stampUpdate) cleanProfile.updatedAt = new Date().toISOString();
   else if (profile?.updatedAt) cleanProfile.updatedAt = String(profile.updatedAt).slice(0, 40);
@@ -964,6 +1101,14 @@ function publicKeyKey(peerId) {
 
 function profileKey(peerId) {
   return `bypassium:profile:${peerId}`;
+}
+
+function quickAddDirectoryKey() {
+  return "bypassium:quick-add-directory";
+}
+
+function quickAddProfilesKey() {
+  return "bypassium:quick-add-profiles";
 }
 
 function groupKey(groupId) {
