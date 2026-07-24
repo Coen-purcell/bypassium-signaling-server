@@ -339,8 +339,10 @@ async function deleteAccount(socket, message = {}) {
     sendAccountResponse(socket, message, false, "Password confirmation failed.");
     return;
   }
-  await removeAccount(peerId);
-  sessions.delete(String(message.sessionToken || ""));
+  await deleteAccountData(peerId);
+  for (const [token, session] of sessions.entries()) {
+    if (session.peerId === peerId) sessions.delete(token);
+  }
   sendAccountResponse(socket, message, true, "Account deleted.");
 }
 
@@ -1028,6 +1030,58 @@ async function removeAccount(peerId) {
   memoryAccounts.delete(peerId);
   if (redis) await redis.del(accountKey(peerId));
   if (upstashRestEnabled) await upstashCommand(["DEL", accountKey(peerId)]);
+}
+
+async function deleteAccountData(peerId) {
+  await Promise.all([
+    removeAccount(peerId),
+    removePublicKey(peerId),
+    removeProfile(peerId),
+    removeQuickAddProfile(peerId),
+    deleteAllQueuedMessages(peerId)
+  ]);
+}
+
+async function removePublicKey(peerId) {
+  memoryPublicKeys.delete(peerId);
+  if (redis) await redis.del(publicKeyKey(peerId));
+  if (upstashRestEnabled) await upstashCommand(["DEL", publicKeyKey(peerId)]);
+}
+
+async function removeProfile(peerId) {
+  memoryProfiles.delete(peerId);
+  if (redis) await redis.del(profileKey(peerId));
+  if (upstashRestEnabled) await upstashCommand(["DEL", profileKey(peerId)]);
+}
+
+async function removeQuickAddProfile(peerId) {
+  memoryDirectory.delete(peerId);
+  if (redis) {
+    await redis.zrem(quickAddDirectoryKey(), peerId);
+    await redis.hdel(quickAddProfilesKey(), peerId);
+  }
+  if (upstashRestEnabled) {
+    await upstashPipeline([
+      ["ZREM", quickAddDirectoryKey(), peerId],
+      ["HDEL", quickAddProfilesKey(), peerId]
+    ]);
+  }
+}
+
+async function deleteAllQueuedMessages(peerId) {
+  memoryOfflineMessages.delete(peerId);
+  const ids = await getInboxIds(peerId);
+  for (const id of new Set(ids)) await deleteQueuedMessage(peerId, id);
+  if (redis) {
+    await redis.del(inboxIndexKey(peerId));
+    await redis.del(legacyInboxKey(peerId));
+  }
+  if (upstashRestEnabled) {
+    await upstashPipeline([
+      ["DEL", inboxIndexKey(peerId)],
+      ["DEL", legacyInboxKey(peerId)]
+    ]);
+  }
 }
 
 async function setProfile(peerId, profile) {
