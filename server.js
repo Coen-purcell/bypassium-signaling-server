@@ -79,6 +79,9 @@ wss.on("connection", (socket, request) => {
       if (message.type === "create-account") await createAccount(socket, message);
       if (message.type === "claim-legacy-account") await claimLegacyAccount(socket, message);
       if (message.type === "sign-in") await signInAccount(socket, message);
+      if (message.type === "account-search") await searchAccounts(socket, message);
+      if (message.type === "recover-account") await recoverAccount(socket, message);
+      if (message.type === "reset-password-with-recovery") await resetPasswordWithRecovery(socket, message);
       if (message.type === "sign-out") await signOutAccount(socket, message);
       if (message.type === "delete-account") await deleteAccount(socket, message);
       if (message.type === "watch-contacts") await sendContactStatuses(socket, message.contacts);
@@ -256,8 +259,14 @@ async function createAccount(socket, message = {}) {
     return;
   }
   const encryptedIdentityBackup = sanitizeEncryptedBackup(message.encryptedIdentityBackup);
+  const encryptedRecoveryBackup = sanitizeEncryptedBackup(message.encryptedRecoveryBackup);
+  const recoveryPhrase = normalizeRecoveryPhrase(message.recoveryPhrase);
   if (!encryptedIdentityBackup?.data) {
     sendAccountResponse(socket, message, false, "Account creation needs an encrypted identity backup.");
+    return;
+  }
+  if (!encryptedRecoveryBackup?.data || !validRecoveryPhrase(recoveryPhrase)) {
+    sendAccountResponse(socket, message, false, "Account creation needs a recovery phrase backup.");
     return;
   }
   const existing = await getAccount(peerId);
@@ -276,6 +285,8 @@ async function createAccount(socket, message = {}) {
     ...hashPassword(password),
     publicKeyJwk,
     encryptedIdentityBackup,
+    encryptedRecoveryBackup,
+    ...hashRecoveryPhrase(recoveryPhrase),
     profile: sanitizeProfile(message.profile || await getProfile(peerId) || {}),
     createdAt: existing?.createdAt || now,
     updatedAt: now
@@ -317,6 +328,53 @@ async function signInAccount(socket, message = {}) {
     sessionToken,
     account: publicAccountStatus(account, true),
     encryptedIdentityBackup: account.encryptedIdentityBackup || null
+  });
+}
+
+async function recoverAccount(socket, message = {}) {
+  const peerId = String(message.peerId || "").trim();
+  const recoveryPhrase = normalizeRecoveryPhrase(message.recoveryPhrase);
+  const account = /^\d{6}$/.test(peerId) ? await getAccount(peerId) : null;
+  if (!account?.recoveryHash || !verifyRecoveryPhrase(recoveryPhrase, account)) {
+    sendAccountResponse(socket, message, false, "Code or recovery phrase is incorrect.");
+    return;
+  }
+  sendAccountResponse(socket, message, true, "Recovery phrase accepted.", {
+    account: publicAccountStatus(account, true),
+    encryptedRecoveryBackup: account.encryptedRecoveryBackup || null
+  });
+}
+
+async function resetPasswordWithRecovery(socket, message = {}) {
+  const peerId = String(message.peerId || "").trim();
+  const recoveryPhrase = normalizeRecoveryPhrase(message.recoveryPhrase);
+  const password = String(message.password || "");
+  const encryptedIdentityBackup = sanitizeEncryptedBackup(message.encryptedIdentityBackup);
+  const publicKeyJwk = message.publicKeyJwk || null;
+  const account = /^\d{6}$/.test(peerId) ? await getAccount(peerId) : null;
+  if (!account?.recoveryHash || !verifyRecoveryPhrase(recoveryPhrase, account)) {
+    sendAccountResponse(socket, message, false, "Code or recovery phrase is incorrect.");
+    return;
+  }
+  if (!validPassword(password) || !encryptedIdentityBackup?.data || !publicKeyJwk) {
+    sendAccountResponse(socket, message, false, "Choose a new password and recovery backup first.");
+    return;
+  }
+  const now = new Date().toISOString();
+  const updated = sanitizeAccount({
+    ...account,
+    ...hashPassword(password),
+    publicKeyJwk,
+    encryptedIdentityBackup,
+    updatedAt: now
+  });
+  await setAccount(peerId, updated);
+  await setPublicKey(peerId, publicKeyJwk);
+  const sessionToken = issueSession(peerId);
+  sendAccountResponse(socket, message, true, "Password reset.", {
+    sessionToken,
+    account: publicAccountStatus(updated, true),
+    encryptedIdentityBackup: updated.encryptedIdentityBackup || null
   });
 }
 
@@ -645,6 +703,72 @@ async function sendQuickAddResults(socket, message = {}) {
   });
 }
 
+async function searchAccounts(socket, message = {}) {
+  if (!allowUserAction(socket, "directory-search")) return;
+  const query = String(message.query || "").trim().toLowerCase().slice(0, 50);
+  const limit = Math.min(30, Math.max(5, Number(message.limit) || 18));
+  if (query.length < 2) {
+    send(socket, {
+      type: "account-search-results",
+      requestId: String(message.requestId || ""),
+      ok: true,
+      query,
+      results: []
+    });
+    return;
+  }
+
+  const entries = await getQuickAddDirectoryEntries();
+  const matches = [];
+  for (const { id, profile } of entries) {
+    if (!isDiscoverableProfile(profile)) continue;
+    const score = accountSearchScore(query, id, profile.displayName || "");
+    if (score === null) continue;
+    matches.push({
+      id,
+      displayName: profile.displayName || "Bypassium User",
+      profilePicture: profile.profilePicture,
+      joinedAt: profile.joinedAt || profile.updatedAt || "",
+      status: clients.has(id) ? "online" : "offline",
+      score
+    });
+  }
+
+  matches.sort((first, second) => first.score - second.score || first.displayName.localeCompare(second.displayName));
+  send(socket, {
+    type: "account-search-results",
+    requestId: String(message.requestId || ""),
+    ok: true,
+    query,
+    results: matches.slice(0, limit).map(({ score, ...result }) => result)
+  });
+}
+
+function accountSearchScore(query, id, displayName) {
+  const name = String(displayName || "").toLowerCase();
+  const code = String(id || "");
+  if (name.startsWith(query)) return 0;
+  if (code.startsWith(query)) return 1;
+  const nameIndex = name.indexOf(query);
+  if (nameIndex >= 0) return 2 + nameIndex / 100;
+  const codeIndex = code.indexOf(query);
+  if (codeIndex >= 0) return 3 + codeIndex / 100;
+  const fuzzy = subsequenceGapScore(query, name);
+  return fuzzy === null ? null : 4 + fuzzy / 100;
+}
+
+function subsequenceGapScore(query, value) {
+  let cursor = 0;
+  let gap = 0;
+  for (const char of query) {
+    const index = value.indexOf(char, cursor);
+    if (index === -1) return null;
+    gap += index - cursor;
+    cursor = index + 1;
+  }
+  return gap + Math.max(0, value.length - query.length) / 10;
+}
+
 async function createGroup(socket, message) {
   const creatorId = getRegisteredSender(socket);
   if (!creatorId) return;
@@ -682,6 +806,9 @@ async function updateGroupDetails(socket, message) {
   }
   if (typeof message.avatar === "string") {
     group.avatar = sanitizeProfilePicture(message.avatar);
+  }
+  if (typeof message.memberAddLocked === "boolean") {
+    group.memberAddLocked = message.memberAddLocked;
   }
   group.updatedAt = new Date().toISOString();
   await setGroup(group);
@@ -1382,6 +1509,9 @@ function sanitizeAccount(account = {}) {
     passwordHash: String(account.passwordHash || "").slice(0, 256),
     publicKeyJwk: account.publicKeyJwk || null,
     encryptedIdentityBackup: sanitizeEncryptedBackup(account.encryptedIdentityBackup),
+    encryptedRecoveryBackup: sanitizeEncryptedBackup(account.encryptedRecoveryBackup),
+    recoverySalt: String(account.recoverySalt || "").slice(0, 128),
+    recoveryHash: String(account.recoveryHash || "").slice(0, 256),
     profile: sanitizeProfile(account.profile || {}),
     createdAt: String(account.createdAt || "").slice(0, 40),
     updatedAt: String(account.updatedAt || "").slice(0, 40)
@@ -1409,11 +1539,37 @@ function hashPassword(password) {
   return { passwordSalt, passwordHash };
 }
 
+function hashRecoveryPhrase(recoveryPhrase) {
+  const recoverySalt = randomBytes(16).toString("base64url");
+  const recoveryHash = scryptSync(`recovery:${recoveryPhrase}`, recoverySalt, 32).toString("base64url");
+  return { recoverySalt, recoveryHash };
+}
+
 function verifyPassword(password, account = {}) {
   if (!validPassword(password) || !account.passwordSalt || !account.passwordHash) return false;
   const expected = Buffer.from(account.passwordHash, "base64url");
   const actual = scryptSync(password, account.passwordSalt, 32);
   return expected.length === actual.length && timingSafeEqual(expected, actual);
+}
+
+function verifyRecoveryPhrase(recoveryPhrase, account = {}) {
+  if (!validRecoveryPhrase(recoveryPhrase) || !account.recoverySalt || !account.recoveryHash) return false;
+  const expected = Buffer.from(account.recoveryHash, "base64url");
+  const actual = scryptSync(`recovery:${recoveryPhrase}`, account.recoverySalt, 32);
+  return expected.length === actual.length && timingSafeEqual(expected, actual);
+}
+
+function normalizeRecoveryPhrase(phrase = "") {
+  return String(phrase || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z\s-]/g, " ")
+    .replace(/\s+/g, " ");
+}
+
+function validRecoveryPhrase(phrase = "") {
+  const words = normalizeRecoveryPhrase(phrase).split(" ").filter(Boolean);
+  return words.length >= 8 && words.length <= 24;
 }
 
 function samePublicKey(first, second) {
@@ -1461,8 +1617,8 @@ function sendAccountResponse(socket, message, ok, responseMessage, data = {}) {
   });
 }
 
-function allowUserAction(socket) {
-  return enforceSocketRateLimit(socket);
+function allowUserAction(socket, action = "general") {
+  return enforceSocketRateLimit(socket, action);
 }
 
 function validateContentType(socket, message = {}) {
@@ -1474,14 +1630,25 @@ function validateContentType(socket, message = {}) {
   return true;
 }
 
-function enforceSocketRateLimit(socket) {
+function enforceSocketRateLimit(socket, action = "general") {
   const now = Date.now();
-  if (!socket.rateWindowStartedAt || now - socket.rateWindowStartedAt >= 60000) {
-    socket.rateWindowStartedAt = now;
-    socket.rateWindowCount = 0;
+  const limits = {
+    message: 120,
+    "group-message": 120,
+    "group-manage": 40,
+    "directory-search": 80,
+    general: 90
+  };
+  const limit = limits[action] || limits.general;
+  if (!socket.rateWindows) socket.rateWindows = new Map();
+  const current = socket.rateWindows.get(action) || { startedAt: now, count: 0 };
+  if (now - current.startedAt >= 60000) {
+    current.startedAt = now;
+    current.count = 0;
   }
-  socket.rateWindowCount += 1;
-  if (socket.rateWindowCount <= 120) return true;
+  current.count += 1;
+  socket.rateWindows.set(action, current);
+  if (current.count <= limit) return true;
   send(socket, { type: "error", message: "This account is sending too quickly. Try again shortly." });
   return false;
 }
