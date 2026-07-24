@@ -236,7 +236,7 @@ async function sendAccountStatus(socket, message = {}) {
     requestId: String(message.requestId || ""),
     ok: true,
     peerId,
-    exists: Boolean(account),
+    exists: Boolean(account || publicKeyJwk),
     hasPassword: Boolean(account?.passwordHash),
     canClaimFromThisDevice: Boolean(socket.bypassiumId === peerId && socket.publicKeyJwk && publicKeyJwk && samePublicKey(socket.publicKeyJwk, publicKeyJwk)),
     profile: sanitizeProfile(account?.profile || await getProfile(peerId) || {})
@@ -255,6 +255,11 @@ async function createAccount(socket, message = {}) {
     sendAccountResponse(socket, message, false, "Use at least 8 characters for your password.");
     return;
   }
+  const encryptedIdentityBackup = sanitizeEncryptedBackup(message.encryptedIdentityBackup);
+  if (!encryptedIdentityBackup?.data) {
+    sendAccountResponse(socket, message, false, "Account creation needs an encrypted identity backup.");
+    return;
+  }
   const existing = await getAccount(peerId);
   if (existing?.passwordHash) {
     sendAccountResponse(socket, message, false, "That Bypassium code already has a password. Sign in instead.");
@@ -270,7 +275,7 @@ async function createAccount(socket, message = {}) {
     peerId,
     ...hashPassword(password),
     publicKeyJwk,
-    encryptedIdentityBackup: sanitizeEncryptedBackup(message.encryptedIdentityBackup),
+    encryptedIdentityBackup,
     profile: sanitizeProfile(message.profile || await getProfile(peerId) || {}),
     createdAt: existing?.createdAt || now,
     updatedAt: now
