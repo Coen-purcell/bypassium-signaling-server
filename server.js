@@ -1,5 +1,5 @@
 import http from "node:http";
-import { randomUUID } from "node:crypto";
+import { randomBytes, randomUUID, scryptSync, timingSafeEqual } from "node:crypto";
 import Redis from "ioredis";
 import { WebSocketServer } from "ws";
 
@@ -16,11 +16,15 @@ const REDIS_URL = process.env.REDIS_URL || process.env.RENDER_REDIS_URL || proce
 const UPSTASH_REST_URL = process.env.UPSTASH_REDIS_REST_URL || "";
 const UPSTASH_REST_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN || "";
 const clients = new Map();
+const sessions = new Map();
 const memoryPublicKeys = new Map();
 const memoryProfiles = new Map();
+const memoryAccounts = new Map();
 const memoryDirectory = new Map();
 const memoryGroups = new Map();
 const memoryOfflineMessages = new Map();
+const pendingQueuedEnvelopes = new Map();
+const cancelledQueuedEnvelopes = new Set();
 const redis = createRedisClient();
 const upstashRestEnabled = Boolean(!redis && UPSTASH_REST_URL && UPSTASH_REST_TOKEN);
 
@@ -55,9 +59,10 @@ const server = http.createServer(async (request, response) => {
 
 const wss = new WebSocketServer({ server, maxPayload: MAX_WEBSOCKET_PAYLOAD_CHARS });
 
-wss.on("connection", (socket) => {
+wss.on("connection", (socket, request) => {
   socket.bypassiumId = null;
   socket.publicKeyJwk = null;
+  socket.remoteAddress = String(request?.socket?.remoteAddress || "");
 
   socket.on("message", async (raw) => {
     let message;
@@ -70,6 +75,12 @@ wss.on("connection", (socket) => {
 
     try {
       if (message.type === "register") await registerClient(socket, message);
+      if (message.type === "account-status") await sendAccountStatus(socket, message);
+      if (message.type === "create-account") await createAccount(socket, message);
+      if (message.type === "claim-legacy-account") await claimLegacyAccount(socket, message);
+      if (message.type === "sign-in") await signInAccount(socket, message);
+      if (message.type === "sign-out") await signOutAccount(socket, message);
+      if (message.type === "delete-account") await deleteAccount(socket, message);
       if (message.type === "watch-contacts") await sendContactStatuses(socket, message.contacts);
       if (message.type === "publish-profile") await publishProfile(socket, message.profile);
       if (message.type === "quick-add-request") await sendQuickAddResults(socket, message);
@@ -118,11 +129,24 @@ async function registerClient(socket, message) {
     send(socket, { type: "error", message: "Registration requires a 6-digit ID and public key." });
     return;
   }
+  const account = await getAccount(byPassiumId);
+  const storedPublicKey = await getPublicKey(byPassiumId);
+  const storedKeyMatches = !storedPublicKey || samePublicKey(storedPublicKey, message.publicKeyJwk);
+  if (account?.passwordHash && !storedKeyMatches && !validSession(byPassiumId, message.sessionToken)) {
+    send(socket, { type: "account-auth-required", peerId: byPassiumId, message: "Sign in before using this Bypassium code on this device." });
+    return;
+  }
+  if (!account?.passwordHash && !storedKeyMatches) {
+    send(socket, { type: "legacy-claim-required", peerId: byPassiumId, message: "This code already belongs to another local identity. Sign in or use the original device." });
+    return;
+  }
 
   unregisterClient(socket);
   socket.bypassiumId = byPassiumId;
   socket.publicKeyJwk = message.publicKeyJwk;
-  await setPublicKey(byPassiumId, message.publicKeyJwk);
+  if (!storedPublicKey || !samePublicKey(storedPublicKey, message.publicKeyJwk)) {
+    await setPublicKey(byPassiumId, message.publicKeyJwk);
+  }
   if (!clients.has(byPassiumId)) clients.set(byPassiumId, new Set());
   clients.get(byPassiumId).add(socket);
   send(socket, {
@@ -140,8 +164,10 @@ async function registerClient(socket, message) {
       deliveryStatus: true,
       groupRoles: true,
       encryptedChatSettings: true,
-      quickAddDirectory: true
-    }
+      quickAddDirectory: true,
+      accounts: true
+    },
+    account: publicAccountStatus(account, Boolean(account?.passwordHash))
   });
   await deliverOfflineMessages(socket);
 }
@@ -161,6 +187,7 @@ async function syncClient(socket) {
 // Removes a browser session from the online directory without deleting its persisted public key.
 function unregisterClient(socket) {
   if (!socket.bypassiumId) return;
+  const disconnectedId = socket.bypassiumId;
   const sockets = clients.get(socket.bypassiumId);
   if (sockets) {
     sockets.delete(socket);
@@ -196,10 +223,128 @@ function getRegisteredSender(socket) {
   return socket.bypassiumId;
 }
 
+async function sendAccountStatus(socket, message = {}) {
+  const peerId = String(message.peerId || socket.bypassiumId || "").trim();
+  if (!/^\d{6}$/.test(peerId)) {
+    send(socket, { type: "account-status-result", requestId: String(message.requestId || ""), ok: false, message: "Enter a valid 6-digit Bypassium code." });
+    return;
+  }
+  const account = await getAccount(peerId);
+  const publicKeyJwk = await getPublicKey(peerId);
+  send(socket, {
+    type: "account-status-result",
+    requestId: String(message.requestId || ""),
+    ok: true,
+    peerId,
+    exists: Boolean(account),
+    hasPassword: Boolean(account?.passwordHash),
+    canClaimFromThisDevice: Boolean(socket.bypassiumId === peerId && socket.publicKeyJwk && publicKeyJwk && samePublicKey(socket.publicKeyJwk, publicKeyJwk)),
+    profile: sanitizeProfile(account?.profile || await getProfile(peerId) || {})
+  });
+}
+
+async function createAccount(socket, message = {}) {
+  const peerId = String(message.peerId || socket.bypassiumId || "").trim();
+  const password = String(message.password || "");
+  const publicKeyJwk = message.publicKeyJwk || socket.publicKeyJwk;
+  if (!/^\d{6}$/.test(peerId) || !publicKeyJwk) {
+    sendAccountResponse(socket, message, false, "Account creation requires a 6-digit code and local identity.");
+    return;
+  }
+  if (!validPassword(password)) {
+    sendAccountResponse(socket, message, false, "Use at least 8 characters for your password.");
+    return;
+  }
+  const existing = await getAccount(peerId);
+  if (existing?.passwordHash) {
+    sendAccountResponse(socket, message, false, "That Bypassium code already has a password. Sign in instead.");
+    return;
+  }
+  const storedPublicKey = await getPublicKey(peerId);
+  if (storedPublicKey && !samePublicKey(storedPublicKey, publicKeyJwk)) {
+    sendAccountResponse(socket, message, false, "That code already belongs to another local identity.");
+    return;
+  }
+  const now = new Date().toISOString();
+  const account = {
+    peerId,
+    ...hashPassword(password),
+    publicKeyJwk,
+    encryptedIdentityBackup: sanitizeEncryptedBackup(message.encryptedIdentityBackup),
+    profile: sanitizeProfile(message.profile || await getProfile(peerId) || {}),
+    createdAt: existing?.createdAt || now,
+    updatedAt: now
+  };
+  await setAccount(peerId, account);
+  await setPublicKey(peerId, publicKeyJwk);
+  if (account.profile) {
+    await setProfile(peerId, account.profile);
+    await updateQuickAddDirectory(peerId, account.profile);
+  }
+  const sessionToken = issueSession(peerId);
+  sendAccountResponse(socket, message, true, "Account created.", { sessionToken, account: publicAccountStatus(account, true) });
+}
+
+async function claimLegacyAccount(socket, message = {}) {
+  const peerId = socket.bypassiumId;
+  if (!peerId || !socket.publicKeyJwk) {
+    sendAccountResponse(socket, message, false, "Open this on the original signed-in Bypassium device.");
+    return;
+  }
+  const storedPublicKey = await getPublicKey(peerId);
+  if (!storedPublicKey || !samePublicKey(storedPublicKey, socket.publicKeyJwk)) {
+    sendAccountResponse(socket, message, false, "This device does not match the saved identity for that code.");
+    return;
+  }
+  await createAccount(socket, { ...message, peerId, publicKeyJwk: socket.publicKeyJwk });
+}
+
+async function signInAccount(socket, message = {}) {
+  const peerId = String(message.peerId || "").trim();
+  const password = String(message.password || "");
+  const account = /^\d{6}$/.test(peerId) ? await getAccount(peerId) : null;
+  if (!account?.passwordHash || !verifyPassword(password, account)) {
+    sendAccountResponse(socket, message, false, "Code or password is incorrect.");
+    return;
+  }
+  const sessionToken = issueSession(peerId);
+  sendAccountResponse(socket, message, true, "Signed in.", {
+    sessionToken,
+    account: publicAccountStatus(account, true),
+    encryptedIdentityBackup: account.encryptedIdentityBackup || null
+  });
+}
+
+async function signOutAccount(socket, message = {}) {
+  const peerId = String(message.peerId || socket.bypassiumId || "").trim();
+  const sessionToken = String(message.sessionToken || "");
+  const session = sessions.get(sessionToken);
+  if (session?.peerId === peerId) sessions.delete(sessionToken);
+  sendAccountResponse(socket, message, true, "Signed out.");
+}
+
+async function deleteAccount(socket, message = {}) {
+  const peerId = String(message.peerId || socket.bypassiumId || "").trim();
+  if (!/^\d{6}$/.test(peerId)) {
+    sendAccountResponse(socket, message, false, "Choose a valid account.");
+    return;
+  }
+  const account = await getAccount(peerId);
+  if (!account?.passwordHash || !verifyPassword(String(message.password || ""), account)) {
+    sendAccountResponse(socket, message, false, "Password confirmation failed.");
+    return;
+  }
+  await removeAccount(peerId);
+  sessions.delete(String(message.sessionToken || ""));
+  sendAccountResponse(socket, message, true, "Account deleted.");
+}
+
 // Relays encrypted message envelopes or queues them until the receiver reconnects.
 async function relayDirectMessage(socket, message) {
   const senderId = getRegisteredSender(socket);
   if (!senderId) return;
+  if (!allowUserAction(socket, "message")) return;
+  if (!validateContentType(socket, message)) return;
 
   const targetId = String(message.to || "").trim();
   if (!/^\d{6}$/.test(targetId) || !message.encrypted) {
@@ -211,13 +356,12 @@ async function relayDirectMessage(socket, message) {
     type: "direct-message",
     messageId: message.messageId || randomUUID(),
     from: senderId,
-    profile: sanitizeProfile(await getProfile(senderId)),
+    profile: localProfile(senderId),
     publicKeyJwk: socket.publicKeyJwk,
     encrypted: message.encrypted,
     sentAt: message.sentAt || new Date().toISOString()
   };
   const targets = clients.get(targetId);
-  await queueOfflineMessage(targetId, envelope);
   send(socket, {
     type: "message-status",
     messageId: envelope.messageId,
@@ -227,6 +371,7 @@ async function relayDirectMessage(socket, message) {
   });
 
   if (!targets?.size) {
+    await queueForDelivery(targetId, envelope, { awaitWrite: true });
     send(socket, { type: "message-queued", peerId: targetId, sentAt: envelope.sentAt, persistent: storageMode() !== "memory" });
     return;
   }
@@ -234,13 +379,15 @@ async function relayDirectMessage(socket, message) {
   for (const target of targets) {
     if (target !== socket && target.readyState === 1) send(target, envelope);
   }
+  queueForDelivery(targetId, envelope);
   send(socket, { type: "message-relayed", messageId: envelope.messageId, peerId: targetId, sentAt: envelope.sentAt });
 }
 
 // Relays an encrypted per-conversation setting without adding it to chat history.
 async function relayDirectSetting(socket, message) {
-  const senderId = registeredPeerId(socket);
+  const senderId = getRegisteredSender(socket);
   if (!senderId) return;
+  if (!allowUserAction(socket, "message")) return;
   const targetId = String(message.to || "").trim();
   if (!/^\d{6}$/.test(targetId) || !message.encrypted) {
     send(socket, { type: "error", message: "Setting target or encrypted payload is invalid." });
@@ -250,14 +397,17 @@ async function relayDirectSetting(socket, message) {
     type: "direct-setting",
     messageId: message.messageId || randomUUID(),
     from: senderId,
-    profile: sanitizeProfile(await getProfile(senderId)),
+    profile: localProfile(senderId),
     publicKeyJwk: socket.publicKeyJwk,
     encrypted: message.encrypted,
     sentAt: message.sentAt || new Date().toISOString()
   };
-  await queueOfflineMessage(targetId, envelope);
-  const target = clients.get(targetId);
-  if (target) send(target, envelope);
+  const targets = clients.get(targetId);
+  if (!targets?.size) await queueForDelivery(targetId, envelope, { awaitWrite: true });
+  for (const target of targets || []) {
+    if (target !== socket && target.readyState === 1) send(target, envelope);
+  }
+  if (targets?.size) queueForDelivery(targetId, envelope);
   send(socket, { type: "setting-relayed", messageId: envelope.messageId, peerId: targetId });
 }
 
@@ -265,6 +415,8 @@ async function relayDirectSetting(socket, message) {
 async function relayGroupMessage(socket, message) {
   const senderId = getRegisteredSender(socket);
   if (!senderId) return;
+  if (!allowUserAction(socket, "group-message")) return;
+  if (!validateContentType(socket, message)) return;
   const group = await getGroup(message.groupId);
   if (!group || !group.members.includes(senderId)) {
     send(socket, { type: "error", message: "You are not a member of this group." });
@@ -273,6 +425,7 @@ async function relayGroupMessage(socket, message) {
   const recipients = Array.isArray(message.recipients) ? message.recipients : [];
   const sentAt = message.sentAt || new Date().toISOString();
   const messageId = message.messageId || randomUUID();
+  const senderProfile = localProfile(senderId);
   const deliveries = recipients.map(async (recipient) => {
     const targetId = String(recipient.to || "").trim();
     if (targetId === senderId || !group.members.includes(targetId) || !recipient.encrypted) return null;
@@ -283,17 +436,19 @@ async function relayGroupMessage(socket, message) {
       groupName: group.name,
       members: group.members,
       from: senderId,
-      profile: sanitizeProfile(await getProfile(senderId)),
+      profile: senderProfile,
       publicKeyJwk: socket.publicKeyJwk,
       encrypted: recipient.encrypted,
       sentAt
     };
-    await queueOfflineMessage(targetId, envelope);
     const targets = clients.get(targetId);
     if (targets?.size) {
       for (const target of targets) {
         if (target !== socket && target.readyState === 1) send(target, envelope);
       }
+      queueForDelivery(targetId, envelope);
+    } else {
+      await queueForDelivery(targetId, envelope, { awaitWrite: true });
     }
     return targetId;
   });
@@ -318,7 +473,9 @@ async function acknowledgeMessage(socket, message) {
     send(socket, { type: "error", message: "Acknowledgement requires a message ID." });
     return;
   }
-  const envelope = await getOfflineMessage(targetId, messageId);
+  const pendingKey = queuedEnvelopeKey(targetId, messageId);
+  cancelledQueuedEnvelopes.add(pendingKey);
+  const envelope = pendingQueuedEnvelopes.get(pendingKey) || await getOfflineMessage(targetId, messageId);
   await removeOfflineMessage(targetId, messageId);
   if (envelope?.from && (envelope.type === "direct-message" || envelope.type === "group-message")) {
     sendToClient(envelope.from, {
@@ -380,8 +537,8 @@ async function relayReadReceipt(socket, message) {
     messageId,
     readAt: message.readAt || new Date().toISOString()
   };
-  await queueOfflineMessage(targetId, envelope);
   sendToClient(targetId, envelope, socket);
+  queueForDelivery(targetId, envelope);
 }
 
 async function relayReaction(socket, message) {
@@ -407,8 +564,8 @@ async function relayReaction(socket, message) {
         active: message.active !== false,
         reactedAt: new Date().toISOString()
       };
-      await queueOfflineMessage(memberId, envelope);
       sendToClient(memberId, envelope, socket);
+      queueForDelivery(memberId, envelope);
     }
     return;
   }
@@ -424,8 +581,8 @@ async function relayReaction(socket, message) {
     active: message.active !== false,
     reactedAt: new Date().toISOString()
   };
-  await queueOfflineMessage(targetId, envelope);
   sendToClient(targetId, envelope, socket);
+  queueForDelivery(targetId, envelope);
 }
 
 // Stores a user's public profile so contacts can display their current picture.
@@ -438,6 +595,8 @@ async function publishProfile(socket, profile = {}) {
     joinedAt: existing?.joinedAt || new Date().toISOString()
   }, true);
   await setProfile(peerId, cleanProfile);
+  const account = await getAccount(peerId);
+  if (account) await setAccount(peerId, { ...account, profile: cleanProfile, updatedAt: new Date().toISOString() });
   await updateQuickAddDirectory(peerId, cleanProfile);
   broadcastProfileUpdate(peerId, cleanProfile);
 }
@@ -482,6 +641,7 @@ async function sendQuickAddResults(socket, message = {}) {
 async function createGroup(socket, message) {
   const creatorId = getRegisteredSender(socket);
   if (!creatorId) return;
+  if (!allowUserAction(socket, "group-manage")) return;
   const members = normalizeMembers([creatorId, ...(message.members || [])]);
   const group = {
     id: randomUUID(),
@@ -504,6 +664,7 @@ async function renameGroup(socket, message) {
 async function updateGroupDetails(socket, message) {
   const peerId = getRegisteredSender(socket);
   if (!peerId) return;
+  if (!allowUserAction(socket, "group-manage")) return;
   const group = await getGroup(message.groupId);
   if (!group || !canAdministerGroup(group, peerId)) {
     send(socket, { type: "error", message: "Only the group owner or an administrator can change group details." });
@@ -523,12 +684,18 @@ async function updateGroupDetails(socket, message) {
 async function addGroupMembers(socket, message) {
   const peerId = getRegisteredSender(socket);
   if (!peerId) return;
+  if (!allowUserAction(socket, "group-manage")) return;
   const group = await getGroup(message.groupId);
   if (!group || !group.members.includes(peerId)) {
     send(socket, { type: "error", message: "Only current group members can add people." });
     return;
   }
-  group.members = normalizeMembers([...group.members, ...(message.members || [])]);
+  if (group.memberAddLocked && group.ownerId !== peerId && !(group.admins || []).includes(peerId)) {
+    send(socket, { type: "error", message: "Adding members is locked for this group." });
+    return;
+  }
+  const requestedMembers = normalizeMembers(message.members || []);
+  group.members = normalizeMembers([...group.members, ...requestedMembers]);
   group.updatedAt = new Date().toISOString();
   await setGroup(group);
   broadcastGroupUpdate(group);
@@ -537,6 +704,7 @@ async function addGroupMembers(socket, message) {
 async function setGroupAdmin(socket, message) {
   const peerId = getRegisteredSender(socket);
   if (!peerId) return;
+  if (!allowUserAction(socket, "group-manage")) return;
   const group = await getGroup(message.groupId);
   const memberId = String(message.memberId || "").trim();
   if (!group || group.ownerId !== peerId || !group.members.includes(memberId) || memberId === group.ownerId) {
@@ -556,6 +724,7 @@ async function setGroupAdmin(socket, message) {
 async function transferGroupOwnership(socket, message) {
   const peerId = getRegisteredSender(socket);
   if (!peerId) return;
+  if (!allowUserAction(socket, "group-manage")) return;
   const group = await getGroup(message.groupId);
   const memberId = String(message.memberId || "").trim();
   if (!group || group.ownerId !== peerId || !group.members.includes(memberId) || memberId === peerId) {
@@ -572,6 +741,7 @@ async function transferGroupOwnership(socket, message) {
 async function removeGroupMember(socket, message) {
   const peerId = getRegisteredSender(socket);
   if (!peerId) return;
+  if (!allowUserAction(socket, "group-manage")) return;
   const group = await getGroup(message.groupId);
   const memberId = String(message.memberId || "").trim();
   if (!group || !canAdministerGroup(group, peerId) || !group.members.includes(memberId) || memberId === group.ownerId) {
@@ -617,25 +787,26 @@ async function queueOfflineMessage(targetId, envelope) {
   if (serialized.length > MAX_QUEUED_ENVELOPE_CHARS) {
     throw new Error("That message is too large for offline delivery. Try a smaller attachment.");
   }
-
   if (redis) {
     const indexKey = inboxIndexKey(targetId);
-    await redis.set(queuedMessageKey(targetId, queueId), serialized, "EX", OFFLINE_MESSAGE_TTL_SECONDS);
-    await redis.lrem(indexKey, 0, queueId);
-    await redis.rpush(indexKey, queueId);
-    await redis.ltrim(indexKey, -MAX_OFFLINE_MESSAGES_PER_USER, -1);
-    await redis.expire(indexKey, OFFLINE_MESSAGE_TTL_SECONDS);
+    await redis.pipeline()
+      .set(queuedMessageKey(targetId, queueId), serialized, "EX", queueTtlSeconds())
+      .lrem(indexKey, 0, queueId)
+      .rpush(indexKey, queueId)
+      .ltrim(indexKey, -maxOfflineMessagesPerUser(), -1)
+      .expire(indexKey, queueTtlSeconds())
+      .exec();
     return;
   }
 
   if (upstashRestEnabled) {
     const indexKey = inboxIndexKey(targetId);
     await upstashPipeline([
-      ["SET", queuedMessageKey(targetId, queueId), serialized, "EX", OFFLINE_MESSAGE_TTL_SECONDS],
+      ["SET", queuedMessageKey(targetId, queueId), serialized, "EX", queueTtlSeconds()],
       ["LREM", indexKey, 0, queueId],
       ["RPUSH", indexKey, queueId],
-      ["LTRIM", indexKey, -MAX_OFFLINE_MESSAGES_PER_USER, -1],
-      ["EXPIRE", indexKey, OFFLINE_MESSAGE_TTL_SECONDS]
+      ["LTRIM", indexKey, -maxOfflineMessagesPerUser(), -1],
+      ["EXPIRE", indexKey, queueTtlSeconds()]
     ]);
     return;
   }
@@ -643,7 +814,31 @@ async function queueOfflineMessage(targetId, envelope) {
   const queue = memoryOfflineMessages.get(targetId) || [];
   const deduped = queue.filter((message) => (message.queueId || message.messageId) !== queueId);
   deduped.push(queuedMessage);
-  memoryOfflineMessages.set(targetId, deduped.slice(-MAX_OFFLINE_MESSAGES_PER_USER));
+  memoryOfflineMessages.set(targetId, deduped.slice(-maxOfflineMessagesPerUser()));
+}
+
+function queueForDelivery(targetId, envelope, { awaitWrite = false } = {}) {
+  const queueId = String(envelope.queueId || envelope.messageId || "");
+  const pendingKey = queuedEnvelopeKey(targetId, queueId);
+  pendingQueuedEnvelopes.set(pendingKey, envelope);
+  const write = queueOfflineMessage(targetId, envelope)
+    .then(async () => {
+      if (cancelledQueuedEnvelopes.has(pendingKey)) {
+        await removeOfflineMessage(targetId, queueId);
+      }
+    })
+    .catch((error) => {
+      console.error("Offline queue write failed:", error.message);
+    })
+    .finally(() => {
+      pendingQueuedEnvelopes.delete(pendingKey);
+      cancelledQueuedEnvelopes.delete(pendingKey);
+    });
+  return awaitWrite ? write : undefined;
+}
+
+function queuedEnvelopeKey(targetId, messageId) {
+  return `${targetId}:${messageId}`;
 }
 
 // Delivers queued messages with their original sentAt time. Messages stay queued until acked.
@@ -657,7 +852,7 @@ async function deliverOfflineMessages(socket) {
     const id = String(message.queueId || message.messageId || "");
     if (!id || seen.has(id)) continue;
     seen.add(id);
-    if (Date.now() - message.queuedAt > OFFLINE_MESSAGE_TTL_SECONDS * 1000) {
+    if (Date.now() - message.queuedAt > queueTtlSeconds() * 1000) {
       expiredIds.push(id);
       continue;
     }
@@ -671,7 +866,7 @@ async function deliverOfflineMessages(socket) {
 async function getOfflineMessages(targetId) {
   if (!redis && !upstashRestEnabled) return memoryOfflineMessages.get(targetId) || [];
   const ids = await getInboxIds(targetId);
-  const uniqueIds = [...new Set(ids)].slice(-MAX_OFFLINE_MESSAGES_PER_USER);
+  const uniqueIds = [...new Set(ids)].slice(-maxOfflineMessagesPerUser());
   const messages = [];
   const keptIds = [];
   for (const id of uniqueIds) {
@@ -754,7 +949,7 @@ async function replaceInboxIds(targetId, ids) {
     await redis.del(key);
     if (ids.length) {
       await redis.rpush(key, ...ids);
-      await redis.expire(key, OFFLINE_MESSAGE_TTL_SECONDS);
+      await redis.expire(key, queueTtlSeconds());
     }
     return;
   }
@@ -763,7 +958,7 @@ async function replaceInboxIds(targetId, ids) {
     await upstashCommand(["DEL", key]);
     if (ids.length) {
       await upstashPushList(key, ids);
-      await upstashCommand(["EXPIRE", key, OFFLINE_MESSAGE_TTL_SECONDS]);
+      await upstashCommand(["EXPIRE", key, queueTtlSeconds()]);
     }
   }
 }
@@ -804,6 +999,30 @@ async function getPublicKey(peerId) {
   const publicKeyJwk = JSON.parse(stored);
   memoryPublicKeys.set(peerId, publicKeyJwk);
   return publicKeyJwk;
+}
+
+async function setAccount(peerId, account) {
+  const clean = sanitizeAccount(account);
+  memoryAccounts.set(peerId, clean);
+  if (redis) await redis.set(accountKey(peerId), JSON.stringify(clean));
+  if (upstashRestEnabled) await upstashCommand(["SET", accountKey(peerId), JSON.stringify(clean)]);
+}
+
+async function getAccount(peerId) {
+  if (memoryAccounts.has(peerId)) return memoryAccounts.get(peerId);
+  let stored = null;
+  if (redis) stored = await redis.get(accountKey(peerId));
+  if (upstashRestEnabled) stored = await upstashCommand(["GET", accountKey(peerId)]);
+  if (!stored) return null;
+  const account = sanitizeAccount(JSON.parse(stored));
+  memoryAccounts.set(peerId, account);
+  return account;
+}
+
+async function removeAccount(peerId) {
+  memoryAccounts.delete(peerId);
+  if (redis) await redis.del(accountKey(peerId));
+  if (upstashRestEnabled) await upstashCommand(["DEL", accountKey(peerId)]);
 }
 
 async function setProfile(peerId, profile) {
@@ -881,6 +1100,7 @@ function parseStoredProfile(value) {
 }
 
 function isDiscoverableProfile(profile = {}) {
+  if (profile.quickAddVisible === false) return false;
   const displayName = String(profile.displayName || "").trim();
   return Boolean(
     profile.profilePicture
@@ -1081,7 +1301,8 @@ function sanitizeProfile(profile = {}, stampUpdate = false) {
   const cleanProfile = {
     displayName: String(profile?.displayName || "").slice(0, 80),
     profilePicture: sanitizeProfilePicture(profile?.profilePicture),
-    joinedAt: String(profile?.joinedAt || "").slice(0, 40)
+    joinedAt: String(profile?.joinedAt || "").slice(0, 40),
+    quickAddVisible: profile?.quickAddVisible !== false
   };
   if (stampUpdate) cleanProfile.updatedAt = new Date().toISOString();
   else if (profile?.updatedAt) cleanProfile.updatedAt = String(profile.updatedAt).slice(0, 40);
@@ -1095,8 +1316,135 @@ function sanitizeProfilePicture(value = "") {
   return picture.slice(0, MAX_PROFILE_PICTURE_CHARS);
 }
 
+function sanitizeAccount(account = {}) {
+  return {
+    peerId: String(account.peerId || "").slice(0, 6),
+    passwordSalt: String(account.passwordSalt || "").slice(0, 128),
+    passwordHash: String(account.passwordHash || "").slice(0, 256),
+    publicKeyJwk: account.publicKeyJwk || null,
+    encryptedIdentityBackup: sanitizeEncryptedBackup(account.encryptedIdentityBackup),
+    profile: sanitizeProfile(account.profile || {}),
+    createdAt: String(account.createdAt || "").slice(0, 40),
+    updatedAt: String(account.updatedAt || "").slice(0, 40)
+  };
+}
+
+function sanitizeEncryptedBackup(value = null) {
+  if (!value || typeof value !== "object") return null;
+  return {
+    version: 1,
+    salt: String(value.salt || "").slice(0, 256),
+    iv: String(value.iv || "").slice(0, 128),
+    data: String(value.data || "").slice(0, 120000),
+    kdf: String(value.kdf || "PBKDF2-SHA-256").slice(0, 40)
+  };
+}
+
+function validPassword(password) {
+  return password.length >= 8 && password.length <= 200;
+}
+
+function hashPassword(password) {
+  const passwordSalt = randomBytes(16).toString("base64url");
+  const passwordHash = scryptSync(password, passwordSalt, 32).toString("base64url");
+  return { passwordSalt, passwordHash };
+}
+
+function verifyPassword(password, account = {}) {
+  if (!validPassword(password) || !account.passwordSalt || !account.passwordHash) return false;
+  const expected = Buffer.from(account.passwordHash, "base64url");
+  const actual = scryptSync(password, account.passwordSalt, 32);
+  return expected.length === actual.length && timingSafeEqual(expected, actual);
+}
+
+function samePublicKey(first, second) {
+  return stableStringify(first) === stableStringify(second);
+}
+
+function stableStringify(value) {
+  if (!value || typeof value !== "object") return JSON.stringify(value);
+  const sorted = {};
+  for (const key of Object.keys(value).sort()) sorted[key] = value[key];
+  return JSON.stringify(sorted);
+}
+
+function issueSession(peerId) {
+  const token = randomBytes(32).toString("base64url");
+  sessions.set(token, { peerId, expiresAt: Date.now() + 30 * 24 * 60 * 60 * 1000 });
+  return token;
+}
+
+function validSession(peerId, token) {
+  const session = sessions.get(String(token || ""));
+  if (!session || session.peerId !== peerId || session.expiresAt < Date.now()) return false;
+  session.expiresAt = Date.now() + 30 * 24 * 60 * 60 * 1000;
+  return true;
+}
+
+function publicAccountStatus(account, hasPassword = false) {
+  return {
+    exists: Boolean(account),
+    hasPassword: Boolean(hasPassword),
+    peerId: account?.peerId || "",
+    profile: sanitizeProfile(account?.profile || {}),
+    createdAt: account?.createdAt || "",
+    updatedAt: account?.updatedAt || ""
+  };
+}
+
+function sendAccountResponse(socket, message, ok, responseMessage, data = {}) {
+  send(socket, {
+    type: "account-response",
+    requestId: String(message.requestId || ""),
+    ok,
+    message: responseMessage,
+    ...data
+  });
+}
+
+function allowUserAction(socket) {
+  return enforceSocketRateLimit(socket);
+}
+
+function validateContentType(socket, message = {}) {
+  const attachmentBytes = Math.max(0, Number(message.attachmentBytes) || 0);
+  if (attachmentBytes > MAX_QUEUED_ENVELOPE_CHARS) {
+    send(socket, { type: "error", message: "That attachment is too large for offline delivery." });
+    return false;
+  }
+  return true;
+}
+
+function enforceSocketRateLimit(socket) {
+  const now = Date.now();
+  if (!socket.rateWindowStartedAt || now - socket.rateWindowStartedAt >= 60000) {
+    socket.rateWindowStartedAt = now;
+    socket.rateWindowCount = 0;
+  }
+  socket.rateWindowCount += 1;
+  if (socket.rateWindowCount <= 120) return true;
+  send(socket, { type: "error", message: "This account is sending too quickly. Try again shortly." });
+  return false;
+}
+
+function queueTtlSeconds() {
+  return OFFLINE_MESSAGE_TTL_SECONDS;
+}
+
+function maxOfflineMessagesPerUser() {
+  return MAX_OFFLINE_MESSAGES_PER_USER;
+}
+
+function localProfile(peerId) {
+  return sanitizeProfile(memoryProfiles.get(peerId) || {});
+}
+
 function publicKeyKey(peerId) {
   return `bypassium:public-key:${peerId}`;
+}
+
+function accountKey(peerId) {
+  return `bypassium:account:${peerId}`;
 }
 
 function profileKey(peerId) {
@@ -1136,7 +1484,9 @@ function sendToClient(peerId, message, exceptSocket = null) {
 }
 
 function send(socket, message) {
-  if (socket.readyState === 1) socket.send(JSON.stringify(message));
+  if (socket.readyState !== 1) return;
+  const serialized = JSON.stringify(message);
+  socket.send(serialized);
 }
 
 server.listen(PORT, () => {
