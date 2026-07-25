@@ -5,6 +5,7 @@ import { WebSocketServer } from "ws";
 
 const PORT = Number(process.env.PORT || 10000);
 const OFFLINE_MESSAGE_TTL_SECONDS = 7 * 24 * 60 * 60;
+const SESSION_TTL_SECONDS = 30 * 24 * 60 * 60;
 const MAX_OFFLINE_MESSAGES_PER_USER = 30;
 const MAX_PROFILE_PICTURE_CHARS = 18000;
 const MAX_UPSTASH_RPUSH_ITEMS = 4;
@@ -79,6 +80,8 @@ wss.on("connection", (socket, request) => {
       if (message.type === "create-account") await createAccount(socket, message);
       if (message.type === "claim-legacy-account") await claimLegacyAccount(socket, message);
       if (message.type === "sign-in") await signInAccount(socket, message);
+      if (message.type === "session-sign-in") await signInWithSession(socket, message);
+      if (message.type === "change-password") await changePassword(socket, message);
       if (message.type === "account-search") await searchAccounts(socket, message);
       if (message.type === "recover-account") await recoverAccount(socket, message);
       if (message.type === "reset-password-with-recovery") await resetPasswordWithRecovery(socket, message);
@@ -135,7 +138,7 @@ async function registerClient(socket, message) {
   const account = await getAccount(byPassiumId);
   const storedPublicKey = await getPublicKey(byPassiumId);
   const storedKeyMatches = !storedPublicKey || samePublicKey(storedPublicKey, message.publicKeyJwk);
-  if (account?.passwordHash && !storedKeyMatches && !validSession(byPassiumId, message.sessionToken)) {
+  if (account?.passwordHash && !storedKeyMatches && !(await validSession(byPassiumId, message.sessionToken))) {
     send(socket, { type: "account-auth-required", peerId: byPassiumId, message: "Sign in before using this Bypassium code on this device." });
     return;
   }
@@ -331,6 +334,55 @@ async function signInAccount(socket, message = {}) {
   });
 }
 
+async function signInWithSession(socket, message = {}) {
+  const peerId = String(message.peerId || "").trim();
+  const sessionToken = String(message.sessionToken || "");
+  const account = /^\d{6}$/.test(peerId) ? await getAccount(peerId) : null;
+  if (!account?.passwordHash || !(await validSession(peerId, sessionToken))) {
+    sendAccountResponse(socket, message, false, "Saved sign-in expired. Enter your password once to trust this device again.");
+    return;
+  }
+  sendAccountResponse(socket, message, true, "Trusted device signed in.", {
+    sessionToken,
+    account: publicAccountStatus(account, true)
+  });
+}
+
+async function changePassword(socket, message = {}) {
+  const peerId = String(message.peerId || socket.bypassiumId || "").trim();
+  const oldPassword = String(message.oldPassword || "");
+  const newPassword = String(message.newPassword || "");
+  const encryptedIdentityBackup = sanitizeEncryptedBackup(message.encryptedIdentityBackup);
+  const publicKeyJwk = message.publicKeyJwk || socket.publicKeyJwk || null;
+  const account = /^\d{6}$/.test(peerId) ? await getAccount(peerId) : null;
+  if (!account?.passwordHash || !verifyPassword(oldPassword, account)) {
+    sendAccountResponse(socket, message, false, "Old password is incorrect.");
+    return;
+  }
+  if (!validPassword(newPassword) || !encryptedIdentityBackup?.data || !publicKeyJwk) {
+    sendAccountResponse(socket, message, false, "Choose a valid new password and identity backup.");
+    return;
+  }
+
+  await revokePeerSessions(peerId);
+  const now = new Date().toISOString();
+  const updated = sanitizeAccount({
+    ...account,
+    ...hashPassword(newPassword),
+    publicKeyJwk,
+    encryptedIdentityBackup,
+    updatedAt: now
+  });
+  await setAccount(peerId, updated);
+  await setPublicKey(peerId, publicKeyJwk);
+  const sessionToken = issueSession(peerId);
+  sendAccountResponse(socket, message, true, "Password changed.", {
+    sessionToken,
+    account: publicAccountStatus(updated, true),
+    encryptedIdentityBackup: updated.encryptedIdentityBackup || null
+  });
+}
+
 async function recoverAccount(socket, message = {}) {
   const peerId = String(message.peerId || "").trim();
   const recoveryPhrase = normalizeRecoveryPhrase(message.recoveryPhrase);
@@ -361,6 +413,7 @@ async function resetPasswordWithRecovery(socket, message = {}) {
     return;
   }
   const now = new Date().toISOString();
+  await revokePeerSessions(peerId);
   const updated = sanitizeAccount({
     ...account,
     ...hashPassword(password),
@@ -382,7 +435,7 @@ async function signOutAccount(socket, message = {}) {
   const peerId = String(message.peerId || socket.bypassiumId || "").trim();
   const sessionToken = String(message.sessionToken || "");
   const session = sessions.get(sessionToken);
-  if (session?.peerId === peerId) sessions.delete(sessionToken);
+  if (session?.peerId === peerId || await validSession(peerId, sessionToken)) await revokeSession(sessionToken);
   sendAccountResponse(socket, message, true, "Signed out.");
 }
 
@@ -398,9 +451,7 @@ async function deleteAccount(socket, message = {}) {
     return;
   }
   await deleteAccountData(peerId);
-  for (const [token, session] of sessions.entries()) {
-    if (session.peerId === peerId) sessions.delete(token);
-  }
+  await revokePeerSessions(peerId);
   sendAccountResponse(socket, message, true, "Account deleted.");
 }
 
@@ -1586,14 +1637,87 @@ function stableStringify(value) {
 function issueSession(peerId) {
   const token = randomBytes(32).toString("base64url");
   sessions.set(token, { peerId, expiresAt: Date.now() + 30 * 24 * 60 * 60 * 1000 });
+  void persistSession(token, peerId).catch((error) => console.error("Could not persist session:", error.message));
   return token;
 }
 
-function validSession(peerId, token) {
-  const session = sessions.get(String(token || ""));
-  if (!session || session.peerId !== peerId || session.expiresAt < Date.now()) return false;
-  session.expiresAt = Date.now() + 30 * 24 * 60 * 60 * 1000;
+async function validSession(peerId, token) {
+  const cleanPeerId = String(peerId || "");
+  const cleanToken = String(token || "");
+  if (!/^\d{6}$/.test(cleanPeerId) || cleanToken.length < 24) return false;
+  const session = sessions.get(cleanToken);
+  if (session?.peerId === cleanPeerId && session.expiresAt > Date.now()) {
+    session.expiresAt = Date.now() + SESSION_TTL_SECONDS * 1000;
+    void persistSession(cleanToken, cleanPeerId).catch((error) => console.error("Could not refresh session:", error.message));
+    return true;
+  }
+  const stored = await getPersistedSession(cleanToken);
+  if (stored?.peerId !== cleanPeerId) return false;
+  sessions.set(cleanToken, { peerId: cleanPeerId, expiresAt: Date.now() + SESSION_TTL_SECONDS * 1000 });
+  void persistSession(cleanToken, cleanPeerId).catch((error) => console.error("Could not refresh session:", error.message));
   return true;
+}
+
+async function persistSession(token, peerId) {
+  const payload = JSON.stringify({ peerId, createdAt: new Date().toISOString() });
+  sessions.set(token, { peerId, expiresAt: Date.now() + SESSION_TTL_SECONDS * 1000 });
+  if (redis) {
+    await redis.set(sessionKey(token), payload, "EX", SESSION_TTL_SECONDS);
+    await redis.sadd(sessionIndexKey(peerId), token);
+    await redis.expire(sessionIndexKey(peerId), SESSION_TTL_SECONDS);
+  }
+  if (upstashRestEnabled) {
+    await upstashPipeline([
+      ["SET", sessionKey(token), payload, "EX", SESSION_TTL_SECONDS],
+      ["SADD", sessionIndexKey(peerId), token],
+      ["EXPIRE", sessionIndexKey(peerId), SESSION_TTL_SECONDS]
+    ]);
+  }
+}
+
+async function getPersistedSession(token) {
+  let stored = null;
+  if (redis) stored = await redis.get(sessionKey(token));
+  if (upstashRestEnabled) stored = await upstashCommand(["GET", sessionKey(token)]);
+  if (!stored) return null;
+  try {
+    return JSON.parse(stored);
+  } catch {
+    return null;
+  }
+}
+
+async function revokeSession(token) {
+  const cleanToken = String(token || "");
+  if (!cleanToken) return;
+  const session = sessions.get(cleanToken) || await getPersistedSession(cleanToken);
+  sessions.delete(cleanToken);
+  if (redis) {
+    await redis.del(sessionKey(cleanToken));
+    if (session?.peerId) await redis.srem(sessionIndexKey(session.peerId), cleanToken);
+  }
+  if (upstashRestEnabled) {
+    const commands = [["DEL", sessionKey(cleanToken)]];
+    if (session?.peerId) commands.push(["SREM", sessionIndexKey(session.peerId), cleanToken]);
+    await upstashPipeline(commands);
+  }
+}
+
+async function revokePeerSessions(peerId) {
+  const cleanPeerId = String(peerId || "");
+  for (const [token, session] of sessions.entries()) {
+    if (session.peerId === cleanPeerId) sessions.delete(token);
+  }
+  let tokens = [];
+  if (redis) tokens = await redis.smembers(sessionIndexKey(cleanPeerId));
+  if (upstashRestEnabled) tokens = await upstashCommand(["SMEMBERS", sessionIndexKey(cleanPeerId)]) || [];
+  if (tokens.length) {
+    const sessionKeys = tokens.map(sessionKey);
+    if (redis) await redis.del(...sessionKeys);
+    if (upstashRestEnabled) await upstashPipeline(sessionKeys.map((key) => ["DEL", key]));
+  }
+  if (redis) await redis.del(sessionIndexKey(cleanPeerId));
+  if (upstashRestEnabled) await upstashCommand(["DEL", sessionIndexKey(cleanPeerId)]);
 }
 
 function publicAccountStatus(account, hasPassword = false) {
@@ -1671,6 +1795,14 @@ function publicKeyKey(peerId) {
 
 function accountKey(peerId) {
   return `bypassium:account:${peerId}`;
+}
+
+function sessionKey(token) {
+  return `bypassium:session:${token}`;
+}
+
+function sessionIndexKey(peerId) {
+  return `bypassium:sessions:${peerId}`;
 }
 
 function profileKey(peerId) {
