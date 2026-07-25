@@ -6,6 +6,8 @@ import { WebSocketServer } from "ws";
 const PORT = Number(process.env.PORT || 10000);
 const OFFLINE_MESSAGE_TTL_SECONDS = 7 * 24 * 60 * 60;
 const SESSION_TTL_SECONDS = 30 * 24 * 60 * 60;
+const ADMIN_RESET_TTL_SECONDS = 30 * 60;
+const ADMIN_AUDIT_LIMIT = 250;
 const MAX_OFFLINE_MESSAGES_PER_USER = 30;
 const MAX_PROFILE_PICTURE_CHARS = 18000;
 const MAX_UPSTASH_RPUSH_ITEMS = 4;
@@ -16,11 +18,15 @@ const MAX_WEBSOCKET_PAYLOAD_CHARS = 6_000_000;
 const REDIS_URL = process.env.REDIS_URL || process.env.RENDER_REDIS_URL || process.env.KEY_VALUE_URL || "";
 const UPSTASH_REST_URL = process.env.UPSTASH_REDIS_REST_URL || "";
 const UPSTASH_REST_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN || "";
+const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "";
 const clients = new Map();
 const sessions = new Map();
 const memoryPublicKeys = new Map();
 const memoryProfiles = new Map();
 const memoryAccounts = new Map();
+const memoryRestrictions = new Map();
+const memoryOwnerResetCodes = new Map();
+const memoryAdminAudit = [];
 const memoryDirectory = new Map();
 const memoryGroups = new Map();
 const memoryOfflineMessages = new Map();
@@ -32,8 +38,8 @@ const upstashRestEnabled = Boolean(!redis && UPSTASH_REST_URL && UPSTASH_REST_TO
 const server = http.createServer(async (request, response) => {
   const corsHeaders = {
     "access-control-allow-origin": "*",
-    "access-control-allow-methods": "GET, OPTIONS",
-    "access-control-allow-headers": "content-type"
+    "access-control-allow-methods": "GET, POST, OPTIONS",
+    "access-control-allow-headers": "content-type, authorization, x-admin-token"
   };
   if (request.method === "OPTIONS") {
     response.writeHead(204, corsHeaders);
@@ -41,7 +47,9 @@ const server = http.createServer(async (request, response) => {
     return;
   }
 
-  if (request.url === "/health") {
+  const url = new URL(request.url || "/", `http://${request.headers.host || "localhost"}`);
+
+  if (url.pathname === "/health") {
     response.writeHead(200, { ...corsHeaders, "content-type": "application/json" });
     response.end(JSON.stringify({
       ok: true,
@@ -51,6 +59,21 @@ const server = http.createServer(async (request, response) => {
       groups: await countGroups(),
       queuedUsers: await countQueuedUsers()
     }));
+    return;
+  }
+
+  if (url.pathname === "/admin") {
+    response.writeHead(200, {
+      ...corsHeaders,
+      "content-type": "text/html; charset=utf-8",
+      "cache-control": "no-store"
+    });
+    response.end(adminPageHtml());
+    return;
+  }
+
+  if (url.pathname.startsWith("/admin/api/")) {
+    await handleAdminApi(request, response, url, corsHeaders);
     return;
   }
 
@@ -85,6 +108,7 @@ wss.on("connection", (socket, request) => {
       if (message.type === "account-search") await searchAccounts(socket, message);
       if (message.type === "recover-account") await recoverAccount(socket, message);
       if (message.type === "reset-password-with-recovery") await resetPasswordWithRecovery(socket, message);
+      if (message.type === "reset-password-with-owner-code") await resetPasswordWithOwnerCode(socket, message);
       if (message.type === "sign-out") await signOutAccount(socket, message);
       if (message.type === "delete-account") await deleteAccount(socket, message);
       if (message.type === "watch-contacts") await sendContactStatuses(socket, message.contacts);
@@ -128,6 +152,383 @@ function createRedisClient() {
   return client;
 }
 
+async function handleAdminApi(request, response, url, corsHeaders) {
+  try {
+    if (url.pathname === "/admin/api/config") {
+      sendJson(response, 200, { ok: true, adminEnabled: Boolean(ADMIN_TOKEN) }, corsHeaders);
+      return;
+    }
+    if (!adminAuthorized(request)) {
+      sendJson(response, ADMIN_TOKEN ? 401 : 503, {
+        ok: false,
+        message: ADMIN_TOKEN ? "Admin token is missing or incorrect." : "Set ADMIN_TOKEN on the server before using the admin panel."
+      }, corsHeaders);
+      return;
+    }
+
+    if (request.method === "GET" && url.pathname === "/admin/api/status") {
+      sendJson(response, 200, {
+        ok: true,
+        storage: storageMode(),
+        onlineClients: clients.size,
+        accounts: (await getKnownPeerIds()).length,
+        groups: await countGroups(),
+        queuedUsers: await countQueuedUsers(),
+        auditEntries: (await getAdminAudit()).length
+      }, corsHeaders);
+      return;
+    }
+
+    if (request.method === "GET" && url.pathname === "/admin/api/accounts") {
+      const query = String(url.searchParams.get("q") || "");
+      const accounts = await searchAdminAccounts(query, 80);
+      sendJson(response, 200, { ok: true, accounts }, corsHeaders);
+      return;
+    }
+
+    if (request.method === "GET" && url.pathname === "/admin/api/account") {
+      const peerId = cleanPeerId(url.searchParams.get("peerId"));
+      const account = peerId ? await adminAccountDetail(peerId) : null;
+      sendJson(response, account ? 200 : 404, account ? { ok: true, account } : { ok: false, message: "Account not found." }, corsHeaders);
+      return;
+    }
+
+    if (request.method === "GET" && url.pathname === "/admin/api/audit") {
+      sendJson(response, 200, { ok: true, audit: await getAdminAudit() }, corsHeaders);
+      return;
+    }
+
+    if (request.method !== "POST") {
+      sendJson(response, 405, { ok: false, message: "Method not allowed." }, corsHeaders);
+      return;
+    }
+
+    const body = await readRequestJson(request);
+    const peerId = cleanPeerId(body.peerId);
+    if (!peerId && url.pathname !== "/admin/api/audit") {
+      sendJson(response, 400, { ok: false, message: "Choose a valid 6-digit account code." }, corsHeaders);
+      return;
+    }
+
+    if (url.pathname === "/admin/api/ban") {
+      const reason = String(body.reason || "Admin ban").slice(0, 240);
+      const bannedUntil = normalizeAdminDate(body.bannedUntil);
+      await setAccountRestriction(peerId, {
+        banned: true,
+        banReason: reason,
+        bannedAt: new Date().toISOString(),
+        bannedUntil,
+        passwordResetRequired: false
+      });
+      await revokePeerSessions(peerId);
+      disconnectPeer(peerId, "This account has been banned.");
+      await recordAdminAudit("ban-account", peerId, { reason, bannedUntil });
+      sendJson(response, 200, { ok: true, account: await adminAccountDetail(peerId) }, corsHeaders);
+      return;
+    }
+
+    if (url.pathname === "/admin/api/unban") {
+      await setAccountRestriction(peerId, {
+        banned: false,
+        banReason: "",
+        bannedUntil: "",
+        bannedAt: ""
+      });
+      await recordAdminAudit("unban-account", peerId);
+      sendJson(response, 200, { ok: true, account: await adminAccountDetail(peerId) }, corsHeaders);
+      return;
+    }
+
+    if (url.pathname === "/admin/api/restrictions") {
+      await setAccountRestriction(peerId, {
+        sendDisabled: Boolean(body.sendDisabled),
+        groupsDisabled: Boolean(body.groupsDisabled),
+        quickAddHidden: Boolean(body.quickAddHidden)
+      });
+      if (body.quickAddHidden) await removeQuickAddProfile(peerId);
+      else {
+        const profile = await getProfile(peerId);
+        if (profile) await updateQuickAddDirectory(peerId, profile);
+      }
+      await recordAdminAudit("update-restrictions", peerId, {
+        sendDisabled: Boolean(body.sendDisabled),
+        groupsDisabled: Boolean(body.groupsDisabled),
+        quickAddHidden: Boolean(body.quickAddHidden)
+      });
+      sendJson(response, 200, { ok: true, account: await adminAccountDetail(peerId) }, corsHeaders);
+      return;
+    }
+
+    if (url.pathname === "/admin/api/revoke-sessions") {
+      await revokePeerSessions(peerId);
+      disconnectPeer(peerId, "Your sessions were revoked by support.");
+      await recordAdminAudit("revoke-sessions", peerId);
+      sendJson(response, 200, { ok: true, account: await adminAccountDetail(peerId) }, corsHeaders);
+      return;
+    }
+
+    if (url.pathname === "/admin/api/force-reset") {
+      const reset = await createOwnerResetCode(peerId);
+      await revokePeerSessions(peerId);
+      await setAccountRestriction(peerId, { passwordResetRequired: true, resetRequestedAt: new Date().toISOString() });
+      disconnectPeer(peerId, "Support started a password reset for this account.");
+      await recordAdminAudit("force-password-reset", peerId, { expiresAt: reset.expiresAt });
+      sendJson(response, 200, { ok: true, resetCode: reset.code, expiresAt: reset.expiresAt, account: await adminAccountDetail(peerId) }, corsHeaders);
+      return;
+    }
+
+    if (url.pathname === "/admin/api/clear-queue") {
+      await deleteAllQueuedMessages(peerId);
+      await recordAdminAudit("clear-offline-queue", peerId);
+      sendJson(response, 200, { ok: true, account: await adminAccountDetail(peerId) }, corsHeaders);
+      return;
+    }
+
+    if (url.pathname === "/admin/api/delete-account") {
+      if (String(body.confirm || "") !== peerId) {
+        sendJson(response, 400, { ok: false, message: "Type the exact 6-digit code to confirm account deletion." }, corsHeaders);
+        return;
+      }
+      await deleteAccountData(peerId);
+      await revokePeerSessions(peerId);
+      await removeAccountRestriction(peerId);
+      await consumeOwnerResetCode(peerId);
+      disconnectPeer(peerId, "This account was deleted by support.");
+      await recordAdminAudit("delete-account", peerId);
+      sendJson(response, 200, { ok: true }, corsHeaders);
+      return;
+    }
+
+    sendJson(response, 404, { ok: false, message: "Unknown admin endpoint." }, corsHeaders);
+  } catch (error) {
+    console.error("Admin API failed:", error.message);
+    sendJson(response, 500, { ok: false, message: error.message || "Admin request failed." }, corsHeaders);
+  }
+}
+
+function adminAuthorized(request) {
+  if (!ADMIN_TOKEN) return false;
+  const header = String(request.headers.authorization || "");
+  const bearer = header.toLowerCase().startsWith("bearer ") ? header.slice(7).trim() : "";
+  const token = bearer || String(request.headers["x-admin-token"] || "");
+  return safeEqualString(token, ADMIN_TOKEN);
+}
+
+function safeEqualString(first, second) {
+  const firstBuffer = Buffer.from(String(first || ""));
+  const secondBuffer = Buffer.from(String(second || ""));
+  if (firstBuffer.length !== secondBuffer.length || !firstBuffer.length) return false;
+  return timingSafeEqual(firstBuffer, secondBuffer);
+}
+
+async function readRequestJson(request) {
+  const chunks = [];
+  for await (const chunk of request) chunks.push(chunk);
+  if (!chunks.length) return {};
+  return JSON.parse(Buffer.concat(chunks).toString("utf8"));
+}
+
+function sendJson(response, status, payload, corsHeaders = {}) {
+  response.writeHead(status, {
+    ...corsHeaders,
+    "content-type": "application/json",
+    "cache-control": "no-store"
+  });
+  response.end(JSON.stringify(payload));
+}
+
+function adminPageHtml() {
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Bypassium Support</title>
+  <style>
+    :root { color-scheme: dark; --bg:#07111f; --panel:rgb(17 27 45 / .78); --panel2:rgb(25 39 64 / .86); --line:rgb(255 255 255 / .14); --text:#eef6ff; --muted:#9fb1c7; --accent:#62a8ff; --accent2:#22d3c5; --danger:#fb7185; --warn:#fbbf24; --ok:#34d399; font-family:Inter,ui-sans-serif,system-ui,Segoe UI,sans-serif; }
+    * { box-sizing:border-box; }
+    body { margin:0; min-height:100vh; color:var(--text); background:radial-gradient(circle at 12% 0%, rgb(96 165 250 / .26), transparent 34%), radial-gradient(circle at 90% 18%, rgb(45 212 191 / .2), transparent 30%), var(--bg); }
+    button,input,textarea { font:inherit; }
+    button { border:0; border-radius:14px; padding:10px 13px; color:white; background:linear-gradient(180deg,color-mix(in srgb,var(--accent),white 12%),var(--accent)); cursor:pointer; font-weight:850; box-shadow:inset 0 1px 0 rgb(255 255 255 / .18),0 12px 28px rgb(0 0 0 / .22); }
+    button.secondary { color:var(--text); background:rgb(255 255 255 / .07); border:1px solid var(--line); }
+    button.danger { background:linear-gradient(180deg,color-mix(in srgb,var(--danger),white 10%),var(--danger)); }
+    button.warn { background:linear-gradient(180deg,color-mix(in srgb,var(--warn),white 10%),#d97706); }
+    input,textarea { width:100%; border:1px solid var(--line); border-radius:14px; padding:11px 12px; color:var(--text); background:rgb(4 12 24 / .52); outline:none; }
+    textarea { min-height:76px; resize:vertical; }
+    label { display:grid; gap:7px; color:var(--muted); font-size:12px; font-weight:800; text-transform:uppercase; }
+    .shell { display:grid; grid-template-columns:minmax(280px,390px) minmax(0,1fr); gap:14px; min-height:100vh; padding:16px; }
+    .card { border:1px solid var(--line); border-radius:24px; padding:16px; background:linear-gradient(145deg,var(--panel),rgb(10 20 36 / .74)); box-shadow:0 24px 70px rgb(0 0 0 / .28),inset 0 1px 0 rgb(255 255 255 / .12); backdrop-filter:blur(24px) saturate(1.25); }
+    .stack { display:grid; gap:12px; }
+    .brand { display:flex; align-items:center; gap:12px; }
+    .logo { display:grid; place-items:center; width:52px; height:52px; border-radius:17px; background:linear-gradient(145deg,var(--accent),#1d4ed8); font-size:28px; font-weight:1000; box-shadow:inset 0 1px 0 rgb(255 255 255 / .22); }
+    h1,h2,h3,p { margin:0; }
+    h1 { font-size:31px; letter-spacing:0; }
+    h2 { font-size:20px; }
+    h3 { font-size:15px; }
+    .muted { color:var(--muted); font-size:13px; line-height:1.45; }
+    .token-row,.search-row,.actions,.split { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:8px; align-items:end; }
+    .status-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:9px; }
+    .status { padding:11px; border:1px solid var(--line); border-radius:16px; background:rgb(255 255 255 / .06); }
+    .status strong { display:block; font-size:20px; }
+    .list { display:grid; gap:8px; max-height:55vh; overflow:auto; padding-right:3px; }
+    .row { display:grid; grid-template-columns:46px minmax(0,1fr) auto; align-items:center; gap:10px; padding:10px; border:1px solid var(--line); border-radius:17px; background:rgb(255 255 255 / .055); cursor:pointer; text-align:left; }
+    .row:hover { border-color:color-mix(in srgb,var(--accent),white 18%); }
+    .avatar { width:46px; height:46px; border-radius:15px; overflow:hidden; display:grid; place-items:center; color:white; font-weight:1000; background:linear-gradient(145deg,var(--accent),var(--accent2)); }
+    .avatar img { width:100%; height:100%; object-fit:cover; }
+    .row strong,.row small { display:block; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
+    .row small { color:var(--muted); margin-top:3px; }
+    .badge { display:inline-flex; align-items:center; min-height:25px; border-radius:999px; padding:3px 9px; font-size:12px; font-weight:900; color:var(--text); border:1px solid var(--line); background:rgb(255 255 255 / .07); }
+    .badge.bad { color:white; background:var(--danger); border-color:transparent; }
+    .badge.ok { color:#042016; background:var(--ok); border-color:transparent; }
+    .detail-head { display:flex; align-items:center; gap:14px; }
+    .detail-head .avatar { width:72px; height:72px; border-radius:24px; font-size:28px; }
+    .info-grid { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:9px; }
+    .info { padding:10px; border:1px solid var(--line); border-radius:15px; background:rgb(255 255 255 / .052); }
+    .info span { display:block; color:var(--muted); font-size:11px; font-weight:900; text-transform:uppercase; }
+    .info strong { display:block; margin-top:4px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .danger-zone { border-color:color-mix(in srgb,var(--danger),white 8%); }
+    .audit { max-height:240px; overflow:auto; display:grid; gap:7px; }
+    .audit div { padding:9px; border:1px solid var(--line); border-radius:13px; background:rgb(255 255 255 / .045); }
+    .hidden { display:none !important; }
+    .toast { position:fixed; right:16px; bottom:16px; max-width:min(440px,calc(100vw - 32px)); padding:12px 14px; border:1px solid var(--line); border-radius:16px; background:var(--panel2); box-shadow:0 20px 60px rgb(0 0 0 / .32); }
+    @media (max-width:860px) { .shell { grid-template-columns:1fr; } .info-grid,.status-grid { grid-template-columns:1fr; } }
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <section class="stack">
+      <div class="card stack">
+        <div class="brand"><div class="logo">B</div><div><p class="muted">Owner dashboard</p><h1>Bypassium Support</h1></div></div>
+        <p class="muted">Protected server controls. No passwords or recovery phrases are shown here.</p>
+        <div class="token-row">
+          <label>Admin token<input id="token" type="password" autocomplete="off" placeholder="ADMIN_TOKEN"></label>
+          <button id="saveToken">Unlock</button>
+        </div>
+        <p id="authStatus" class="muted">Checking server...</p>
+      </div>
+      <div class="card stack">
+        <h2>Server</h2>
+        <div id="statusGrid" class="status-grid"></div>
+      </div>
+      <div class="card stack">
+        <h2>Accounts</h2>
+        <div class="search-row">
+          <label>Search<input id="search" placeholder="Code or username"></label>
+          <button id="searchBtn">Search</button>
+        </div>
+        <div id="accountList" class="list"></div>
+      </div>
+    </section>
+    <section class="stack">
+      <div id="detail" class="card stack">
+        <h2>Select an account</h2>
+        <p class="muted">Search by code or display name, then choose an account to manage.</p>
+      </div>
+      <div class="card stack">
+        <div class="split"><h2>Audit log</h2><button id="refreshAudit" class="secondary">Refresh</button></div>
+        <div id="audit" class="audit"></div>
+      </div>
+    </section>
+  </main>
+  <div id="toast" class="toast hidden"></div>
+  <script>
+    const state = { token: localStorage.getItem("bypassiumAdminToken") || "", selected: "" };
+    const $ = (id) => document.getElementById(id);
+    $("token").value = state.token;
+    $("saveToken").onclick = () => { state.token = $("token").value.trim(); localStorage.setItem("bypassiumAdminToken", state.token); refreshAll(); };
+    $("searchBtn").onclick = () => searchAccounts();
+    $("search").addEventListener("keydown", (event) => { if (event.key === "Enter") searchAccounts(); });
+    $("refreshAudit").onclick = () => loadAudit();
+
+    async function api(path, options = {}) {
+      const response = await fetch("/admin/api" + path, {
+        ...options,
+        headers: { "content-type": "application/json", authorization: "Bearer " + state.token, ...(options.headers || {}) }
+      });
+      const payload = await response.json().catch(() => ({ ok:false, message:"Bad server response." }));
+      if (!response.ok || payload.ok === false) throw new Error(payload.message || "Request failed.");
+      return payload;
+    }
+    async function refreshAll() { await Promise.allSettled([loadStatus(), searchAccounts(), loadAudit()]); }
+    async function loadStatus() {
+      try {
+        const config = await fetch("/admin/api/config").then((r) => r.json());
+        if (!config.adminEnabled) $("authStatus").textContent = "ADMIN_TOKEN is not configured on the server.";
+        else $("authStatus").textContent = state.token ? "Token saved locally in this browser." : "Enter ADMIN_TOKEN to unlock actions.";
+        const status = await api("/status");
+        $("statusGrid").innerHTML = ["storage","onlineClients","accounts","groups","queuedUsers","auditEntries"].map((key) => '<div class="status"><span class="muted">' + escapeHtml(key) + '</span><strong>' + escapeHtml(String(status[key])) + '</strong></div>').join("");
+      } catch (error) {
+        $("statusGrid").innerHTML = '<p class="muted">' + escapeHtml(error.message) + '</p>';
+      }
+    }
+    async function searchAccounts() {
+      try {
+        const q = encodeURIComponent($("search").value.trim());
+        const payload = await api("/accounts?q=" + q);
+        $("accountList").innerHTML = payload.accounts.length ? payload.accounts.map(accountRow).join("") : '<p class="muted">No accounts found.</p>';
+        document.querySelectorAll("[data-peer]").forEach((button) => button.onclick = () => loadAccount(button.dataset.peer));
+      } catch (error) {
+        $("accountList").innerHTML = '<p class="muted">' + escapeHtml(error.message) + '</p>';
+      }
+    }
+    function accountRow(account) {
+      const avatar = account.profilePicture ? '<img src="' + escapeAttr(account.profilePicture) + '" alt="">' : escapeHtml((account.displayName || "B").slice(0,1).toUpperCase());
+      const flags = account.banned ? '<span class="badge bad">Banned</span>' : account.passwordResetRequired ? '<span class="badge">Reset required</span>' : '<span class="badge ok">Active</span>';
+      return '<button class="row" data-peer="' + escapeAttr(account.peerId) + '"><span class="avatar">' + avatar + '</span><span><strong>' + escapeHtml(account.displayName || "Bypassium User") + '</strong><small>' + escapeHtml(account.peerId + " - " + account.status) + '</small></span>' + flags + '</button>';
+    }
+    async function loadAccount(peerId) {
+      try {
+        state.selected = peerId;
+        const payload = await api("/account?peerId=" + encodeURIComponent(peerId));
+        renderDetail(payload.account);
+      } catch (error) { toast(error.message); }
+    }
+    function renderDetail(account) {
+      const avatar = account.profilePicture ? '<img src="' + escapeAttr(account.profilePicture) + '" alt="">' : escapeHtml((account.displayName || "B").slice(0,1).toUpperCase());
+      $("detail").innerHTML = '<div class="detail-head"><span class="avatar">' + avatar + '</span><div><p class="muted">' + escapeHtml(account.peerId) + '</p><h1>' + escapeHtml(account.displayName || "Bypassium User") + '</h1><p class="muted">' + escapeHtml(account.status) + '</p></div></div>'
+        + '<div class="info-grid">'
+        + info("Password", account.hasPassword ? "set" : "not set") + info("Recovery", account.hasRecoveryPhrase ? "exists" : "missing") + info("Queued", String(account.queuedMessages))
+        + info("Sessions", String(account.sessionCount)) + info("Groups", String(account.groupCount)) + info("Created", account.createdAt || "unknown")
+        + '</div>'
+        + '<div class="card stack danger-zone"><h2>Ban</h2><label>Reason<textarea id="banReason" placeholder="Reason shown internally"></textarea></label><label>Ban until optional<input id="banUntil" type="datetime-local"></label><div class="actions"><button class="danger" id="banBtn">Ban account</button><button class="secondary" id="unbanBtn">Unban</button></div><p class="muted">' + escapeHtml(account.banned ? "Currently banned: " + (account.banReason || "no reason") : "Not banned.") + '</p></div>'
+        + '<div class="card stack"><h2>Restrictions</h2><label><input id="sendDisabled" type="checkbox" ' + checked(account.sendDisabled) + '> Stop sending messages</label><label><input id="groupsDisabled" type="checkbox" ' + checked(account.groupsDisabled) + '> Stop creating/joining groups</label><label><input id="quickAddHidden" type="checkbox" ' + checked(account.quickAddHidden) + '> Hide from Quick Add/search</label><button id="saveRestrictions">Save restrictions</button></div>'
+        + '<div class="card stack"><h2>Recovery</h2><p class="muted">Force reset creates a one-time owner reset code. It does not reveal the old password.</p><button class="warn" id="forceReset">Force password reset</button><p id="resetOutput" class="muted"></p></div>'
+        + '<div class="card stack"><h2>Sessions and queue</h2><div class="actions"><button id="revokeSessions">Revoke sessions</button><button class="secondary" id="clearQueue">Clear offline queue</button></div></div>'
+        + '<div class="card stack danger-zone"><h2>Delete</h2><label>Type code to confirm<input id="deleteConfirm" placeholder="' + escapeAttr(account.peerId) + '"></label><button class="danger" id="deleteAccount">Delete account</button></div>';
+      $("banBtn").onclick = () => postAction("/ban", { peerId: account.peerId, reason: $("banReason").value, bannedUntil: $("banUntil").value });
+      $("unbanBtn").onclick = () => postAction("/unban", { peerId: account.peerId });
+      $("saveRestrictions").onclick = () => postAction("/restrictions", { peerId: account.peerId, sendDisabled: $("sendDisabled").checked, groupsDisabled: $("groupsDisabled").checked, quickAddHidden: $("quickAddHidden").checked });
+      $("forceReset").onclick = async () => { const payload = await postAction("/force-reset", { peerId: account.peerId }, false); $("resetOutput").textContent = "Reset code: " + payload.resetCode + " - expires " + new Date(payload.expiresAt).toLocaleString(); };
+      $("revokeSessions").onclick = () => postAction("/revoke-sessions", { peerId: account.peerId });
+      $("clearQueue").onclick = () => postAction("/clear-queue", { peerId: account.peerId });
+      $("deleteAccount").onclick = () => postAction("/delete-account", { peerId: account.peerId, confirm: $("deleteConfirm").value });
+    }
+    function info(label, value) { return '<div class="info"><span>' + escapeHtml(label) + '</span><strong>' + escapeHtml(value) + '</strong></div>'; }
+    function checked(value) { return value ? "checked" : ""; }
+    async function postAction(path, body, reload = true) {
+      try {
+        const payload = await api(path, { method:"POST", body:JSON.stringify(body) });
+        toast("Done.");
+        if (payload.account) renderDetail(payload.account);
+        if (reload) await refreshAll();
+        return payload;
+      } catch (error) { toast(error.message); throw error; }
+    }
+    async function loadAudit() {
+      try {
+        const payload = await api("/audit");
+        $("audit").innerHTML = payload.audit.length ? payload.audit.map((entry) => '<div><strong>' + escapeHtml(entry.action) + '</strong> <span class="muted">' + escapeHtml(entry.peerId || "") + '</span><br><span class="muted">' + escapeHtml(new Date(entry.at).toLocaleString()) + '</span></div>').join("") : '<p class="muted">No audit entries.</p>';
+      } catch (error) { $("audit").innerHTML = '<p class="muted">' + escapeHtml(error.message) + '</p>'; }
+    }
+    function toast(message) { $("toast").textContent = message; $("toast").classList.remove("hidden"); setTimeout(() => $("toast").classList.add("hidden"), 1800); }
+    function escapeHtml(value) { return String(value ?? "").replace(/[&<>"']/g, (char) => ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#39;" }[char])); }
+    function escapeAttr(value) { return escapeHtml(value).replace(new RegExp(String.fromCharCode(96), "g"), "&#96;"); }
+    refreshAll();
+  </script>
+</body>
+</html>`;
+}
+
 // Registers a permanent Bypassium ID and persists its public key for encrypted relay messages.
 async function registerClient(socket, message) {
   const byPassiumId = String(message.peerId || "").trim();
@@ -136,6 +537,11 @@ async function registerClient(socket, message) {
     return;
   }
   const account = await getAccount(byPassiumId);
+  const accountBlock = await accountBlockMessage(byPassiumId, "account");
+  if (accountBlock) {
+    send(socket, { type: "account-auth-required", peerId: byPassiumId, message: accountBlock });
+    return;
+  }
   const storedPublicKey = await getPublicKey(byPassiumId);
   const storedKeyMatches = !storedPublicKey || samePublicKey(storedPublicKey, message.publicKeyJwk);
   if (account?.passwordHash && !storedKeyMatches && !(await validSession(byPassiumId, message.sessionToken))) {
@@ -253,6 +659,11 @@ async function createAccount(socket, message = {}) {
   const peerId = String(message.peerId || socket.bypassiumId || "").trim();
   const password = String(message.password || "");
   const publicKeyJwk = message.publicKeyJwk || socket.publicKeyJwk;
+  const accountBlock = await accountBlockMessage(peerId, "account");
+  if (accountBlock) {
+    sendAccountResponse(socket, message, false, accountBlock);
+    return;
+  }
   if (!/^\d{6}$/.test(peerId) || !publicKeyJwk) {
     sendAccountResponse(socket, message, false, "Account creation requires a 6-digit code and local identity.");
     return;
@@ -322,6 +733,11 @@ async function signInAccount(socket, message = {}) {
   const peerId = String(message.peerId || "").trim();
   const password = String(message.password || "");
   const account = /^\d{6}$/.test(peerId) ? await getAccount(peerId) : null;
+  const accountBlock = await accountBlockMessage(peerId, "account");
+  if (accountBlock) {
+    sendAccountResponse(socket, message, false, accountBlock);
+    return;
+  }
   if (!account?.passwordHash || !verifyPassword(password, account)) {
     sendAccountResponse(socket, message, false, "Code or password is incorrect.");
     return;
@@ -338,6 +754,11 @@ async function signInWithSession(socket, message = {}) {
   const peerId = String(message.peerId || "").trim();
   const sessionToken = String(message.sessionToken || "");
   const account = /^\d{6}$/.test(peerId) ? await getAccount(peerId) : null;
+  const accountBlock = await accountBlockMessage(peerId, "account");
+  if (accountBlock) {
+    sendAccountResponse(socket, message, false, accountBlock);
+    return;
+  }
   if (!account?.passwordHash || !(await validSession(peerId, sessionToken))) {
     sendAccountResponse(socket, message, false, "Saved sign-in expired. Enter your password once to trust this device again.");
     return;
@@ -355,6 +776,11 @@ async function changePassword(socket, message = {}) {
   const encryptedIdentityBackup = sanitizeEncryptedBackup(message.encryptedIdentityBackup);
   const publicKeyJwk = message.publicKeyJwk || socket.publicKeyJwk || null;
   const account = /^\d{6}$/.test(peerId) ? await getAccount(peerId) : null;
+  const accountBlock = await accountBlockMessage(peerId, "account", { allowForcedReset: true });
+  if (accountBlock) {
+    sendAccountResponse(socket, message, false, accountBlock);
+    return;
+  }
   if (!account?.passwordHash || !verifyPassword(oldPassword, account)) {
     sendAccountResponse(socket, message, false, "Old password is incorrect.");
     return;
@@ -387,6 +813,11 @@ async function recoverAccount(socket, message = {}) {
   const peerId = String(message.peerId || "").trim();
   const recoveryPhrase = normalizeRecoveryPhrase(message.recoveryPhrase);
   const account = /^\d{6}$/.test(peerId) ? await getAccount(peerId) : null;
+  const accountBlock = await accountBlockMessage(peerId, "account", { allowForcedReset: true });
+  if (accountBlock) {
+    sendAccountResponse(socket, message, false, accountBlock);
+    return;
+  }
   if (!account?.recoveryHash || !verifyRecoveryPhrase(recoveryPhrase, account)) {
     sendAccountResponse(socket, message, false, "Code or recovery phrase is incorrect.");
     return;
@@ -404,6 +835,11 @@ async function resetPasswordWithRecovery(socket, message = {}) {
   const encryptedIdentityBackup = sanitizeEncryptedBackup(message.encryptedIdentityBackup);
   const publicKeyJwk = message.publicKeyJwk || null;
   const account = /^\d{6}$/.test(peerId) ? await getAccount(peerId) : null;
+  const accountBlock = await accountBlockMessage(peerId, "account", { allowForcedReset: true });
+  if (accountBlock) {
+    sendAccountResponse(socket, message, false, accountBlock);
+    return;
+  }
   if (!account?.recoveryHash || !verifyRecoveryPhrase(recoveryPhrase, account)) {
     sendAccountResponse(socket, message, false, "Code or recovery phrase is incorrect.");
     return;
@@ -422,9 +858,51 @@ async function resetPasswordWithRecovery(socket, message = {}) {
     updatedAt: now
   });
   await setAccount(peerId, updated);
+  await setAccountRestriction(peerId, { passwordResetRequired: false });
   await setPublicKey(peerId, publicKeyJwk);
   const sessionToken = issueSession(peerId);
   sendAccountResponse(socket, message, true, "Password reset.", {
+    sessionToken,
+    account: publicAccountStatus(updated, true),
+    encryptedIdentityBackup: updated.encryptedIdentityBackup || null
+  });
+}
+
+async function resetPasswordWithOwnerCode(socket, message = {}) {
+  const peerId = String(message.peerId || "").trim();
+  const resetCode = String(message.resetCode || "").trim();
+  const password = String(message.password || "");
+  const encryptedIdentityBackup = sanitizeEncryptedBackup(message.encryptedIdentityBackup);
+  const publicKeyJwk = message.publicKeyJwk || null;
+  const account = /^\d{6}$/.test(peerId) ? await getAccount(peerId) : null;
+  const accountBlock = await accountBlockMessage(peerId, "account", { allowForcedReset: true });
+  if (accountBlock) {
+    sendAccountResponse(socket, message, false, accountBlock);
+    return;
+  }
+  if (!account?.passwordHash || !(await verifyOwnerResetCode(peerId, resetCode))) {
+    sendAccountResponse(socket, message, false, "Owner reset code is incorrect or expired.");
+    return;
+  }
+  if (!validPassword(password) || !encryptedIdentityBackup?.data || !publicKeyJwk) {
+    sendAccountResponse(socket, message, false, "Choose a valid new password first.");
+    return;
+  }
+
+  await revokePeerSessions(peerId);
+  await consumeOwnerResetCode(peerId);
+  const updated = sanitizeAccount({
+    ...account,
+    ...hashPassword(password),
+    publicKeyJwk,
+    encryptedIdentityBackup,
+    updatedAt: new Date().toISOString()
+  });
+  await setAccount(peerId, updated);
+  await setPublicKey(peerId, publicKeyJwk);
+  await setAccountRestriction(peerId, { passwordResetRequired: false });
+  const sessionToken = issueSession(peerId);
+  sendAccountResponse(socket, message, true, "Password reset by owner code.", {
     sessionToken,
     account: publicAccountStatus(updated, true),
     encryptedIdentityBackup: updated.encryptedIdentityBackup || null
@@ -459,6 +937,7 @@ async function deleteAccount(socket, message = {}) {
 async function relayDirectMessage(socket, message) {
   const senderId = getRegisteredSender(socket);
   if (!senderId) return;
+  if (!(await enforceAccountAction(socket, senderId, "send"))) return;
   if (!allowUserAction(socket, "message")) return;
   if (!validateContentType(socket, message)) return;
 
@@ -503,6 +982,7 @@ async function relayDirectMessage(socket, message) {
 async function relayDirectSetting(socket, message) {
   const senderId = getRegisteredSender(socket);
   if (!senderId) return;
+  if (!(await enforceAccountAction(socket, senderId, "send"))) return;
   if (!allowUserAction(socket, "message")) return;
   const targetId = String(message.to || "").trim();
   if (!/^\d{6}$/.test(targetId) || !message.encrypted) {
@@ -531,6 +1011,7 @@ async function relayDirectSetting(socket, message) {
 async function relayGroupMessage(socket, message) {
   const senderId = getRegisteredSender(socket);
   if (!senderId) return;
+  if (!(await enforceAccountAction(socket, senderId, "send"))) return;
   if (!allowUserAction(socket, "group-message")) return;
   if (!validateContentType(socket, message)) return;
   const group = await getGroup(message.groupId);
@@ -705,6 +1186,7 @@ async function relayReaction(socket, message) {
 async function publishProfile(socket, profile = {}) {
   const peerId = getRegisteredSender(socket);
   if (!peerId) return;
+  if (!(await enforceAccountAction(socket, peerId, "account"))) return;
   const existing = await getProfile(peerId);
   const cleanProfile = sanitizeProfile({
     ...profile,
@@ -713,7 +1195,8 @@ async function publishProfile(socket, profile = {}) {
   await setProfile(peerId, cleanProfile);
   const account = await getAccount(peerId);
   if (account) await setAccount(peerId, { ...account, profile: cleanProfile, updatedAt: new Date().toISOString() });
-  await updateQuickAddDirectory(peerId, cleanProfile);
+  if (await accountQuickAddHidden(peerId)) await removeQuickAddProfile(peerId);
+  else await updateQuickAddDirectory(peerId, cleanProfile);
   broadcastProfileUpdate(peerId, cleanProfile);
 }
 
@@ -721,6 +1204,7 @@ async function publishProfile(socket, profile = {}) {
 async function sendQuickAddResults(socket, message = {}) {
   const peerId = getRegisteredSender(socket);
   if (!peerId) return;
+  if (!(await enforceAccountAction(socket, peerId, "quick-add"))) return;
   const now = Date.now();
   if (now - Number(socket.lastQuickAddRequestAt || 0) < 200) return;
   socket.lastQuickAddRequestAt = now;
@@ -733,6 +1217,7 @@ async function sendQuickAddResults(socket, message = {}) {
   const matches = [];
   for (const { id, profile } of entries) {
     if (excluded.has(id)) continue;
+    if (await accountQuickAddHidden(id)) continue;
     if (!isDiscoverableProfile(profile)) continue;
     if (query && !String(profile.displayName || "").toLowerCase().includes(query) && !id.includes(query)) continue;
     matches.push({
@@ -772,6 +1257,7 @@ async function searchAccounts(socket, message = {}) {
   const entries = await getQuickAddDirectoryEntries();
   const matches = [];
   for (const { id, profile } of entries) {
+    if (await accountQuickAddHidden(id)) continue;
     if (!isDiscoverableProfile(profile)) continue;
     const score = accountSearchScore(query, id, profile.displayName || "");
     if (score === null) continue;
@@ -823,8 +1309,13 @@ function subsequenceGapScore(query, value) {
 async function createGroup(socket, message) {
   const creatorId = getRegisteredSender(socket);
   if (!creatorId) return;
+  if (!(await enforceAccountAction(socket, creatorId, "groups"))) return;
   if (!allowUserAction(socket, "group-manage")) return;
-  const members = normalizeMembers([creatorId, ...(message.members || [])]);
+  const requestedMembers = normalizeMembers([creatorId, ...(message.members || [])]);
+  const members = [];
+  for (const memberId of requestedMembers) {
+    if (memberId === creatorId || !(await accountGroupsDisabled(memberId))) members.push(memberId);
+  }
   const group = {
     id: randomUUID(),
     name: String(message.name || "New group").slice(0, 80),
@@ -846,6 +1337,7 @@ async function renameGroup(socket, message) {
 async function updateGroupDetails(socket, message) {
   const peerId = getRegisteredSender(socket);
   if (!peerId) return;
+  if (!(await enforceAccountAction(socket, peerId, "groups"))) return;
   if (!allowUserAction(socket, "group-manage")) return;
   const group = await getGroup(message.groupId);
   if (!group || !canAdministerGroup(group, peerId)) {
@@ -869,6 +1361,7 @@ async function updateGroupDetails(socket, message) {
 async function addGroupMembers(socket, message) {
   const peerId = getRegisteredSender(socket);
   if (!peerId) return;
+  if (!(await enforceAccountAction(socket, peerId, "groups"))) return;
   if (!allowUserAction(socket, "group-manage")) return;
   const group = await getGroup(message.groupId);
   if (!group || !group.members.includes(peerId)) {
@@ -879,7 +1372,10 @@ async function addGroupMembers(socket, message) {
     send(socket, { type: "error", message: "Adding members is locked for this group." });
     return;
   }
-  const requestedMembers = normalizeMembers(message.members || []);
+  const requestedMembers = [];
+  for (const memberId of normalizeMembers(message.members || [])) {
+    if (!(await accountGroupsDisabled(memberId))) requestedMembers.push(memberId);
+  }
   group.members = normalizeMembers([...group.members, ...requestedMembers]);
   group.updatedAt = new Date().toISOString();
   await setGroup(group);
@@ -889,6 +1385,7 @@ async function addGroupMembers(socket, message) {
 async function setGroupAdmin(socket, message) {
   const peerId = getRegisteredSender(socket);
   if (!peerId) return;
+  if (!(await enforceAccountAction(socket, peerId, "groups"))) return;
   if (!allowUserAction(socket, "group-manage")) return;
   const group = await getGroup(message.groupId);
   const memberId = String(message.memberId || "").trim();
@@ -909,6 +1406,7 @@ async function setGroupAdmin(socket, message) {
 async function transferGroupOwnership(socket, message) {
   const peerId = getRegisteredSender(socket);
   if (!peerId) return;
+  if (!(await enforceAccountAction(socket, peerId, "groups"))) return;
   if (!allowUserAction(socket, "group-manage")) return;
   const group = await getGroup(message.groupId);
   const memberId = String(message.memberId || "").trim();
@@ -926,6 +1424,7 @@ async function transferGroupOwnership(socket, message) {
 async function removeGroupMember(socket, message) {
   const peerId = getRegisteredSender(socket);
   if (!peerId) return;
+  if (!(await enforceAccountAction(socket, peerId, "groups"))) return;
   if (!allowUserAction(socket, "group-manage")) return;
   const group = await getGroup(message.groupId);
   const memberId = String(message.memberId || "").trim();
@@ -1343,6 +1842,310 @@ function isDiscoverableProfile(profile = {}) {
     profile.profilePicture
     || (displayName && displayName.toLowerCase() !== "local user")
   );
+}
+
+async function searchAdminAccounts(query = "", limit = 80) {
+  const cleanQuery = String(query || "").trim().toLowerCase();
+  const ids = await getKnownPeerIds();
+  const accounts = [];
+  for (const id of ids) {
+    const account = await adminAccountSummary(id);
+    const haystack = `${account.peerId} ${account.displayName}`.toLowerCase();
+    if (cleanQuery && !haystack.includes(cleanQuery)) continue;
+    accounts.push(account);
+    if (accounts.length >= limit) break;
+  }
+  return accounts.sort((first, second) => {
+    if (first.banned !== second.banned) return first.banned ? -1 : 1;
+    if (first.status !== second.status) return first.status === "online" ? -1 : 1;
+    return first.displayName.localeCompare(second.displayName);
+  });
+}
+
+async function adminAccountSummary(peerId) {
+  const account = await getAccount(peerId);
+  const profile = sanitizeProfile(account?.profile || await getProfile(peerId) || {});
+  const restriction = await getAccountRestriction(peerId);
+  const banned = restrictionBanned(restriction);
+  return {
+    peerId,
+    displayName: profile.displayName || "Bypassium User",
+    profilePicture: profile.profilePicture || "",
+    status: clients.has(peerId) ? "online" : "offline",
+    hasPassword: Boolean(account?.passwordHash),
+    hasRecoveryPhrase: Boolean(account?.recoveryHash),
+    quickAddVisible: profile.quickAddVisible !== false,
+    banned,
+    banReason: restriction.banReason || "",
+    bannedUntil: restriction.bannedUntil || "",
+    sendDisabled: Boolean(restriction.sendDisabled),
+    groupsDisabled: Boolean(restriction.groupsDisabled),
+    quickAddHidden: Boolean(restriction.quickAddHidden),
+    passwordResetRequired: Boolean(restriction.passwordResetRequired),
+    createdAt: account?.createdAt || profile.joinedAt || "",
+    updatedAt: account?.updatedAt || profile.updatedAt || ""
+  };
+}
+
+async function adminAccountDetail(peerId) {
+  const account = await getAccount(peerId);
+  const profile = await getProfile(peerId);
+  const publicKey = await getPublicKey(peerId);
+  if (!account && !profile && !publicKey) return null;
+  return {
+    ...(await adminAccountSummary(peerId)),
+    queuedMessages: await countQueuedMessages(peerId),
+    sessionCount: await countPeerSessions(peerId),
+    groupCount: (await getGroupsForMember(peerId)).length,
+    hasPublicKey: Boolean(publicKey),
+    storage: storageMode()
+  };
+}
+
+async function getKnownPeerIds() {
+  const ids = new Set([
+    ...memoryAccounts.keys(),
+    ...memoryProfiles.keys(),
+    ...memoryPublicKeys.keys(),
+    ...memoryDirectory.keys(),
+    ...memoryRestrictions.keys()
+  ]);
+  if (redis || upstashRestEnabled) {
+    for (const [pattern, prefix] of [
+      ["bypassium:account:*", "bypassium:account:"],
+      ["bypassium:profile:*", "bypassium:profile:"],
+      ["bypassium:public-key:*", "bypassium:public-key:"],
+      ["bypassium:restriction:*", "bypassium:restriction:"]
+    ]) {
+      const keys = await listKeys(pattern);
+      for (const key of keys) {
+        const id = String(key || "").slice(prefix.length);
+        if (/^\d{6}$/.test(id)) ids.add(id);
+      }
+    }
+  }
+  return [...ids].filter((id) => /^\d{6}$/.test(id));
+}
+
+async function countQueuedMessages(peerId) {
+  const memoryCount = (memoryOfflineMessages.get(peerId) || []).length;
+  const ids = await getInboxIds(peerId);
+  return Math.max(memoryCount, new Set(ids || []).size);
+}
+
+async function countPeerSessions(peerId) {
+  let count = 0;
+  for (const session of sessions.values()) {
+    if (session.peerId === peerId && session.expiresAt > Date.now()) count += 1;
+  }
+  let persisted = [];
+  if (redis) persisted = await redis.smembers(sessionIndexKey(peerId));
+  if (upstashRestEnabled) persisted = await upstashCommand(["SMEMBERS", sessionIndexKey(peerId)]) || [];
+  return Math.max(count, new Set(persisted).size);
+}
+
+async function getAccountRestriction(peerId) {
+  const clean = cleanPeerId(peerId);
+  if (!clean) return {};
+  if (memoryRestrictions.has(clean)) return normalizeRestriction(memoryRestrictions.get(clean));
+  let stored = null;
+  if (redis) stored = await redis.get(restrictionKey(clean));
+  if (upstashRestEnabled) stored = await upstashCommand(["GET", restrictionKey(clean)]);
+  if (!stored) return {};
+  const restriction = normalizeRestriction(JSON.parse(stored));
+  memoryRestrictions.set(clean, restriction);
+  return restriction;
+}
+
+async function setAccountRestriction(peerId, patch = {}) {
+  const clean = cleanPeerId(peerId);
+  if (!clean) return {};
+  const current = await getAccountRestriction(clean);
+  const next = normalizeRestriction({ ...current, ...patch, updatedAt: new Date().toISOString() });
+  if (!restrictionHasAnyFlag(next)) {
+    await removeAccountRestriction(clean);
+    return {};
+  }
+  memoryRestrictions.set(clean, next);
+  if (redis) await redis.set(restrictionKey(clean), JSON.stringify(next));
+  if (upstashRestEnabled) await upstashCommand(["SET", restrictionKey(clean), JSON.stringify(next)]);
+  return next;
+}
+
+async function removeAccountRestriction(peerId) {
+  const clean = cleanPeerId(peerId);
+  if (!clean) return;
+  memoryRestrictions.delete(clean);
+  if (redis) await redis.del(restrictionKey(clean));
+  if (upstashRestEnabled) await upstashCommand(["DEL", restrictionKey(clean)]);
+}
+
+function normalizeRestriction(value = {}) {
+  return {
+    banned: Boolean(value.banned),
+    banReason: String(value.banReason || "").slice(0, 240),
+    bannedAt: String(value.bannedAt || "").slice(0, 40),
+    bannedUntil: normalizeAdminDate(value.bannedUntil),
+    sendDisabled: Boolean(value.sendDisabled),
+    groupsDisabled: Boolean(value.groupsDisabled),
+    quickAddHidden: Boolean(value.quickAddHidden),
+    passwordResetRequired: Boolean(value.passwordResetRequired),
+    resetRequestedAt: String(value.resetRequestedAt || "").slice(0, 40),
+    updatedAt: String(value.updatedAt || "").slice(0, 40)
+  };
+}
+
+function restrictionHasAnyFlag(restriction = {}) {
+  return Boolean(
+    restrictionBanned(restriction)
+    || restriction.sendDisabled
+    || restriction.groupsDisabled
+    || restriction.quickAddHidden
+    || restriction.passwordResetRequired
+  );
+}
+
+function restrictionBanned(restriction = {}) {
+  if (!restriction.banned) return false;
+  if (!restriction.bannedUntil) return true;
+  const until = Date.parse(restriction.bannedUntil);
+  return Number.isFinite(until) && until > Date.now();
+}
+
+async function accountBlockMessage(peerId, action = "account", { allowForcedReset = false } = {}) {
+  const restriction = await getAccountRestriction(peerId);
+  if (restrictionBanned(restriction)) return restriction.banReason ? `Account banned: ${restriction.banReason}` : "This account is banned.";
+  if (restriction.passwordResetRequired && !allowForcedReset) return "This account must reset its password before continuing.";
+  if (action === "send" && restriction.sendDisabled) return "Support has disabled message sending for this account.";
+  if (action === "groups" && restriction.groupsDisabled) return "Support has disabled group actions for this account.";
+  if (action === "quick-add" && restriction.quickAddHidden) return "Support has hidden this account from public discovery.";
+  return "";
+}
+
+async function enforceAccountAction(socket, peerId, action) {
+  const message = await accountBlockMessage(peerId, action);
+  if (!message) return true;
+  send(socket, { type: "error", message });
+  return false;
+}
+
+async function accountQuickAddHidden(peerId) {
+  const restriction = await getAccountRestriction(peerId);
+  return restrictionBanned(restriction) || restriction.quickAddHidden;
+}
+
+async function accountGroupsDisabled(peerId) {
+  const restriction = await getAccountRestriction(peerId);
+  return restrictionBanned(restriction) || restriction.groupsDisabled;
+}
+
+async function createOwnerResetCode(peerId) {
+  const clean = cleanPeerId(peerId);
+  if (!clean || !(await getAccount(clean))) throw new Error("Account not found.");
+  const code = `BYP-${randomBytes(4).toString("hex").toUpperCase()}`;
+  const salt = randomBytes(12).toString("base64url");
+  const expiresAt = new Date(Date.now() + ADMIN_RESET_TTL_SECONDS * 1000).toISOString();
+  const record = {
+    peerId: clean,
+    salt,
+    codeHash: hashOwnerResetCode(clean, code, salt),
+    expiresAt,
+    createdAt: new Date().toISOString()
+  };
+  memoryOwnerResetCodes.set(clean, record);
+  if (redis) await redis.set(ownerResetKey(clean), JSON.stringify(record), "EX", ADMIN_RESET_TTL_SECONDS);
+  if (upstashRestEnabled) await upstashCommand(["SET", ownerResetKey(clean), JSON.stringify(record), "EX", ADMIN_RESET_TTL_SECONDS]);
+  return { code, expiresAt };
+}
+
+async function verifyOwnerResetCode(peerId, code) {
+  const clean = cleanPeerId(peerId);
+  const record = await getOwnerResetRecord(clean);
+  if (!record || Date.parse(record.expiresAt) < Date.now()) return false;
+  const actual = hashOwnerResetCode(clean, String(code || "").trim(), record.salt);
+  return safeEqualString(actual, record.codeHash);
+}
+
+async function getOwnerResetRecord(peerId) {
+  const clean = cleanPeerId(peerId);
+  if (!clean) return null;
+  if (memoryOwnerResetCodes.has(clean)) return memoryOwnerResetCodes.get(clean);
+  let stored = null;
+  if (redis) stored = await redis.get(ownerResetKey(clean));
+  if (upstashRestEnabled) stored = await upstashCommand(["GET", ownerResetKey(clean)]);
+  if (!stored) return null;
+  const record = JSON.parse(stored);
+  memoryOwnerResetCodes.set(clean, record);
+  return record;
+}
+
+async function consumeOwnerResetCode(peerId) {
+  const clean = cleanPeerId(peerId);
+  if (!clean) return;
+  memoryOwnerResetCodes.delete(clean);
+  if (redis) await redis.del(ownerResetKey(clean));
+  if (upstashRestEnabled) await upstashCommand(["DEL", ownerResetKey(clean)]);
+}
+
+function hashOwnerResetCode(peerId, code, salt) {
+  return scryptSync(`owner-reset:${peerId}:${code}`, salt, 32).toString("base64url");
+}
+
+async function recordAdminAudit(action, peerId = "", details = {}) {
+  const entry = {
+    id: randomUUID(),
+    at: new Date().toISOString(),
+    action: String(action || "").slice(0, 80),
+    peerId: cleanPeerId(peerId),
+    details
+  };
+  memoryAdminAudit.unshift(entry);
+  memoryAdminAudit.splice(ADMIN_AUDIT_LIMIT);
+  if (redis) {
+    await redis.lpush(adminAuditKey(), JSON.stringify(entry));
+    await redis.ltrim(adminAuditKey(), 0, ADMIN_AUDIT_LIMIT - 1);
+  }
+  if (upstashRestEnabled) {
+    await upstashPipeline([
+      ["LPUSH", adminAuditKey(), JSON.stringify(entry)],
+      ["LTRIM", adminAuditKey(), 0, ADMIN_AUDIT_LIMIT - 1]
+    ]);
+  }
+  return entry;
+}
+
+async function getAdminAudit() {
+  if (redis) return (await redis.lrange(adminAuditKey(), 0, ADMIN_AUDIT_LIMIT - 1)).map(parseAuditEntry).filter(Boolean);
+  if (upstashRestEnabled) return (await upstashCommand(["LRANGE", adminAuditKey(), 0, ADMIN_AUDIT_LIMIT - 1]) || []).map(parseAuditEntry).filter(Boolean);
+  return memoryAdminAudit;
+}
+
+function parseAuditEntry(value) {
+  try {
+    return typeof value === "string" ? JSON.parse(value) : value;
+  } catch {
+    return null;
+  }
+}
+
+function disconnectPeer(peerId, message) {
+  const sockets = clients.get(peerId);
+  if (!sockets) return;
+  for (const socket of sockets) {
+    send(socket, { type: "error", message });
+    socket.close(4003, message.slice(0, 120));
+  }
+}
+
+function cleanPeerId(value) {
+  const peerId = String(value || "").trim();
+  return /^\d{6}$/.test(peerId) ? peerId : "";
+}
+
+function normalizeAdminDate(value) {
+  if (!value) return "";
+  const timestamp = Date.parse(value);
+  return Number.isFinite(timestamp) && timestamp > Date.now() ? new Date(timestamp).toISOString() : "";
 }
 
 async function setGroup(group) {
@@ -1803,6 +2606,18 @@ function sessionKey(token) {
 
 function sessionIndexKey(peerId) {
   return `bypassium:sessions:${peerId}`;
+}
+
+function restrictionKey(peerId) {
+  return `bypassium:restriction:${peerId}`;
+}
+
+function ownerResetKey(peerId) {
+  return `bypassium:owner-reset:${peerId}`;
+}
+
+function adminAuditKey() {
+  return "bypassium:admin-audit";
 }
 
 function profileKey(peerId) {
