@@ -441,10 +441,13 @@ function adminPageHtml() {
     $("refreshAudit").onclick = () => loadAudit();
 
     async function api(path, options = {}) {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 15000);
       const response = await fetch("/admin/api" + path, {
         ...options,
+        signal: controller.signal,
         headers: { "content-type": "application/json", authorization: "Bearer " + state.token, ...(options.headers || {}) }
-      });
+      }).finally(() => clearTimeout(timeout));
       const payload = await response.json().catch(() => ({ ok:false, message:"Bad server response." }));
       if (!response.ok || payload.ok === false) throw new Error(payload.message || "Request failed.");
       return payload;
@@ -472,7 +475,8 @@ function adminPageHtml() {
         $("accountList").innerHTML = accounts.length ? accounts.map(accountRow).join("") : '<p class="muted list-state">No accounts found. Try their 6-digit code or a shorter name.</p>';
         document.querySelectorAll("[data-peer]").forEach((button) => button.onclick = () => loadAccount(button.dataset.peer));
       } catch (error) {
-        if (seq === state.searchSeq) $("accountList").innerHTML = '<p class="muted list-state">' + escapeHtml(error.message) + '</p>';
+        const message = error.name === "AbortError" ? "Search timed out. Try a 6-digit code or refresh after the server finishes waking up." : error.message;
+        if (seq === state.searchSeq) $("accountList").innerHTML = '<p class="muted list-state">' + escapeHtml(message) + '</p>';
       }
     }
     function scheduleAccountSearch() {
@@ -1854,11 +1858,11 @@ function isDiscoverableProfile(profile = {}) {
 
 async function searchAdminAccounts(query = "", limit = 80) {
   const cleanQuery = String(query || "").trim().toLowerCase();
-  const directoryProfiles = new Map((await getQuickAddDirectoryEntries()).map(({ id, profile }) => [id, profile]));
-  const ids = new Set([...(await getKnownPeerIds()), ...directoryProfiles.keys()]);
+  const directoryProfiles = await getQuickAddProfileMap();
+  const ids = [...new Set([...(await getKnownPeerIds()), ...directoryProfiles.keys()])];
+  const summaries = await adminAccountSummaries(ids, directoryProfiles);
   const accounts = [];
-  for (const id of ids) {
-    const account = await adminAccountSummary(id, directoryProfiles.get(id));
+  for (const account of summaries) {
     const score = cleanQuery ? accountSearchScore(cleanQuery, account.peerId, account.displayName) : 0;
     if (score === null) continue;
     accounts.push({ ...account, score });
@@ -1871,10 +1875,67 @@ async function searchAdminAccounts(query = "", limit = 80) {
   }).slice(0, limit).map(({ score, ...account }) => account);
 }
 
+async function getQuickAddProfileMap() {
+  try {
+    return new Map((await getQuickAddDirectoryEntries()).map(({ id, profile }) => [id, profile]));
+  } catch {
+    return new Map();
+  }
+}
+
+async function adminAccountSummaries(peerIds, fallbackProfiles = new Map()) {
+  const cleanIds = [...new Set(peerIds.map(cleanPeerId).filter(Boolean))];
+  if (!cleanIds.length) return [];
+  if (upstashRestEnabled) return adminAccountSummariesFromUpstash(cleanIds, fallbackProfiles);
+  if (redis) return adminAccountSummariesFromRedis(cleanIds, fallbackProfiles);
+  return Promise.all(cleanIds.map((id) => adminAccountSummary(id, fallbackProfiles.get(id))));
+}
+
+async function adminAccountSummariesFromUpstash(peerIds, fallbackProfiles) {
+  const summaries = [];
+  for (let index = 0; index < peerIds.length; index += 30) {
+    const chunk = peerIds.slice(index, index + 30);
+    const commands = [];
+    for (const id of chunk) {
+      commands.push(["GET", accountKey(id)], ["GET", profileKey(id)], ["GET", restrictionKey(id)]);
+    }
+    const results = await upstashPipeline(commands);
+    for (let offset = 0; offset < chunk.length; offset += 1) {
+      const id = chunk[offset];
+      const base = offset * 3;
+      summaries.push(adminAccountSummaryFromValues(
+        id,
+        parseStoredAccount(results[base]),
+        parseStoredProfile(results[base + 1]) || fallbackProfiles.get(id) || null,
+        parseStoredRestriction(results[base + 2])
+      ));
+    }
+  }
+  return summaries;
+}
+
+async function adminAccountSummariesFromRedis(peerIds, fallbackProfiles) {
+  const accountValues = await redis.mget(...peerIds.map(accountKey));
+  const profileValues = await redis.mget(...peerIds.map(profileKey));
+  const restrictionValues = await redis.mget(...peerIds.map(restrictionKey));
+  return peerIds.map((id, index) => adminAccountSummaryFromValues(
+    id,
+    parseStoredAccount(accountValues[index]),
+    parseStoredProfile(profileValues[index]) || fallbackProfiles.get(id) || null,
+    parseStoredRestriction(restrictionValues[index])
+  ));
+}
+
 async function adminAccountSummary(peerId, fallbackProfile = null) {
   const account = await getAccount(peerId);
   const profile = sanitizeProfile(account?.profile || await getProfile(peerId) || fallbackProfile || {});
   const restriction = await getAccountRestriction(peerId);
+  return adminAccountSummaryFromValues(peerId, account, profile, restriction);
+}
+
+function adminAccountSummaryFromValues(peerId, account = null, profileValue = null, restrictionValue = {}) {
+  const profile = sanitizeProfile(account?.profile || profileValue || {});
+  const restriction = normalizeRestriction(restrictionValue || {});
   const banned = restrictionBanned(restriction);
   return {
     peerId,
@@ -1894,6 +1955,22 @@ async function adminAccountSummary(peerId, fallbackProfile = null) {
     createdAt: account?.createdAt || profile.joinedAt || "",
     updatedAt: account?.updatedAt || profile.updatedAt || ""
   };
+}
+
+function parseStoredAccount(value) {
+  try {
+    return value ? sanitizeAccount(typeof value === "string" ? JSON.parse(value) : value) : null;
+  } catch {
+    return null;
+  }
+}
+
+function parseStoredRestriction(value) {
+  try {
+    return value ? normalizeRestriction(typeof value === "string" ? JSON.parse(value) : value) : {};
+  } catch {
+    return {};
+  }
 }
 
 async function adminAccountDetail(peerId) {
