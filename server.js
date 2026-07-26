@@ -2057,7 +2057,8 @@ async function storeDirectMessageHistory(senderId, targetId, envelope, { senderE
       publicKeyJwk: envelope.publicKeyJwk,
       peerPublicKeyJwk: targetPublicKeyJwk,
       encrypted: senderEncrypted,
-      sentAt
+      sentAt,
+      selfEncrypted: true
     });
   }
 }
@@ -2103,8 +2104,10 @@ async function storeGroupMessageHistory(senderId, group, options = {}) {
       from: senderId,
       profile: options.senderProfile || {},
       publicKeyJwk: senderPublicKeyJwk,
+      senderPublicKeyJwk,
       encrypted: options.senderEncrypted,
-      sentAt
+      sentAt,
+      selfEncrypted: true
     });
   }
 }
