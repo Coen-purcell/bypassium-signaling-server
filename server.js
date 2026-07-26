@@ -5,13 +5,15 @@ import { WebSocketServer } from "ws";
 
 const PORT = Number(process.env.PORT || 10000);
 const OFFLINE_MESSAGE_TTL_SECONDS = 90 * 24 * 60 * 60;
-const HISTORY_TTL_SECONDS = 180 * 24 * 60 * 60;
+const HISTORY_TTL_SECONDS = Number(process.env.HISTORY_TTL_SECONDS || 0);
 const SESSION_TTL_SECONDS = 30 * 24 * 60 * 60;
 const ADMIN_RESET_TTL_SECONDS = 30 * 60;
 const ADMIN_AUDIT_LIMIT = 500;
 const SAFETY_LOG_LIMIT = 1000;
 const MAX_OFFLINE_MESSAGES_PER_USER = 500;
-const MAX_HISTORY_MESSAGES_PER_USER = 2500;
+const MAX_HISTORY_MESSAGES_PER_USER = Number(process.env.MAX_HISTORY_MESSAGES_PER_USER || 0);
+const DEFAULT_HISTORY_SYNC_LIMIT = Number(process.env.DEFAULT_HISTORY_SYNC_LIMIT || 5000);
+const MAX_HISTORY_SYNC_LIMIT = Number(process.env.MAX_HISTORY_SYNC_LIMIT || 50000);
 const MAX_PROFILE_PICTURE_CHARS = 18000;
 const MAX_UPSTASH_RPUSH_ITEMS = 4;
 const MAX_UPSTASH_RPUSH_CHARS = 6_000_000;
@@ -138,6 +140,7 @@ wss.on("connection", (socket, request) => {
       if (message.type === "read-receipt") await relayReadReceipt(socket, message);
       if (message.type === "reaction") await relayReaction(socket, message);
       if (message.type === "history-sync") await syncHistoryMessages(socket, message);
+      if (message.type === "history-backfill") await backfillHistoryMessages(socket, message);
       if (message.type === "sync") await syncClient(socket);
     } catch (error) {
       console.error("Message handler failed:", error.message);
@@ -783,6 +786,8 @@ async function registerClient(socket, message) {
       groupRoles: true,
       encryptedChatSettings: true,
       encryptedHistorySync: true,
+      persistentEncryptedHistory: historyTtlSeconds() === 0,
+      historyBackfill: true,
       quickAddDirectory: true,
       accounts: true
     },
@@ -806,8 +811,85 @@ async function syncClient(socket) {
 async function syncHistoryMessages(socket, message = {}) {
   const peerId = getRegisteredSender(socket);
   if (!peerId) return;
-  const limit = Math.min(MAX_HISTORY_MESSAGES_PER_USER, Math.max(50, Number(message.limit) || 500));
+  const requested = Number(message.limit);
+  const limit = Math.min(
+    maxHistorySyncLimit(),
+    Math.max(50, Number.isFinite(requested) && requested > 0 ? requested : defaultHistorySyncLimit())
+  );
   await deliverHistoryMessages(socket, limit);
+}
+
+async function backfillHistoryMessages(socket, message = {}) {
+  const peerId = getRegisteredSender(socket);
+  if (!peerId) return;
+  if (!(await enforceAccountAction(socket, peerId, "send"))) return;
+  if (!allowUserAction(socket, "message")) return;
+  const entries = Array.isArray(message.entries) ? message.entries.slice(0, 80) : [];
+  let stored = 0;
+  for (const entry of entries) {
+    if (!validEncryptedPayload(entry?.encrypted)) continue;
+    const messageId = String(entry.messageId || "").trim();
+    if (!messageId) continue;
+    const sentAt = entry.sentAt || new Date().toISOString();
+    const historyDirection = entry.historyDirection === "outbound" ? "outbound" : "inbound";
+    const historyKind = entry.historyKind === "group" ? "group" : "direct";
+    if (historyKind === "group") {
+      const groupId = String(entry.groupId || "").trim();
+      if (!groupId) continue;
+      const existingGroup = await getGroup(groupId);
+      if (existingGroup && !existingGroup.members.includes(peerId)) continue;
+      const senderId = String(entry.senderId || entry.from || peerId).trim();
+      if (!/^\d{6}$/.test(senderId)) continue;
+      const members = normalizeMembers(entry.members || existingGroup?.members || [peerId, senderId]);
+      if (!members.includes(peerId)) members.push(peerId);
+      await queueHistoryMessage(peerId, {
+        type: "group-message",
+        historyKind: "group",
+        historyDirection,
+        historyPeerId: senderId,
+        groupId,
+        groupName: String(entry.groupName || existingGroup?.name || "Group chat").slice(0, 80),
+        members,
+        messageId,
+        from: senderId,
+        profile: sanitizeProfile(entry.profile || {}),
+        publicKeyJwk: socket.publicKeyJwk,
+        senderPublicKeyJwk: entry.senderPublicKeyJwk || null,
+        encrypted: entry.encrypted,
+        sentAt,
+        selfEncrypted: true
+      });
+      stored += 1;
+      continue;
+    }
+
+    const historyPeerId = String(entry.historyPeerId || "").trim();
+    const from = String(entry.from || (historyDirection === "outbound" ? peerId : historyPeerId)).trim();
+    if (!/^\d{6}$/.test(historyPeerId) || !/^\d{6}$/.test(from)) continue;
+    await queueHistoryMessage(peerId, {
+      type: "direct-message",
+      historyKind: "direct",
+      historyDirection,
+      historyPeerId,
+      messageId,
+      from,
+      profile: sanitizeProfile(entry.profile || {}),
+      peerProfile: sanitizeProfile(entry.peerProfile || {}),
+      publicKeyJwk: socket.publicKeyJwk,
+      peerPublicKeyJwk: entry.peerPublicKeyJwk || null,
+      encrypted: entry.encrypted,
+      sentAt,
+      selfEncrypted: true
+    });
+    stored += 1;
+  }
+  send(socket, {
+    type: "history-backfill-result",
+    requestId: String(message.requestId || ""),
+    ok: true,
+    stored,
+    received: entries.length
+  });
 }
 
 // Removes a browser session from the online directory without deleting its persisted public key.
@@ -2036,36 +2118,41 @@ async function queueHistoryMessage(peerId, entry) {
   };
   const serialized = JSON.stringify(payload);
   if (serialized.length > MAX_QUEUED_ENVELOPE_CHARS) return;
+  const storageLimit = maxHistoryMessagesPerUser();
   if (!redis && !upstashRestEnabled) {
     const history = memoryHistoryMessages.get(peerId) || [];
     const next = history.filter((item) => item.historyId !== historyId);
     next.push(payload);
-    memoryHistoryMessages.set(peerId, next.slice(-maxHistoryMessagesPerUser()));
+    memoryHistoryMessages.set(peerId, storageLimit > 0 ? next.slice(-storageLimit) : next);
     return;
   }
 
   const indexKey = historyIndexKey(peerId);
+  const messageKey = historyMessageKey(peerId, historyId);
+  const ttl = historyTtlSeconds();
   if (redis) {
-    await redis.pipeline()
-      .set(historyMessageKey(peerId, historyId), serialized, "EX", historyTtlSeconds())
-      .lrem(indexKey, 0, historyId)
-      .rpush(indexKey, historyId)
-      .ltrim(indexKey, -maxHistoryMessagesPerUser(), -1)
-      .expire(indexKey, historyTtlSeconds())
-      .exec();
+    const pipeline = redis.pipeline();
+    if (ttl > 0) pipeline.set(messageKey, serialized, "EX", ttl);
+    else pipeline.set(messageKey, serialized);
+    pipeline.lrem(indexKey, 0, historyId);
+    pipeline.rpush(indexKey, historyId);
+    if (storageLimit > 0) pipeline.ltrim(indexKey, -storageLimit, -1);
+    if (ttl > 0) pipeline.expire(indexKey, ttl);
+    await pipeline.exec();
     return;
   }
 
-  await upstashPipeline([
-    ["SET", historyMessageKey(peerId, historyId), serialized, "EX", historyTtlSeconds()],
+  const commands = [
+    ttl > 0 ? ["SET", messageKey, serialized, "EX", ttl] : ["SET", messageKey, serialized],
     ["LREM", indexKey, 0, historyId],
-    ["RPUSH", indexKey, historyId],
-    ["LTRIM", indexKey, -maxHistoryMessagesPerUser(), -1],
-    ["EXPIRE", indexKey, historyTtlSeconds()]
-  ]);
+    ["RPUSH", indexKey, historyId]
+  ];
+  if (storageLimit > 0) commands.push(["LTRIM", indexKey, -storageLimit, -1]);
+  if (ttl > 0) commands.push(["EXPIRE", indexKey, ttl]);
+  await upstashPipeline(commands);
 }
 
-async function deliverHistoryMessages(socket, limit = 500) {
+async function deliverHistoryMessages(socket, limit = defaultHistorySyncLimit()) {
   const peerId = socket.bypassiumId;
   if (!peerId) return;
   const history = await getHistoryMessages(peerId, limit);
@@ -2093,11 +2180,13 @@ function sendHistoryItems(socket, history) {
 }
 
 async function getHistoryMessages(peerId, limit = 500) {
+  const requestedLimit = Math.max(0, Number(limit) || 0);
   if (!redis && !upstashRestEnabled) {
-    return (memoryHistoryMessages.get(peerId) || []).slice(-limit);
+    const history = memoryHistoryMessages.get(peerId) || [];
+    return requestedLimit ? history.slice(-requestedLimit) : history;
   }
   const ids = await getHistoryIds(peerId);
-  const uniqueIds = [...new Set(ids)].slice(-Math.min(maxHistoryMessagesPerUser(), limit));
+  const uniqueIds = requestedLimit ? [...new Set(ids)].slice(-requestedLimit) : [...new Set(ids)];
   const messages = [];
   const keptIds = [];
   for (const id of uniqueIds) {
@@ -2140,7 +2229,7 @@ async function replaceHistoryIds(peerId, ids) {
     await redis.del(key);
     if (ids.length) {
       await redis.rpush(key, ...ids);
-      await redis.expire(key, historyTtlSeconds());
+      if (historyTtlSeconds() > 0) await redis.expire(key, historyTtlSeconds());
     }
     return;
   }
@@ -2149,7 +2238,7 @@ async function replaceHistoryIds(peerId, ids) {
     await upstashCommand(["DEL", key]);
     if (ids.length) {
       await upstashPushList(key, ids);
-      await upstashCommand(["EXPIRE", key, historyTtlSeconds()]);
+      if (historyTtlSeconds() > 0) await upstashCommand(["EXPIRE", key, historyTtlSeconds()]);
     }
   }
 }
@@ -3490,11 +3579,19 @@ function maxOfflineMessagesPerUser() {
 }
 
 function historyTtlSeconds() {
-  return HISTORY_TTL_SECONDS;
+  return Math.max(0, Number(HISTORY_TTL_SECONDS) || 0);
 }
 
 function maxHistoryMessagesPerUser() {
-  return MAX_HISTORY_MESSAGES_PER_USER;
+  return Math.max(0, Number(MAX_HISTORY_MESSAGES_PER_USER) || 0);
+}
+
+function defaultHistorySyncLimit() {
+  return Math.max(50, Number(DEFAULT_HISTORY_SYNC_LIMIT) || 5000);
+}
+
+function maxHistorySyncLimit() {
+  return Math.max(defaultHistorySyncLimit(), Number(MAX_HISTORY_SYNC_LIMIT) || 50000);
 }
 
 function localProfile(peerId) {
