@@ -4,17 +4,20 @@ import Redis from "ioredis";
 import { WebSocketServer } from "ws";
 
 const PORT = Number(process.env.PORT || 10000);
-const OFFLINE_MESSAGE_TTL_SECONDS = 7 * 24 * 60 * 60;
+const OFFLINE_MESSAGE_TTL_SECONDS = 90 * 24 * 60 * 60;
+const HISTORY_TTL_SECONDS = 180 * 24 * 60 * 60;
 const SESSION_TTL_SECONDS = 30 * 24 * 60 * 60;
 const ADMIN_RESET_TTL_SECONDS = 30 * 60;
-const ADMIN_AUDIT_LIMIT = 250;
-const MAX_OFFLINE_MESSAGES_PER_USER = 30;
+const ADMIN_AUDIT_LIMIT = 500;
+const SAFETY_LOG_LIMIT = 1000;
+const MAX_OFFLINE_MESSAGES_PER_USER = 500;
+const MAX_HISTORY_MESSAGES_PER_USER = 2500;
 const MAX_PROFILE_PICTURE_CHARS = 18000;
 const MAX_UPSTASH_RPUSH_ITEMS = 4;
 const MAX_UPSTASH_RPUSH_CHARS = 6_000_000;
 const MAX_UPSTASH_COMMAND_CHARS = 8_500_000;
-const MAX_QUEUED_ENVELOPE_CHARS = 4_500_000;
-const MAX_WEBSOCKET_PAYLOAD_CHARS = 6_000_000;
+const MAX_QUEUED_ENVELOPE_CHARS = 7_500_000;
+const MAX_WEBSOCKET_PAYLOAD_CHARS = 8_500_000;
 const REDIS_URL = process.env.REDIS_URL || process.env.RENDER_REDIS_URL || process.env.KEY_VALUE_URL || "";
 const UPSTASH_REST_URL = process.env.UPSTASH_REDIS_REST_URL || "";
 const UPSTASH_REST_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN || "";
@@ -24,14 +27,19 @@ const sessions = new Map();
 const memoryPublicKeys = new Map();
 const memoryProfiles = new Map();
 const memoryAccounts = new Map();
+const memoryAccountIndex = new Set();
+const memoryAccountSearch = new Map();
 const memoryRestrictions = new Map();
 const memoryOwnerResetCodes = new Map();
 const memoryAdminAudit = [];
+const memorySafetyLog = [];
 const memoryDirectory = new Map();
 const memoryGroups = new Map();
 const memoryOfflineMessages = new Map();
+const memoryHistoryMessages = new Map();
 const pendingQueuedEnvelopes = new Map();
 const cancelledQueuedEnvelopes = new Set();
+let accountIndexHydrated = false;
 const redis = createRedisClient();
 const upstashRestEnabled = Boolean(!redis && UPSTASH_REST_URL && UPSTASH_REST_TOKEN);
 
@@ -127,6 +135,7 @@ wss.on("connection", (socket, request) => {
       if (message.type === "typing") await relayTyping(socket, message);
       if (message.type === "read-receipt") await relayReadReceipt(socket, message);
       if (message.type === "reaction") await relayReaction(socket, message);
+      if (message.type === "history-sync") await syncHistoryMessages(socket, message);
       if (message.type === "sync") await syncClient(socket);
     } catch (error) {
       console.error("Message handler failed:", error.message);
@@ -172,7 +181,8 @@ async function handleAdminApi(request, response, url, corsHeaders) {
         accounts: (await getKnownPeerIds()).length,
         groups: await countGroups(),
         queuedUsers: await countQueuedUsers(),
-        auditEntries: (await getAdminAudit()).length
+        auditEntries: (await getAdminAudit()).length,
+        safetyEntries: (await getSafetyLog()).length
       }, corsHeaders);
       return;
     }
@@ -202,6 +212,19 @@ async function handleAdminApi(request, response, url, corsHeaders) {
     }
 
     const body = await readRequestJson(request);
+
+    if (url.pathname === "/admin/api/bulk-delete-accounts") {
+      const peerIds = normalizeMembers(Array.isArray(body.peerIds) ? body.peerIds : []).slice(0, 100);
+      if (!peerIds.length) {
+        sendJson(response, 400, { ok: false, message: "Select at least one account to delete." }, corsHeaders);
+        return;
+      }
+      for (const id of peerIds) await deleteAccountBySupport(id);
+      await recordAdminAudit("bulk-delete-accounts", "", { count: peerIds.length, peerIds });
+      sendJson(response, 200, { ok: true, deleted: peerIds }, corsHeaders);
+      return;
+    }
+
     const peerId = cleanPeerId(body.peerId);
     if (!peerId && url.pathname !== "/admin/api/audit") {
       sendJson(response, 400, { ok: false, message: "Choose a valid 6-digit account code." }, corsHeaders);
@@ -211,7 +234,7 @@ async function handleAdminApi(request, response, url, corsHeaders) {
     if (url.pathname === "/admin/api/ban") {
       const reason = String(body.reason || "Admin ban").slice(0, 240);
       const bannedUntil = normalizeAdminDate(body.bannedUntil);
-      await setAccountRestriction(peerId, {
+      const restriction = await setAccountRestriction(peerId, {
         banned: true,
         banReason: reason,
         bannedAt: new Date().toISOString(),
@@ -219,7 +242,7 @@ async function handleAdminApi(request, response, url, corsHeaders) {
         passwordResetRequired: false
       });
       await revokePeerSessions(peerId);
-      disconnectPeer(peerId, "This account has been banned.");
+      disconnectPeer(peerId, accountBanMessage(restriction), accountBanPayload(peerId, restriction));
       await recordAdminAudit("ban-account", peerId, { reason, bannedUntil });
       sendJson(response, 200, { ok: true, account: await adminAccountDetail(peerId) }, corsHeaders);
       return;
@@ -257,6 +280,29 @@ async function handleAdminApi(request, response, url, corsHeaders) {
       return;
     }
 
+    if (url.pathname === "/admin/api/profile") {
+      const account = await getAccount(peerId);
+      const currentProfile = sanitizeProfile(account?.profile || await getProfile(peerId) || {});
+      const displayName = String(body.displayName || "").trim().slice(0, 80) || "Bypassium User";
+      const profilePicture = body.removeProfilePicture ? "" : sanitizeProfilePicture(body.profilePicture || currentProfile.profilePicture);
+      const cleanProfile = sanitizeProfile({
+        ...currentProfile,
+        displayName,
+        profilePicture
+      }, true);
+      await setProfile(peerId, cleanProfile);
+      if (account) await setAccount(peerId, { ...account, profile: cleanProfile, updatedAt: new Date().toISOString() });
+      if (await accountQuickAddHidden(peerId)) await removeQuickAddProfile(peerId);
+      else await updateQuickAddDirectory(peerId, cleanProfile);
+      broadcastProfileUpdate(peerId, cleanProfile);
+      await recordAdminAudit("moderate-profile", peerId, {
+        displayName,
+        profilePictureChanged: profilePicture !== currentProfile.profilePicture
+      });
+      sendJson(response, 200, { ok: true, account: await adminAccountDetail(peerId) }, corsHeaders);
+      return;
+    }
+
     if (url.pathname === "/admin/api/revoke-sessions") {
       await revokePeerSessions(peerId);
       disconnectPeer(peerId, "Your sessions were revoked by support.");
@@ -287,11 +333,7 @@ async function handleAdminApi(request, response, url, corsHeaders) {
         sendJson(response, 400, { ok: false, message: "Type the exact 6-digit code to confirm account deletion." }, corsHeaders);
         return;
       }
-      await deleteAccountData(peerId);
-      await revokePeerSessions(peerId);
-      await removeAccountRestriction(peerId);
-      await consumeOwnerResetCode(peerId);
-      disconnectPeer(peerId, "This account was deleted by support.");
+      await deleteAccountBySupport(peerId);
       await recordAdminAudit("delete-account", peerId);
       sendJson(response, 200, { ok: true }, corsHeaders);
       return;
@@ -348,6 +390,7 @@ function adminPageHtml() {
     body { margin:0; min-height:100vh; color:var(--text); background:radial-gradient(circle at 12% 0%, rgb(96 165 250 / .26), transparent 34%), radial-gradient(circle at 90% 18%, rgb(45 212 191 / .2), transparent 30%), var(--bg); }
     button,input,textarea { font:inherit; }
     button { border:0; border-radius:14px; padding:10px 13px; color:white; background:linear-gradient(180deg,color-mix(in srgb,var(--accent),white 12%),var(--accent)); cursor:pointer; font-weight:850; box-shadow:inset 0 1px 0 rgb(255 255 255 / .18),0 12px 28px rgb(0 0 0 / .22); }
+    button:disabled { opacity:.48; cursor:not-allowed; box-shadow:none; }
     button.secondary { color:var(--text); background:rgb(255 255 255 / .07); border:1px solid var(--line); }
     button.danger { background:linear-gradient(180deg,color-mix(in srgb,var(--danger),white 10%),var(--danger)); }
     button.warn { background:linear-gradient(180deg,color-mix(in srgb,var(--warn),white 10%),#d97706); }
@@ -365,22 +408,28 @@ function adminPageHtml() {
     h3 { font-size:15px; }
     .muted { color:var(--muted); font-size:13px; line-height:1.45; }
     .token-row,.search-row,.actions,.split { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:8px; align-items:end; }
+    .bulk-bar { display:grid; grid-template-columns:auto minmax(0,1fr) auto auto; gap:8px; align-items:center; padding:9px; border:1px solid var(--line); border-radius:15px; background:rgb(255 255 255 / .045); }
+    .bulk-bar label,.row-check { display:flex; align-items:center; gap:8px; color:var(--muted); font-size:12px; font-weight:900; text-transform:none; }
+    input[type="checkbox"] { width:auto; accent-color:var(--accent); }
     .status-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:9px; }
     .status { padding:11px; border:1px solid var(--line); border-radius:16px; background:rgb(255 255 255 / .06); }
     .status strong { display:block; font-size:20px; }
     .list { display:grid; gap:8px; max-height:55vh; overflow:auto; padding-right:3px; }
     .list-state { padding:11px; border:1px solid var(--line); border-radius:15px; background:rgb(255 255 255 / .045); }
-    .row { display:grid; grid-template-columns:46px minmax(0,1fr) auto; align-items:center; gap:10px; padding:10px; border:1px solid var(--line); border-radius:17px; background:rgb(255 255 255 / .055); cursor:pointer; text-align:left; }
+    .row { display:grid; grid-template-columns:auto minmax(0,1fr) auto; align-items:center; gap:10px; padding:10px; border:1px solid var(--line); border-radius:17px; background:rgb(255 255 255 / .055); text-align:left; }
     .row:hover { border-color:color-mix(in srgb,var(--accent),white 18%); }
+    .account-open { min-width:0; display:grid; grid-template-columns:46px minmax(0,1fr); align-items:center; gap:10px; padding:0; border-radius:0; color:var(--text); background:transparent; box-shadow:none; text-align:left; }
     .avatar { width:46px; height:46px; border-radius:15px; overflow:hidden; display:grid; place-items:center; color:white; font-weight:1000; background:linear-gradient(145deg,var(--accent),var(--accent2)); }
     .avatar img { width:100%; height:100%; object-fit:cover; }
-    .row strong,.row small { display:block; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
-    .row small { color:var(--muted); margin-top:3px; }
+    .account-open strong,.account-open small { display:block; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
+    .account-open small { color:var(--muted); margin-top:3px; }
     .badge { display:inline-flex; align-items:center; min-height:25px; border-radius:999px; padding:3px 9px; font-size:12px; font-weight:900; color:var(--text); border:1px solid var(--line); background:rgb(255 255 255 / .07); }
     .badge.bad { color:white; background:var(--danger); border-color:transparent; }
     .badge.ok { color:#042016; background:var(--ok); border-color:transparent; }
     .detail-head { display:flex; align-items:center; gap:14px; }
     .detail-head .avatar { width:72px; height:72px; border-radius:24px; font-size:28px; }
+    .profile-edit { display:grid; grid-template-columns:86px minmax(0,1fr); gap:12px; align-items:start; }
+    .profile-preview { width:86px; height:86px; border-radius:24px; font-size:32px; }
     .info-grid { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:9px; }
     .info { padding:10px; border:1px solid var(--line); border-radius:15px; background:rgb(255 255 255 / .052); }
     .info span { display:block; color:var(--muted); font-size:11px; font-weight:900; text-transform:uppercase; }
@@ -415,6 +464,12 @@ function adminPageHtml() {
           <label>Search<input id="search" placeholder="Code or username"></label>
           <button id="searchBtn">Search</button>
         </div>
+        <div class="bulk-bar">
+          <label><input id="selectAll" type="checkbox"> Select shown</label>
+          <span id="selectedCount" class="muted">0 selected</span>
+          <button id="clearSelected" class="secondary" disabled>Clear</button>
+          <button id="bulkDelete" class="danger" disabled>Delete selected</button>
+        </div>
         <div id="accountList" class="list"></div>
       </div>
     </section>
@@ -431,7 +486,7 @@ function adminPageHtml() {
   </main>
   <div id="toast" class="toast hidden"></div>
   <script>
-    const state = { token: localStorage.getItem("bypassiumAdminToken") || "", selected: "", searchTimer: 0, searchSeq: 0 };
+    const state = { token: localStorage.getItem("bypassiumAdminToken") || "", selected: "", selectedPeers: new Set(), searchTimer: 0, searchSeq: 0, profilePictureDraft: "" };
     const $ = (id) => document.getElementById(id);
     $("token").value = state.token;
     $("saveToken").onclick = () => { state.token = $("token").value.trim(); localStorage.setItem("bypassiumAdminToken", state.token); refreshAll(); };
@@ -439,6 +494,9 @@ function adminPageHtml() {
     $("search").addEventListener("input", () => scheduleAccountSearch());
     $("search").addEventListener("keydown", (event) => { if (event.key === "Enter") searchAccounts(); });
     $("refreshAudit").onclick = () => loadAudit();
+    $("selectAll").onchange = () => toggleShownSelection($("selectAll").checked);
+    $("clearSelected").onclick = () => { state.selectedPeers.clear(); updateSelectionUi(); };
+    $("bulkDelete").onclick = () => bulkDeleteSelected();
 
     async function api(path, options = {}) {
       const controller = new AbortController();
@@ -473,7 +531,7 @@ function adminPageHtml() {
         if (seq !== state.searchSeq) return;
         const accounts = Array.isArray(payload.accounts) ? payload.accounts : [];
         $("accountList").innerHTML = accounts.length ? accounts.map(accountRow).join("") : '<p class="muted list-state">No accounts found. Try their 6-digit code or a shorter name.</p>';
-        document.querySelectorAll("[data-peer]").forEach((button) => button.onclick = () => loadAccount(button.dataset.peer));
+        wireAccountRows();
       } catch (error) {
         const message = error.name === "AbortError" ? "Search timed out. Try a 6-digit code or refresh after the server finishes waking up." : error.message;
         if (seq === state.searchSeq) $("accountList").innerHTML = '<p class="muted list-state">' + escapeHtml(message) + '</p>';
@@ -486,7 +544,52 @@ function adminPageHtml() {
     function accountRow(account) {
       const avatar = account.profilePicture ? '<img src="' + escapeAttr(account.profilePicture) + '" alt="">' : escapeHtml((account.displayName || "B").slice(0,1).toUpperCase());
       const flags = account.banned ? '<span class="badge bad">Banned</span>' : account.passwordResetRequired ? '<span class="badge">Reset required</span>' : '<span class="badge ok">Active</span>';
-      return '<button class="row" data-peer="' + escapeAttr(account.peerId) + '"><span class="avatar">' + avatar + '</span><span><strong>' + escapeHtml(account.displayName || "Bypassium User") + '</strong><small>' + escapeHtml(account.peerId + " - " + account.status) + '</small></span>' + flags + '</button>';
+      return '<div class="row" data-row-peer="' + escapeAttr(account.peerId) + '"><label class="row-check" title="Select account"><input type="checkbox" data-select-peer="' + escapeAttr(account.peerId) + '"></label><button class="account-open" data-open-peer="' + escapeAttr(account.peerId) + '"><span class="avatar">' + avatar + '</span><span><strong>' + escapeHtml(account.displayName || "Bypassium User") + '</strong><small>' + escapeHtml(account.peerId + " - " + account.status) + '</small></span></button>' + flags + '</div>';
+    }
+    function wireAccountRows() {
+      document.querySelectorAll("[data-open-peer]").forEach((button) => button.onclick = () => loadAccount(button.dataset.openPeer));
+      document.querySelectorAll("[data-select-peer]").forEach((checkbox) => {
+        checkbox.checked = state.selectedPeers.has(checkbox.dataset.selectPeer);
+        checkbox.onchange = () => {
+          if (checkbox.checked) state.selectedPeers.add(checkbox.dataset.selectPeer);
+          else state.selectedPeers.delete(checkbox.dataset.selectPeer);
+          updateSelectionUi();
+        };
+      });
+      updateSelectionUi();
+    }
+    function updateSelectionUi() {
+      const boxes = [...document.querySelectorAll("[data-select-peer]")];
+      for (const box of boxes) box.checked = state.selectedPeers.has(box.dataset.selectPeer);
+      const shownSelected = boxes.filter((box) => box.checked).length;
+      $("selectedCount").textContent = state.selectedPeers.size + " selected";
+      $("clearSelected").disabled = state.selectedPeers.size === 0;
+      $("bulkDelete").disabled = state.selectedPeers.size === 0;
+      $("selectAll").checked = boxes.length > 0 && shownSelected === boxes.length;
+      $("selectAll").indeterminate = shownSelected > 0 && shownSelected < boxes.length;
+    }
+    function toggleShownSelection(checked) {
+      document.querySelectorAll("[data-select-peer]").forEach((box) => {
+        if (checked) state.selectedPeers.add(box.dataset.selectPeer);
+        else state.selectedPeers.delete(box.dataset.selectPeer);
+      });
+      updateSelectionUi();
+    }
+    async function bulkDeleteSelected() {
+      const peerIds = [...state.selectedPeers];
+      if (!peerIds.length) return;
+      const preview = peerIds.slice(0, 12).join(", ") + (peerIds.length > 12 ? "..." : "");
+      if (!confirm("Delete " + peerIds.length + " account(s)?\\n" + preview + "\\n\\nThis removes accounts, sessions, queued messages, profiles, and group membership.")) return;
+      try {
+        const payload = await api("/bulk-delete-accounts", { method:"POST", body:JSON.stringify({ peerIds }) });
+        state.selectedPeers.clear();
+        if (payload.deleted && payload.deleted.includes(state.selected)) {
+          state.selected = "";
+          $("detail").innerHTML = '<h2>Select an account</h2><p class="muted">Search by code or display name, then choose an account to manage.</p>';
+        }
+        toast("Deleted " + (payload.deleted || []).length + " account(s).");
+        await refreshAll();
+      } catch (error) { toast(error.message); }
     }
     async function loadAccount(peerId) {
       try {
@@ -497,16 +600,33 @@ function adminPageHtml() {
     }
     function renderDetail(account) {
       const avatar = account.profilePicture ? '<img src="' + escapeAttr(account.profilePicture) + '" alt="">' : escapeHtml((account.displayName || "B").slice(0,1).toUpperCase());
+      state.profilePictureDraft = account.profilePicture || "";
       $("detail").innerHTML = '<div class="detail-head"><span class="avatar">' + avatar + '</span><div><p class="muted">' + escapeHtml(account.peerId) + '</p><h1>' + escapeHtml(account.displayName || "Bypassium User") + '</h1><p class="muted">' + escapeHtml(account.status) + '</p></div></div>'
         + '<div class="info-grid">'
         + info("Password", account.hasPassword ? "set" : "not set") + info("Recovery", account.hasRecoveryPhrase ? "exists" : "missing") + info("Queued", String(account.queuedMessages))
         + info("Sessions", String(account.sessionCount)) + info("Groups", String(account.groupCount)) + info("Created", account.createdAt || "unknown")
         + '</div>'
+        + '<div class="card stack"><h2>Profile moderation</h2><div class="profile-edit"><span id="profilePreview" class="avatar profile-preview">' + profilePreviewHtml(account.profilePicture, account.displayName) + '</span><div class="stack"><label>Username<input id="profileDisplayName" value="' + escapeAttr(account.displayName || "Bypassium User") + '" maxlength="80"></label><label>Profile picture<input id="profilePictureFile" type="file" accept="image/*"></label><div class="actions"><button id="saveProfile">Save profile</button><button id="removeProfilePicture" class="secondary">Remove picture</button></div><p class="muted">Use this for inappropriate names or images. Uploaded pictures are compressed before saving.</p></div></div></div>'
         + '<div class="card stack danger-zone"><h2>Ban</h2><label>Reason<textarea id="banReason" placeholder="Reason shown internally"></textarea></label><label>Ban until optional<input id="banUntil" type="datetime-local"></label><div class="actions"><button class="danger" id="banBtn">Ban account</button><button class="secondary" id="unbanBtn">Unban</button></div><p class="muted">' + escapeHtml(account.banned ? "Currently banned: " + (account.banReason || "no reason") : "Not banned.") + '</p></div>'
         + '<div class="card stack"><h2>Restrictions</h2><label><input id="sendDisabled" type="checkbox" ' + checked(account.sendDisabled) + '> Stop sending messages</label><label><input id="groupsDisabled" type="checkbox" ' + checked(account.groupsDisabled) + '> Stop creating/joining groups</label><label><input id="quickAddHidden" type="checkbox" ' + checked(account.quickAddHidden) + '> Hide from Quick Add/search</label><button id="saveRestrictions">Save restrictions</button></div>'
         + '<div class="card stack"><h2>Recovery</h2><p class="muted">Force reset creates a one-time owner reset code. It does not reveal the old password.</p><button class="warn" id="forceReset">Force password reset</button><p id="resetOutput" class="muted"></p></div>'
         + '<div class="card stack"><h2>Sessions and queue</h2><div class="actions"><button id="revokeSessions">Revoke sessions</button><button class="secondary" id="clearQueue">Clear offline queue</button></div></div>'
         + '<div class="card stack danger-zone"><h2>Delete</h2><label>Type code to confirm<input id="deleteConfirm" placeholder="' + escapeAttr(account.peerId) + '"></label><button class="danger" id="deleteAccount">Delete account</button></div>';
+      $("profilePictureFile").onchange = async () => {
+        try {
+          const file = $("profilePictureFile").files && $("profilePictureFile").files[0];
+          if (!file) return;
+          state.profilePictureDraft = await compressProfileImage(file);
+          $("profilePreview").innerHTML = profilePreviewHtml(state.profilePictureDraft, $("profileDisplayName").value);
+          toast("Picture ready. Click Save profile.");
+        } catch (error) { toast(error.message); }
+      };
+      $("removeProfilePicture").onclick = () => {
+        state.profilePictureDraft = "";
+        $("profilePreview").innerHTML = profilePreviewHtml("", $("profileDisplayName").value);
+        toast("Picture removed. Click Save profile.");
+      };
+      $("saveProfile").onclick = () => postAction("/profile", { peerId: account.peerId, displayName: $("profileDisplayName").value, profilePicture: state.profilePictureDraft, removeProfilePicture: !state.profilePictureDraft });
       $("banBtn").onclick = () => postAction("/ban", { peerId: account.peerId, reason: $("banReason").value, bannedUntil: $("banUntil").value });
       $("unbanBtn").onclick = () => postAction("/unban", { peerId: account.peerId });
       $("saveRestrictions").onclick = () => postAction("/restrictions", { peerId: account.peerId, sendDisabled: $("sendDisabled").checked, groupsDisabled: $("groupsDisabled").checked, quickAddHidden: $("quickAddHidden").checked });
@@ -514,6 +634,9 @@ function adminPageHtml() {
       $("revokeSessions").onclick = () => postAction("/revoke-sessions", { peerId: account.peerId });
       $("clearQueue").onclick = () => postAction("/clear-queue", { peerId: account.peerId });
       $("deleteAccount").onclick = () => postAction("/delete-account", { peerId: account.peerId, confirm: $("deleteConfirm").value });
+    }
+    function profilePreviewHtml(profilePicture, displayName) {
+      return profilePicture ? '<img src="' + escapeAttr(profilePicture) + '" alt="">' : escapeHtml((displayName || "B").slice(0,1).toUpperCase());
     }
     function info(label, value) { return '<div class="info"><span>' + escapeHtml(label) + '</span><strong>' + escapeHtml(value) + '</strong></div>'; }
     function checked(value) { return value ? "checked" : ""; }
@@ -533,6 +656,32 @@ function adminPageHtml() {
       } catch (error) { $("audit").innerHTML = '<p class="muted">' + escapeHtml(error.message) + '</p>'; }
     }
     function toast(message) { $("toast").textContent = message; $("toast").classList.remove("hidden"); setTimeout(() => $("toast").classList.add("hidden"), 1800); }
+    function compressProfileImage(file) {
+      return new Promise((resolve, reject) => {
+        if (!file.type.startsWith("image/")) { reject(new Error("Choose an image file.")); return; }
+        const reader = new FileReader();
+        reader.onerror = () => reject(new Error("Could not read that image."));
+        reader.onload = () => {
+          const image = new Image();
+          image.onerror = () => reject(new Error("Could not decode that image."));
+          image.onload = () => {
+            const maxSide = 160;
+            const scale = Math.min(1, maxSide / Math.max(image.width, image.height));
+            const canvas = document.createElement("canvas");
+            canvas.width = Math.max(1, Math.round(image.width * scale));
+            canvas.height = Math.max(1, Math.round(image.height * scale));
+            const context = canvas.getContext("2d");
+            context.drawImage(image, 0, 0, canvas.width, canvas.height);
+            let dataUrl = canvas.toDataURL("image/jpeg", .78);
+            if (dataUrl.length > 18000) dataUrl = canvas.toDataURL("image/jpeg", .58);
+            if (dataUrl.length > 18000) reject(new Error("That picture is still too large. Try a smaller crop."));
+            else resolve(dataUrl);
+          };
+          image.src = reader.result;
+        };
+        reader.readAsDataURL(file);
+      });
+    }
     function escapeHtml(value) { return String(value ?? "").replace(/[&<>"']/g, (char) => ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#39;" }[char])); }
     function escapeAttr(value) { return escapeHtml(value).replace(new RegExp(String.fromCharCode(96), "g"), "&#96;"); }
     refreshAll();
@@ -549,9 +698,13 @@ async function registerClient(socket, message) {
     return;
   }
   const account = await getAccount(byPassiumId);
-  const accountBlock = await accountBlockMessage(byPassiumId, "account");
+  const accountBlock = await accountBlockInfo(byPassiumId, "account");
   if (accountBlock) {
-    send(socket, { type: "account-auth-required", peerId: byPassiumId, message: accountBlock });
+    send(socket, {
+      type: accountBlock.code === "account-banned" ? "account-banned" : "account-auth-required",
+      peerId: byPassiumId,
+      ...accountBlock
+    });
     return;
   }
   const storedPublicKey = await getPublicKey(byPassiumId);
@@ -588,6 +741,7 @@ async function registerClient(socket, message) {
       deliveryStatus: true,
       groupRoles: true,
       encryptedChatSettings: true,
+      encryptedHistorySync: true,
       quickAddDirectory: true,
       accounts: true
     },
@@ -606,6 +760,13 @@ async function syncClient(socket) {
   });
   await sendContactStatuses(socket, [...(socket.watchedContacts || [])]);
   await deliverOfflineMessages(socket);
+}
+
+async function syncHistoryMessages(socket, message = {}) {
+  const peerId = getRegisteredSender(socket);
+  if (!peerId) return;
+  const limit = Math.min(MAX_HISTORY_MESSAGES_PER_USER, Math.max(50, Number(message.limit) || 500));
+  await deliverHistoryMessages(socket, limit);
 }
 
 // Removes a browser session from the online directory without deleting its persisted public key.
@@ -671,9 +832,9 @@ async function createAccount(socket, message = {}) {
   const peerId = String(message.peerId || socket.bypassiumId || "").trim();
   const password = String(message.password || "");
   const publicKeyJwk = message.publicKeyJwk || socket.publicKeyJwk;
-  const accountBlock = await accountBlockMessage(peerId, "account");
+  const accountBlock = await accountBlockInfo(peerId, "account");
   if (accountBlock) {
-    sendAccountResponse(socket, message, false, accountBlock);
+    sendAccountResponse(socket, message, false, accountBlock.message, accountBlock);
     return;
   }
   if (!/^\d{6}$/.test(peerId) || !publicKeyJwk) {
@@ -724,6 +885,7 @@ async function createAccount(socket, message = {}) {
     await updateQuickAddDirectory(peerId, account.profile);
   }
   const sessionToken = issueSession(peerId);
+  void recordSafetyLog("account-created", peerId, { remoteAddress: socket.remoteAddress }).catch((error) => console.error("Safety log write failed:", error.message));
   sendAccountResponse(socket, message, true, "Account created.", { sessionToken, account: publicAccountStatus(account, true) });
 }
 
@@ -745,16 +907,18 @@ async function signInAccount(socket, message = {}) {
   const peerId = String(message.peerId || "").trim();
   const password = String(message.password || "");
   const account = /^\d{6}$/.test(peerId) ? await getAccount(peerId) : null;
-  const accountBlock = await accountBlockMessage(peerId, "account");
+  const accountBlock = await accountBlockInfo(peerId, "account");
   if (accountBlock) {
-    sendAccountResponse(socket, message, false, accountBlock);
+    sendAccountResponse(socket, message, false, accountBlock.message, accountBlock);
     return;
   }
   if (!account?.passwordHash || !verifyPassword(password, account)) {
+    void recordSafetyLog("failed-sign-in", peerId, { reason: "bad-credentials", remoteAddress: socket.remoteAddress }).catch((error) => console.error("Safety log write failed:", error.message));
     sendAccountResponse(socket, message, false, "Code or password is incorrect.");
     return;
   }
   const sessionToken = issueSession(peerId);
+  void recordSafetyLog("sign-in", peerId, { remoteAddress: socket.remoteAddress }).catch((error) => console.error("Safety log write failed:", error.message));
   sendAccountResponse(socket, message, true, "Signed in.", {
     sessionToken,
     account: publicAccountStatus(account, true),
@@ -766,15 +930,17 @@ async function signInWithSession(socket, message = {}) {
   const peerId = String(message.peerId || "").trim();
   const sessionToken = String(message.sessionToken || "");
   const account = /^\d{6}$/.test(peerId) ? await getAccount(peerId) : null;
-  const accountBlock = await accountBlockMessage(peerId, "account");
+  const accountBlock = await accountBlockInfo(peerId, "account");
   if (accountBlock) {
-    sendAccountResponse(socket, message, false, accountBlock);
+    sendAccountResponse(socket, message, false, accountBlock.message, accountBlock);
     return;
   }
   if (!account?.passwordHash || !(await validSession(peerId, sessionToken))) {
+    void recordSafetyLog("failed-session-sign-in", peerId, { reason: "expired-session", remoteAddress: socket.remoteAddress }).catch((error) => console.error("Safety log write failed:", error.message));
     sendAccountResponse(socket, message, false, "Saved sign-in expired. Enter your password once to trust this device again.");
     return;
   }
+  void recordSafetyLog("session-sign-in", peerId, { remoteAddress: socket.remoteAddress }).catch((error) => console.error("Safety log write failed:", error.message));
   sendAccountResponse(socket, message, true, "Trusted device signed in.", {
     sessionToken,
     account: publicAccountStatus(account, true)
@@ -788,9 +954,9 @@ async function changePassword(socket, message = {}) {
   const encryptedIdentityBackup = sanitizeEncryptedBackup(message.encryptedIdentityBackup);
   const publicKeyJwk = message.publicKeyJwk || socket.publicKeyJwk || null;
   const account = /^\d{6}$/.test(peerId) ? await getAccount(peerId) : null;
-  const accountBlock = await accountBlockMessage(peerId, "account", { allowForcedReset: true });
+  const accountBlock = await accountBlockInfo(peerId, "account", { allowForcedReset: true });
   if (accountBlock) {
-    sendAccountResponse(socket, message, false, accountBlock);
+    sendAccountResponse(socket, message, false, accountBlock.message, accountBlock);
     return;
   }
   if (!account?.passwordHash || !verifyPassword(oldPassword, account)) {
@@ -814,6 +980,7 @@ async function changePassword(socket, message = {}) {
   await setAccount(peerId, updated);
   await setPublicKey(peerId, publicKeyJwk);
   const sessionToken = issueSession(peerId);
+  void recordSafetyLog("password-changed", peerId, { remoteAddress: socket.remoteAddress }).catch((error) => console.error("Safety log write failed:", error.message));
   sendAccountResponse(socket, message, true, "Password changed.", {
     sessionToken,
     account: publicAccountStatus(updated, true),
@@ -825,15 +992,17 @@ async function recoverAccount(socket, message = {}) {
   const peerId = String(message.peerId || "").trim();
   const recoveryPhrase = normalizeRecoveryPhrase(message.recoveryPhrase);
   const account = /^\d{6}$/.test(peerId) ? await getAccount(peerId) : null;
-  const accountBlock = await accountBlockMessage(peerId, "account", { allowForcedReset: true });
+  const accountBlock = await accountBlockInfo(peerId, "account", { allowForcedReset: true });
   if (accountBlock) {
-    sendAccountResponse(socket, message, false, accountBlock);
+    sendAccountResponse(socket, message, false, accountBlock.message, accountBlock);
     return;
   }
   if (!account?.recoveryHash || !verifyRecoveryPhrase(recoveryPhrase, account)) {
+    void recordSafetyLog("failed-recovery", peerId, { reason: "bad-recovery-phrase", remoteAddress: socket.remoteAddress }).catch((error) => console.error("Safety log write failed:", error.message));
     sendAccountResponse(socket, message, false, "Code or recovery phrase is incorrect.");
     return;
   }
+  void recordSafetyLog("recovery-accepted", peerId, { remoteAddress: socket.remoteAddress }).catch((error) => console.error("Safety log write failed:", error.message));
   sendAccountResponse(socket, message, true, "Recovery phrase accepted.", {
     account: publicAccountStatus(account, true),
     encryptedRecoveryBackup: account.encryptedRecoveryBackup || null
@@ -847,9 +1016,9 @@ async function resetPasswordWithRecovery(socket, message = {}) {
   const encryptedIdentityBackup = sanitizeEncryptedBackup(message.encryptedIdentityBackup);
   const publicKeyJwk = message.publicKeyJwk || null;
   const account = /^\d{6}$/.test(peerId) ? await getAccount(peerId) : null;
-  const accountBlock = await accountBlockMessage(peerId, "account", { allowForcedReset: true });
+  const accountBlock = await accountBlockInfo(peerId, "account", { allowForcedReset: true });
   if (accountBlock) {
-    sendAccountResponse(socket, message, false, accountBlock);
+    sendAccountResponse(socket, message, false, accountBlock.message, accountBlock);
     return;
   }
   if (!account?.recoveryHash || !verifyRecoveryPhrase(recoveryPhrase, account)) {
@@ -873,6 +1042,7 @@ async function resetPasswordWithRecovery(socket, message = {}) {
   await setAccountRestriction(peerId, { passwordResetRequired: false });
   await setPublicKey(peerId, publicKeyJwk);
   const sessionToken = issueSession(peerId);
+  void recordSafetyLog("password-reset-recovery", peerId, { remoteAddress: socket.remoteAddress }).catch((error) => console.error("Safety log write failed:", error.message));
   sendAccountResponse(socket, message, true, "Password reset.", {
     sessionToken,
     account: publicAccountStatus(updated, true),
@@ -887,9 +1057,9 @@ async function resetPasswordWithOwnerCode(socket, message = {}) {
   const encryptedIdentityBackup = sanitizeEncryptedBackup(message.encryptedIdentityBackup);
   const publicKeyJwk = message.publicKeyJwk || null;
   const account = /^\d{6}$/.test(peerId) ? await getAccount(peerId) : null;
-  const accountBlock = await accountBlockMessage(peerId, "account", { allowForcedReset: true });
+  const accountBlock = await accountBlockInfo(peerId, "account", { allowForcedReset: true });
   if (accountBlock) {
-    sendAccountResponse(socket, message, false, accountBlock);
+    sendAccountResponse(socket, message, false, accountBlock.message, accountBlock);
     return;
   }
   if (!account?.passwordHash || !(await verifyOwnerResetCode(peerId, resetCode))) {
@@ -914,6 +1084,7 @@ async function resetPasswordWithOwnerCode(socket, message = {}) {
   await setPublicKey(peerId, publicKeyJwk);
   await setAccountRestriction(peerId, { passwordResetRequired: false });
   const sessionToken = issueSession(peerId);
+  void recordSafetyLog("password-reset-owner-code", peerId, { remoteAddress: socket.remoteAddress }).catch((error) => console.error("Safety log write failed:", error.message));
   sendAccountResponse(socket, message, true, "Password reset by owner code.", {
     sessionToken,
     account: publicAccountStatus(updated, true),
@@ -942,6 +1113,7 @@ async function deleteAccount(socket, message = {}) {
   }
   await deleteAccountData(peerId);
   await revokePeerSessions(peerId);
+  void recordSafetyLog("account-deleted-by-owner", peerId, { remoteAddress: socket.remoteAddress }).catch((error) => console.error("Safety log write failed:", error.message));
   sendAccountResponse(socket, message, true, "Account deleted.");
 }
 
@@ -968,6 +1140,9 @@ async function relayDirectMessage(socket, message) {
     encrypted: message.encrypted,
     sentAt: message.sentAt || new Date().toISOString()
   };
+  void storeDirectMessageHistory(senderId, targetId, envelope, {
+    senderEncrypted: message.senderEncrypted
+  }).catch((error) => console.error("Direct history write failed:", error.message));
   const targets = clients.get(targetId);
   send(socket, {
     type: "message-status",
@@ -1035,6 +1210,7 @@ async function relayGroupMessage(socket, message) {
   const sentAt = message.sentAt || new Date().toISOString();
   const messageId = message.messageId || randomUUID();
   const senderProfile = localProfile(senderId);
+  const senderEncrypted = message.senderEncrypted;
   const deliveries = recipients.map(async (recipient) => {
     const targetId = String(recipient.to || "").trim();
     if (targetId === senderId || !group.members.includes(targetId) || !recipient.encrypted) return null;
@@ -1062,6 +1238,14 @@ async function relayGroupMessage(socket, message) {
     return targetId;
   });
   const deliveredTo = (await Promise.all(deliveries)).filter(Boolean);
+  void storeGroupMessageHistory(senderId, group, {
+    messageId,
+    sentAt,
+    senderProfile,
+    senderPublicKeyJwk: socket.publicKeyJwk,
+    senderEncrypted,
+    recipients
+  }).catch((error) => console.error("Group history write failed:", error.message));
   send(socket, {
     type: "message-status",
     messageId,
@@ -1209,6 +1393,10 @@ async function publishProfile(socket, profile = {}) {
   if (account) await setAccount(peerId, { ...account, profile: cleanProfile, updatedAt: new Date().toISOString() });
   if (await accountQuickAddHidden(peerId)) await removeQuickAddProfile(peerId);
   else await updateQuickAddDirectory(peerId, cleanProfile);
+  void recordSafetyLog("profile-updated", peerId, {
+    displayNameChanged: existing?.displayName !== cleanProfile.displayName,
+    profilePictureChanged: existing?.profilePicture !== cleanProfile.profilePicture
+  }).catch((error) => console.error("Safety log write failed:", error.message));
   broadcastProfileUpdate(peerId, cleanProfile);
 }
 
@@ -1266,11 +1454,12 @@ async function searchAccounts(socket, message = {}) {
     return;
   }
 
-  const entries = await getQuickAddDirectoryEntries();
+  if (!accountIndexHydrated) await getKnownPeerIds();
+  let entries = await getAccountSearchEntries();
+  if (!entries.length) entries = await getQuickAddDirectoryEntries();
   const matches = [];
   for (const { id, profile } of entries) {
-    if (await accountQuickAddHidden(id)) continue;
-    if (!isDiscoverableProfile(profile)) continue;
+    if (!isDiscoverableProfile(profile) && !id.includes(query)) continue;
     const score = accountSearchScore(query, id, profile.displayName || "");
     if (score === null) continue;
     matches.push({
@@ -1339,6 +1528,7 @@ async function createGroup(socket, message) {
     updatedAt: new Date().toISOString()
   };
   await setGroup(group);
+  void recordSafetyLog("group-created", creatorId, { groupId: group.id, memberCount: members.length }).catch((error) => console.error("Safety log write failed:", error.message));
   broadcastGroupUpdate(group);
 }
 
@@ -1356,6 +1546,7 @@ async function updateGroupDetails(socket, message) {
     send(socket, { type: "error", message: "Only the group owner or an administrator can change group details." });
     return;
   }
+  const previous = { name: group.name, avatar: group.avatar, memberAddLocked: Boolean(group.memberAddLocked) };
   if (typeof message.name === "string" && message.name.trim()) {
     group.name = message.name.trim().slice(0, 80);
   }
@@ -1367,6 +1558,12 @@ async function updateGroupDetails(socket, message) {
   }
   group.updatedAt = new Date().toISOString();
   await setGroup(group);
+  void recordSafetyLog("group-updated", peerId, {
+    groupId: group.id,
+    nameChanged: previous.name !== group.name,
+    avatarChanged: previous.avatar !== group.avatar,
+    memberAddLockedChanged: previous.memberAddLocked !== Boolean(group.memberAddLocked)
+  }).catch((error) => console.error("Safety log write failed:", error.message));
   broadcastGroupUpdate(group);
 }
 
@@ -1388,9 +1585,14 @@ async function addGroupMembers(socket, message) {
   for (const memberId of normalizeMembers(message.members || [])) {
     if (!(await accountGroupsDisabled(memberId))) requestedMembers.push(memberId);
   }
+  const previousMembers = new Set(group.members);
   group.members = normalizeMembers([...group.members, ...requestedMembers]);
   group.updatedAt = new Date().toISOString();
   await setGroup(group);
+  void recordSafetyLog("group-members-added", peerId, {
+    groupId: group.id,
+    added: group.members.filter((id) => !previousMembers.has(id))
+  }).catch((error) => console.error("Safety log write failed:", error.message));
   broadcastGroupUpdate(group);
 }
 
@@ -1412,6 +1614,7 @@ async function setGroupAdmin(socket, message) {
   group.admins = [...admins].filter((id) => group.members.includes(id));
   group.updatedAt = new Date().toISOString();
   await setGroup(group);
+  void recordSafetyLog("group-admin-updated", peerId, { groupId: group.id, memberId, isAdmin: message.isAdmin !== false }).catch((error) => console.error("Safety log write failed:", error.message));
   broadcastGroupUpdate(group);
 }
 
@@ -1430,6 +1633,7 @@ async function transferGroupOwnership(socket, message) {
   group.admins = normalizeMembers([memberId, peerId, ...(group.admins || [])]).filter((id) => group.members.includes(id));
   group.updatedAt = new Date().toISOString();
   await setGroup(group);
+  void recordSafetyLog("group-owner-transferred", peerId, { groupId: group.id, newOwnerId: memberId }).catch((error) => console.error("Safety log write failed:", error.message));
   broadcastGroupUpdate(group);
 }
 
@@ -1452,6 +1656,7 @@ async function removeGroupMember(socket, message) {
   group.admins = group.admins.filter((id) => id !== memberId);
   group.updatedAt = new Date().toISOString();
   await setGroup(group);
+  void recordSafetyLog("group-member-removed", peerId, { groupId: group.id, memberId }).catch((error) => console.error("Safety log write failed:", error.message));
   broadcastGroupUpdate(group, [memberId]);
 }
 
@@ -1469,8 +1674,10 @@ async function leaveGroup(socket, message) {
   group.updatedAt = new Date().toISOString();
   if (group.members.length) {
     await setGroup(group);
+    void recordSafetyLog("group-left", peerId, { groupId: group.id }).catch((error) => console.error("Safety log write failed:", error.message));
     broadcastGroupUpdate(group, [peerId]);
   } else {
+    void recordSafetyLog("group-deleted-empty", peerId, { groupId: group.id }).catch((error) => console.error("Safety log write failed:", error.message));
     await deleteGroup(group.id);
   }
 }
@@ -1659,6 +1866,223 @@ async function replaceInboxIds(targetId, ids) {
   }
 }
 
+async function storeDirectMessageHistory(senderId, targetId, envelope, { senderEncrypted = null } = {}) {
+  const sentAt = envelope.sentAt || new Date().toISOString();
+  await queueHistoryMessage(targetId, {
+    type: "direct-message",
+    historyKind: "direct",
+    historyDirection: "inbound",
+    historyPeerId: senderId,
+    messageId: envelope.messageId,
+    from: senderId,
+    profile: envelope.profile,
+    publicKeyJwk: envelope.publicKeyJwk,
+    encrypted: envelope.encrypted,
+    sentAt
+  });
+
+  if (validEncryptedPayload(senderEncrypted)) {
+    const targetProfile = await getProfile(targetId) || {};
+    const targetPublicKeyJwk = await getPublicKey(targetId);
+    await queueHistoryMessage(senderId, {
+      type: "direct-message",
+      historyKind: "direct",
+      historyDirection: "outbound",
+      historyPeerId: targetId,
+      messageId: envelope.messageId,
+      from: senderId,
+      profile: targetProfile,
+      peerProfile: targetProfile,
+      publicKeyJwk: envelope.publicKeyJwk,
+      peerPublicKeyJwk: targetPublicKeyJwk,
+      encrypted: senderEncrypted,
+      sentAt
+    });
+  }
+}
+
+async function storeGroupMessageHistory(senderId, group, options = {}) {
+  const messageId = String(options.messageId || "");
+  if (!messageId) return;
+  const sentAt = options.sentAt || new Date().toISOString();
+  const recipientById = new Map((options.recipients || []).map((recipient) => [String(recipient.to || ""), recipient]));
+  const senderPublicKeyJwk = options.senderPublicKeyJwk || null;
+
+  for (const memberId of group.members || []) {
+    if (memberId === senderId) continue;
+    const recipient = recipientById.get(memberId);
+    if (!validEncryptedPayload(recipient?.encrypted)) continue;
+    await queueHistoryMessage(memberId, {
+      type: "group-message",
+      historyKind: "group",
+      historyDirection: "inbound",
+      historyPeerId: senderId,
+      groupId: group.id,
+      groupName: group.name,
+      members: group.members,
+      messageId,
+      from: senderId,
+      profile: options.senderProfile || {},
+      publicKeyJwk: senderPublicKeyJwk,
+      encrypted: recipient.encrypted,
+      sentAt
+    });
+  }
+
+  if (validEncryptedPayload(options.senderEncrypted) && senderPublicKeyJwk) {
+    await queueHistoryMessage(senderId, {
+      type: "group-message",
+      historyKind: "group",
+      historyDirection: "outbound",
+      historyPeerId: senderId,
+      groupId: group.id,
+      groupName: group.name,
+      members: group.members,
+      messageId,
+      from: senderId,
+      profile: options.senderProfile || {},
+      publicKeyJwk: senderPublicKeyJwk,
+      encrypted: options.senderEncrypted,
+      sentAt
+    });
+  }
+}
+
+async function queueHistoryMessage(peerId, entry) {
+  const historyId = String(entry.historyId || `${entry.messageId}:${entry.historyDirection || "inbound"}:${entry.historyKind || entry.type}`);
+  const payload = {
+    ...entry,
+    historyId,
+    storedAt: Date.now()
+  };
+  const serialized = JSON.stringify(payload);
+  if (serialized.length > MAX_QUEUED_ENVELOPE_CHARS) return;
+  if (!redis && !upstashRestEnabled) {
+    const history = memoryHistoryMessages.get(peerId) || [];
+    const next = history.filter((item) => item.historyId !== historyId);
+    next.push(payload);
+    memoryHistoryMessages.set(peerId, next.slice(-maxHistoryMessagesPerUser()));
+    return;
+  }
+
+  const indexKey = historyIndexKey(peerId);
+  if (redis) {
+    await redis.pipeline()
+      .set(historyMessageKey(peerId, historyId), serialized, "EX", historyTtlSeconds())
+      .lrem(indexKey, 0, historyId)
+      .rpush(indexKey, historyId)
+      .ltrim(indexKey, -maxHistoryMessagesPerUser(), -1)
+      .expire(indexKey, historyTtlSeconds())
+      .exec();
+    return;
+  }
+
+  await upstashPipeline([
+    ["SET", historyMessageKey(peerId, historyId), serialized, "EX", historyTtlSeconds()],
+    ["LREM", indexKey, 0, historyId],
+    ["RPUSH", indexKey, historyId],
+    ["LTRIM", indexKey, -maxHistoryMessagesPerUser(), -1],
+    ["EXPIRE", indexKey, historyTtlSeconds()]
+  ]);
+}
+
+async function deliverHistoryMessages(socket, limit = 500) {
+  const peerId = socket.bypassiumId;
+  if (!peerId) return;
+  const history = await getHistoryMessages(peerId, limit);
+  if (history.length) sendHistoryItems(socket, history);
+  send(socket, {
+    type: "history-sync-complete",
+    count: history.length,
+    syncedAt: new Date().toISOString()
+  });
+}
+
+function sendHistoryItems(socket, history) {
+  let batch = [];
+  for (const item of history) {
+    const candidate = [...batch, item];
+    const size = JSON.stringify({ type: "history-items", items: candidate }).length;
+    if (batch.length && size > MAX_WEBSOCKET_PAYLOAD_CHARS - 300_000) {
+      send(socket, { type: "history-items", items: batch });
+      batch = [item];
+    } else {
+      batch = candidate;
+    }
+  }
+  if (batch.length) send(socket, { type: "history-items", items: batch });
+}
+
+async function getHistoryMessages(peerId, limit = 500) {
+  if (!redis && !upstashRestEnabled) {
+    return (memoryHistoryMessages.get(peerId) || []).slice(-limit);
+  }
+  const ids = await getHistoryIds(peerId);
+  const uniqueIds = [...new Set(ids)].slice(-Math.min(maxHistoryMessagesPerUser(), limit));
+  const messages = [];
+  const keptIds = [];
+  for (const id of uniqueIds) {
+    const stored = await getHistoryMessage(peerId, id);
+    if (!stored) continue;
+    try {
+      messages.push(JSON.parse(stored));
+      keptIds.push(id);
+    } catch {
+      await deleteHistoryMessage(peerId, id);
+    }
+  }
+  if (keptIds.length !== ids.length) await replaceHistoryIds(peerId, keptIds);
+  return messages;
+}
+
+async function getHistoryIds(peerId) {
+  if (redis) return redis.lrange(historyIndexKey(peerId), 0, -1);
+  if (upstashRestEnabled) return upstashCommand(["LRANGE", historyIndexKey(peerId), 0, -1]);
+  return [];
+}
+
+async function getHistoryMessage(peerId, historyId) {
+  if (redis) return redis.get(historyMessageKey(peerId, historyId));
+  if (upstashRestEnabled) return upstashCommand(["GET", historyMessageKey(peerId, historyId)]);
+  return null;
+}
+
+async function deleteHistoryMessage(peerId, historyId) {
+  if (redis) {
+    await redis.del(historyMessageKey(peerId, historyId));
+    return;
+  }
+  if (upstashRestEnabled) await upstashCommand(["DEL", historyMessageKey(peerId, historyId)]);
+}
+
+async function replaceHistoryIds(peerId, ids) {
+  if (redis) {
+    const key = historyIndexKey(peerId);
+    await redis.del(key);
+    if (ids.length) {
+      await redis.rpush(key, ...ids);
+      await redis.expire(key, historyTtlSeconds());
+    }
+    return;
+  }
+  if (upstashRestEnabled) {
+    const key = historyIndexKey(peerId);
+    await upstashCommand(["DEL", key]);
+    if (ids.length) {
+      await upstashPushList(key, ids);
+      await upstashCommand(["EXPIRE", key, historyTtlSeconds()]);
+    }
+  }
+}
+
+async function deleteAllHistoryMessages(peerId) {
+  memoryHistoryMessages.delete(peerId);
+  const ids = await getHistoryIds(peerId);
+  for (const id of new Set(ids)) await deleteHistoryMessage(peerId, id);
+  if (redis) await redis.del(historyIndexKey(peerId));
+  if (upstashRestEnabled) await upstashCommand(["DEL", historyIndexKey(peerId)]);
+}
+
 async function getLegacyOfflineMessages(targetId) {
   if (!redis && !upstashRestEnabled) return [];
   try {
@@ -1684,6 +2108,7 @@ async function setPublicKey(peerId, publicKeyJwk) {
   memoryPublicKeys.set(peerId, publicKeyJwk);
   if (redis) await redis.set(publicKeyKey(peerId), JSON.stringify(publicKeyJwk));
   if (upstashRestEnabled) await upstashCommand(["SET", publicKeyKey(peerId), JSON.stringify(publicKeyJwk)]);
+  void updateAccountIndex(peerId).catch((error) => console.error("Account index update failed:", error.message));
 }
 
 async function getPublicKey(peerId) {
@@ -1702,6 +2127,7 @@ async function setAccount(peerId, account) {
   memoryAccounts.set(peerId, clean);
   if (redis) await redis.set(accountKey(peerId), JSON.stringify(clean));
   if (upstashRestEnabled) await upstashCommand(["SET", accountKey(peerId), JSON.stringify(clean)]);
+  await updateAccountIndex(peerId, clean.profile, clean);
 }
 
 async function getAccount(peerId) {
@@ -1719,6 +2145,7 @@ async function removeAccount(peerId) {
   memoryAccounts.delete(peerId);
   if (redis) await redis.del(accountKey(peerId));
   if (upstashRestEnabled) await upstashCommand(["DEL", accountKey(peerId)]);
+  await removeAccountIndex(peerId);
 }
 
 async function deleteAccountData(peerId) {
@@ -1727,8 +2154,43 @@ async function deleteAccountData(peerId) {
     removePublicKey(peerId),
     removeProfile(peerId),
     removeQuickAddProfile(peerId),
-    deleteAllQueuedMessages(peerId)
+    deleteAllQueuedMessages(peerId),
+    deleteAllHistoryMessages(peerId),
+    removeAccountIndex(peerId)
   ]);
+}
+
+async function deleteAccountBySupport(peerId) {
+  const clean = cleanPeerId(peerId);
+  if (!clean) return false;
+  await removePeerFromGroups(clean);
+  await deleteAccountData(clean);
+  await revokePeerSessions(clean);
+  await removeAccountRestriction(clean);
+  await consumeOwnerResetCode(clean);
+  disconnectPeer(clean, "This account was deleted by support.");
+  return true;
+}
+
+async function removePeerFromGroups(peerId) {
+  const groups = await getGroupsForMember(peerId);
+  for (const group of groups) {
+    const remainingMembers = group.members.filter((id) => id !== peerId);
+    if (!remainingMembers.length) {
+      await deleteGroup(group.id);
+      broadcastGroupUpdate({ ...group, members: [] }, [peerId]);
+      continue;
+    }
+    group.members = remainingMembers;
+    group.admins = (group.admins || []).filter((id) => id !== peerId && remainingMembers.includes(id));
+    if (group.ownerId === peerId) {
+      group.ownerId = group.admins[0] || remainingMembers[0];
+      group.admins = normalizeMembers([group.ownerId, ...group.admins]).filter((id) => remainingMembers.includes(id));
+    }
+    group.updatedAt = new Date().toISOString();
+    await setGroup(group);
+    broadcastGroupUpdate(group, [peerId]);
+  }
 }
 
 async function removePublicKey(peerId) {
@@ -1777,6 +2239,7 @@ async function setProfile(peerId, profile) {
   memoryProfiles.set(peerId, profile);
   if (redis) await redis.set(profileKey(peerId), JSON.stringify(profile));
   if (upstashRestEnabled) await upstashCommand(["SET", profileKey(peerId), JSON.stringify(profile)]);
+  await updateAccountIndex(peerId, profile);
 }
 
 async function getProfile(peerId) {
@@ -1842,6 +2305,90 @@ async function getQuickAddDirectoryEntries() {
 function parseStoredProfile(value) {
   try {
     return value ? sanitizeProfile(JSON.parse(value)) : null;
+  } catch {
+    return null;
+  }
+}
+
+async function updateAccountIndex(peerId, profile = null, account = null) {
+  const clean = cleanPeerId(peerId);
+  if (!clean) return;
+  const indexedAccount = account || await getAccount(clean);
+  const indexedProfile = sanitizeProfile(profile || indexedAccount?.profile || await getProfile(clean) || {});
+  const summary = {
+    peerId: clean,
+    displayName: indexedProfile.displayName || "Bypassium User",
+    profilePicture: indexedProfile.profilePicture || "",
+    joinedAt: indexedProfile.joinedAt || indexedAccount?.createdAt || "",
+    updatedAt: indexedProfile.updatedAt || indexedAccount?.updatedAt || "",
+    quickAddVisible: indexedProfile.quickAddVisible !== false
+  };
+  memoryAccountIndex.add(clean);
+  memoryAccountSearch.set(clean, summary);
+  if (redis) {
+    await redis.sadd(accountIndexKey(), clean);
+    await redis.hset(accountSearchIndexKey(), clean, JSON.stringify(summary));
+  }
+  if (upstashRestEnabled) {
+    await upstashPipeline([
+      ["SADD", accountIndexKey(), clean],
+      ["HSET", accountSearchIndexKey(), clean, JSON.stringify(summary)]
+    ]);
+  }
+}
+
+async function removeAccountIndex(peerId) {
+  const clean = cleanPeerId(peerId);
+  if (!clean) return;
+  memoryAccountIndex.delete(clean);
+  memoryAccountSearch.delete(clean);
+  if (redis) {
+    await redis.srem(accountIndexKey(), clean);
+    await redis.hdel(accountSearchIndexKey(), clean);
+  }
+  if (upstashRestEnabled) {
+    await upstashPipeline([
+      ["SREM", accountIndexKey(), clean],
+      ["HDEL", accountSearchIndexKey(), clean]
+    ]);
+  }
+}
+
+async function getIndexedPeerIds() {
+  const ids = new Set(memoryAccountIndex);
+  if (redis) {
+    for (const id of await redis.smembers(accountIndexKey())) ids.add(id);
+  }
+  if (upstashRestEnabled) {
+    for (const id of await upstashCommand(["SMEMBERS", accountIndexKey()]) || []) ids.add(id);
+  }
+  return [...ids].filter(cleanPeerId);
+}
+
+async function getAccountSearchEntries() {
+  const entries = new Map(memoryAccountSearch);
+  if (redis) {
+    const stored = await redis.hgetall(accountSearchIndexKey());
+    for (const [id, value] of Object.entries(stored || {})) {
+      const parsed = parseAccountSearchEntry(value);
+      if (parsed) entries.set(id, parsed);
+    }
+  }
+  if (upstashRestEnabled) {
+    const stored = await upstashCommand(["HGETALL", accountSearchIndexKey()]) || [];
+    for (let index = 0; index < stored.length; index += 2) {
+      const parsed = parseAccountSearchEntry(stored[index + 1]);
+      if (parsed) entries.set(stored[index], parsed);
+    }
+  }
+  return [...entries.entries()]
+    .map(([id, profile]) => ({ id, profile: sanitizeProfile(profile) }))
+    .filter(({ id }) => cleanPeerId(id));
+}
+
+function parseAccountSearchEntry(value) {
+  try {
+    return value ? sanitizeProfile(typeof value === "string" ? JSON.parse(value) : value) : null;
   } catch {
     return null;
   }
@@ -1989,8 +2536,12 @@ async function adminAccountDetail(peerId) {
 }
 
 async function getKnownPeerIds() {
+  const indexedIds = await getIndexedPeerIds();
+  if (indexedIds.length && accountIndexHydrated) return indexedIds;
   const ids = new Set([
+    ...indexedIds,
     ...memoryAccounts.keys(),
+    ...memoryAccountIndex,
     ...memoryProfiles.keys(),
     ...memoryPublicKeys.keys(),
     ...memoryDirectory.keys(),
@@ -2010,7 +2561,12 @@ async function getKnownPeerIds() {
       }
     }
   }
-  return [...ids].filter((id) => /^\d{6}$/.test(id));
+  const cleanIds = [...ids].filter((id) => /^\d{6}$/.test(id));
+  await Promise.all(cleanIds.map((id) => updateAccountIndex(id).catch((error) => {
+    console.error("Account index hydrate failed:", error.message);
+  })));
+  accountIndexHydrated = true;
+  return cleanIds;
 }
 
 async function countQueuedMessages(peerId) {
@@ -2099,19 +2655,67 @@ function restrictionBanned(restriction = {}) {
 }
 
 async function accountBlockMessage(peerId, action = "account", { allowForcedReset = false } = {}) {
+  const info = await accountBlockInfo(peerId, action, { allowForcedReset });
+  return info?.message || "";
+}
+
+async function accountBlockInfo(peerId, action = "account", { allowForcedReset = false } = {}) {
+  const clean = cleanPeerId(peerId);
   const restriction = await getAccountRestriction(peerId);
-  if (restrictionBanned(restriction)) return restriction.banReason ? `Account banned: ${restriction.banReason}` : "This account is banned.";
-  if (restriction.passwordResetRequired && !allowForcedReset) return "This account must reset its password before continuing.";
-  if (action === "send" && restriction.sendDisabled) return "Support has disabled message sending for this account.";
-  if (action === "groups" && restriction.groupsDisabled) return "Support has disabled group actions for this account.";
-  if (action === "quick-add" && restriction.quickAddHidden) return "Support has hidden this account from public discovery.";
-  return "";
+  if (restrictionBanned(restriction)) return accountBanPayload(clean, restriction);
+  if (restriction.passwordResetRequired && !allowForcedReset) {
+    return {
+      code: "password-reset-required",
+      peerId: clean,
+      message: "This account must reset its password before continuing."
+    };
+  }
+  if (action === "send" && restriction.sendDisabled) {
+    return {
+      code: "send-disabled",
+      peerId: clean,
+      message: "Support has disabled message sending for this account."
+    };
+  }
+  if (action === "groups" && restriction.groupsDisabled) {
+    return {
+      code: "groups-disabled",
+      peerId: clean,
+      message: "Support has disabled group actions for this account."
+    };
+  }
+  if (action === "quick-add" && restriction.quickAddHidden) {
+    return {
+      code: "quick-add-hidden",
+      peerId: clean,
+      message: "Support has hidden this account from public discovery."
+    };
+  }
+  return null;
+}
+
+function accountBanMessage(restriction = {}) {
+  return restriction.banReason ? `Account banned: ${restriction.banReason}` : "This account is banned.";
+}
+
+function accountBanPayload(peerId, restriction = {}) {
+  return {
+    code: "account-banned",
+    peerId: cleanPeerId(peerId),
+    banned: true,
+    banReason: restriction.banReason || "",
+    bannedUntil: restriction.bannedUntil || "",
+    message: accountBanMessage(restriction)
+  };
 }
 
 async function enforceAccountAction(socket, peerId, action) {
-  const message = await accountBlockMessage(peerId, action);
-  if (!message) return true;
-  send(socket, { type: "error", message });
+  const block = await accountBlockInfo(peerId, action);
+  if (!block) return true;
+  send(socket, {
+    type: block.code === "account-banned" ? "account-banned" : "error",
+    ...block
+  });
   return false;
 }
 
@@ -2197,6 +2801,7 @@ async function recordAdminAudit(action, peerId = "", details = {}) {
       ["LTRIM", adminAuditKey(), 0, ADMIN_AUDIT_LIMIT - 1]
     ]);
   }
+  void recordSafetyLog(`admin:${entry.action}`, peerId, details).catch((error) => console.error("Safety log write failed:", error.message));
   return entry;
 }
 
@@ -2214,11 +2819,47 @@ function parseAuditEntry(value) {
   }
 }
 
-function disconnectPeer(peerId, message) {
+async function recordSafetyLog(action, peerId = "", details = {}) {
+  const entry = {
+    id: randomUUID(),
+    at: new Date().toISOString(),
+    action: String(action || "").slice(0, 80),
+    peerId: cleanPeerId(peerId),
+    details: sanitizeSafetyDetails(details)
+  };
+  memorySafetyLog.unshift(entry);
+  memorySafetyLog.splice(SAFETY_LOG_LIMIT);
+  if (redis) {
+    await redis.lpush(safetyLogKey(), JSON.stringify(entry));
+    await redis.ltrim(safetyLogKey(), 0, SAFETY_LOG_LIMIT - 1);
+  }
+  if (upstashRestEnabled) {
+    await upstashPipeline([
+      ["LPUSH", safetyLogKey(), JSON.stringify(entry)],
+      ["LTRIM", safetyLogKey(), 0, SAFETY_LOG_LIMIT - 1]
+    ]);
+  }
+  return entry;
+}
+
+async function getSafetyLog() {
+  if (redis) return (await redis.lrange(safetyLogKey(), 0, SAFETY_LOG_LIMIT - 1)).map(parseAuditEntry).filter(Boolean);
+  if (upstashRestEnabled) return (await upstashCommand(["LRANGE", safetyLogKey(), 0, SAFETY_LOG_LIMIT - 1]) || []).map(parseAuditEntry).filter(Boolean);
+  return memorySafetyLog;
+}
+
+function sanitizeSafetyDetails(details = {}) {
+  const json = JSON.stringify(details || {});
+  if (json.length <= 1200) return details || {};
+  return { truncated: true, preview: json.slice(0, 1200) };
+}
+
+function disconnectPeer(peerId, message, payload = null) {
   const sockets = clients.get(peerId);
   if (!sockets) return;
   for (const socket of sockets) {
-    send(socket, { type: "error", message });
+    if (payload) send(socket, { type: payload.type || "account-banned", message, ...payload });
+    else send(socket, { type: "error", message });
     socket.close(4003, message.slice(0, 120));
   }
 }
@@ -2674,6 +3315,14 @@ function maxOfflineMessagesPerUser() {
   return MAX_OFFLINE_MESSAGES_PER_USER;
 }
 
+function historyTtlSeconds() {
+  return HISTORY_TTL_SECONDS;
+}
+
+function maxHistoryMessagesPerUser() {
+  return MAX_HISTORY_MESSAGES_PER_USER;
+}
+
 function localProfile(peerId) {
   return sanitizeProfile(memoryProfiles.get(peerId) || {});
 }
@@ -2706,6 +3355,18 @@ function adminAuditKey() {
   return "bypassium:admin-audit";
 }
 
+function safetyLogKey() {
+  return "bypassium:safety-log";
+}
+
+function accountIndexKey() {
+  return "bypassium:account-index";
+}
+
+function accountSearchIndexKey() {
+  return "bypassium:account-search-index";
+}
+
 function profileKey(peerId) {
   return `bypassium:profile:${peerId}`;
 }
@@ -2732,6 +3393,18 @@ function inboxIndexKey(peerId) {
 
 function queuedMessageKey(peerId, messageId) {
   return `bypassium:queued:${peerId}:${messageId}`;
+}
+
+function historyIndexKey(peerId) {
+  return `bypassium:history-index:${peerId}`;
+}
+
+function historyMessageKey(peerId, historyId) {
+  return `bypassium:history:${peerId}:${historyId}`;
+}
+
+function validEncryptedPayload(value) {
+  return Boolean(value && typeof value === "object" && value.iv && value.ciphertext);
 }
 
 function sendToClient(peerId, message, exceptSocket = null) {
