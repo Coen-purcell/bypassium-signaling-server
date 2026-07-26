@@ -299,10 +299,12 @@ async function handleAdminApi(request, response, url, corsHeaders) {
       const currentProfile = sanitizeProfile(account?.profile || await getProfile(peerId) || {});
       const displayName = String(body.displayName || "").trim().slice(0, 80) || "Bypassium User";
       const profilePicture = body.removeProfilePicture ? "" : sanitizeProfilePicture(body.profilePicture || currentProfile.profilePicture);
+      const badge = sanitizeProfileBadge(body.badge);
       const cleanProfile = sanitizeProfile({
         ...currentProfile,
         displayName,
-        profilePicture
+        profilePicture,
+        badge
       }, true);
       await setProfile(peerId, cleanProfile);
       if (account) await setAccount(peerId, { ...account, profile: cleanProfile, updatedAt: new Date().toISOString() });
@@ -311,7 +313,8 @@ async function handleAdminApi(request, response, url, corsHeaders) {
       broadcastProfileUpdate(peerId, cleanProfile);
       await recordAdminAudit("moderate-profile", peerId, {
         displayName,
-        profilePictureChanged: profilePicture !== currentProfile.profilePicture
+        profilePictureChanged: profilePicture !== currentProfile.profilePicture,
+        badgeChanged: badge !== currentProfile.badge
       });
       sendJson(response, 200, { ok: true, account: await adminAccountDetail(peerId) }, corsHeaders);
       return;
@@ -446,6 +449,7 @@ function adminPageHtml() {
     .account-open strong,.account-open small { display:block; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
     .account-open small { color:var(--muted); margin-top:3px; }
     .badge { display:inline-flex; align-items:center; min-height:25px; border-radius:999px; padding:3px 9px; font-size:12px; font-weight:900; color:var(--text); border:1px solid var(--line); background:rgb(255 255 255 / .07); }
+    .profile-badge { display:inline-flex; align-items:center; width:max-content; max-width:100%; min-height:22px; margin-top:5px; padding:3px 9px; border:1px solid rgb(147 197 253 / .52); border-radius:999px; color:#dbeafe; background:linear-gradient(180deg,rgb(96 165 250 / .28),rgb(14 165 233 / .14)); box-shadow:inset 0 1px 0 rgb(255 255 255 / .22),0 10px 26px rgb(96 165 250 / .18); font-size:11px; font-weight:1000; letter-spacing:.01em; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
     .badge.bad { color:white; background:var(--danger); border-color:transparent; }
     .badge.ok { color:#042016; background:var(--ok); border-color:transparent; }
     .detail-head { display:flex; align-items:center; gap:14px; }
@@ -565,8 +569,9 @@ function adminPageHtml() {
     }
     function accountRow(account) {
       const avatar = account.profilePicture ? '<img src="' + escapeAttr(account.profilePicture) + '" alt="">' : escapeHtml((account.displayName || "B").slice(0,1).toUpperCase());
+      const profileBadge = account.badge ? '<span class="profile-badge">' + escapeHtml(account.badge) + '</span>' : '';
       const flags = account.banned ? '<span class="badge bad">Banned</span>' : account.passwordResetRequired ? '<span class="badge">Reset required</span>' : '<span class="badge ok">Active</span>';
-      return '<div class="row" data-row-peer="' + escapeAttr(account.peerId) + '"><label class="row-check" title="Select account"><input type="checkbox" data-select-peer="' + escapeAttr(account.peerId) + '"></label><button class="account-open" data-open-peer="' + escapeAttr(account.peerId) + '"><span class="avatar">' + avatar + '</span><span><strong>' + escapeHtml(account.displayName || "Bypassium User") + '</strong><small>' + escapeHtml(account.peerId + " - " + account.status) + '</small></span></button>' + flags + '</div>';
+      return '<div class="row" data-row-peer="' + escapeAttr(account.peerId) + '"><label class="row-check" title="Select account"><input type="checkbox" data-select-peer="' + escapeAttr(account.peerId) + '"></label><button class="account-open" data-open-peer="' + escapeAttr(account.peerId) + '"><span class="avatar">' + avatar + '</span><span><strong>' + escapeHtml(account.displayName || "Bypassium User") + '</strong>' + profileBadge + '<small>' + escapeHtml(account.peerId + " - " + account.status) + '</small></span></button>' + flags + '</div>';
     }
     function wireAccountRows() {
       document.querySelectorAll("[data-open-peer]").forEach((button) => button.onclick = () => loadAccount(button.dataset.openPeer));
@@ -635,13 +640,14 @@ function adminPageHtml() {
     }
     function renderDetail(account) {
       const avatar = account.profilePicture ? '<img src="' + escapeAttr(account.profilePicture) + '" alt="">' : escapeHtml((account.displayName || "B").slice(0,1).toUpperCase());
+      const profileBadge = account.badge ? '<span class="profile-badge">' + escapeHtml(account.badge) + '</span>' : '';
       state.profilePictureDraft = account.profilePicture || "";
-      $("detail").innerHTML = '<div class="detail-head"><span class="avatar">' + avatar + '</span><div><p class="muted">' + escapeHtml(account.peerId) + '</p><h1>' + escapeHtml(account.displayName || "Bypassium User") + '</h1><p class="muted">' + escapeHtml(account.status) + '</p></div></div>'
+      $("detail").innerHTML = '<div class="detail-head"><span class="avatar">' + avatar + '</span><div><p class="muted">' + escapeHtml(account.peerId) + '</p><h1>' + escapeHtml(account.displayName || "Bypassium User") + '</h1>' + profileBadge + '<p class="muted">' + escapeHtml(account.status) + '</p></div></div>'
         + '<div class="info-grid">'
         + info("Password", account.hasPassword ? "set" : "not set") + info("Recovery", account.hasRecoveryPhrase ? "exists" : "missing") + info("Queued", String(account.queuedMessages))
         + info("Sessions", String(account.sessionCount)) + info("Groups", String(account.groupCount)) + info("Created", account.createdAt || "unknown")
         + '</div>'
-        + '<div class="card stack"><h2>Profile moderation</h2><div class="profile-edit"><span id="profilePreview" class="avatar profile-preview">' + profilePreviewHtml(account.profilePicture, account.displayName) + '</span><div class="stack"><label>Username<input id="profileDisplayName" value="' + escapeAttr(account.displayName || "Bypassium User") + '" maxlength="80"></label><label>Profile picture<input id="profilePictureFile" type="file" accept="image/*"></label><div class="actions"><button id="saveProfile">Save profile</button><button id="removeProfilePicture" class="secondary">Remove picture</button></div><p class="muted">Use this for inappropriate names or images. Uploaded pictures are compressed before saving.</p></div></div></div>'
+        + '<div class="card stack"><h2>Profile moderation</h2><div class="profile-edit"><span id="profilePreview" class="avatar profile-preview">' + profilePreviewHtml(account.profilePicture, account.displayName) + '</span><div class="stack"><label>Username<input id="profileDisplayName" value="' + escapeAttr(account.displayName || "Bypassium User") + '" maxlength="80"></label><label>Public badge<input id="profileBadge" value="' + escapeAttr(account.badge || "") + '" maxlength="32" placeholder="Updates Director"></label><label>Profile picture<input id="profilePictureFile" type="file" accept="image/*"></label><div class="actions"><button id="saveProfile">Save profile</button><button id="removeProfilePicture" class="secondary">Remove picture</button></div><p class="muted">Badges appear as separate premium labels next to the username. Leave blank for no badge.</p></div></div></div>'
         + '<div class="card stack danger-zone"><h2>Ban</h2><label>Reason<textarea id="banReason" placeholder="Reason shown internally"></textarea></label><label>Ban until optional<input id="banUntil" type="datetime-local"></label><div class="actions"><button class="danger" id="banBtn">Ban account</button><button class="secondary" id="unbanBtn">Unban</button></div><p class="muted">' + escapeHtml(account.banned ? "Currently banned: " + (account.banReason || "no reason") : "Not banned.") + '</p></div>'
         + '<div class="card stack"><h2>Restrictions</h2><label><input id="sendDisabled" type="checkbox" ' + checked(account.sendDisabled) + '> Stop sending messages</label><label><input id="groupsDisabled" type="checkbox" ' + checked(account.groupsDisabled) + '> Stop creating/joining groups</label><label><input id="quickAddHidden" type="checkbox" ' + checked(account.quickAddHidden) + '> Hide from Quick Add/search</label><button id="saveRestrictions">Save restrictions</button></div>'
         + '<div class="card stack"><h2>Recovery</h2><p class="muted">Force reset creates a one-time owner reset code. It does not reveal the old password.</p><button class="warn" id="forceReset">Force password reset</button><p id="resetOutput" class="muted"></p></div>'
@@ -661,7 +667,7 @@ function adminPageHtml() {
         $("profilePreview").innerHTML = profilePreviewHtml("", $("profileDisplayName").value);
         toast("Picture removed. Click Save profile.");
       };
-      $("saveProfile").onclick = () => postAction("/profile", { peerId: account.peerId, displayName: $("profileDisplayName").value, profilePicture: state.profilePictureDraft, removeProfilePicture: !state.profilePictureDraft });
+      $("saveProfile").onclick = () => postAction("/profile", { peerId: account.peerId, displayName: $("profileDisplayName").value, badge: $("profileBadge").value, profilePicture: state.profilePictureDraft, removeProfilePicture: !state.profilePictureDraft });
       $("banBtn").onclick = () => postAction("/ban", { peerId: account.peerId, reason: $("banReason").value, bannedUntil: $("banUntil").value });
       $("unbanBtn").onclick = () => postAction("/unban", { peerId: account.peerId });
       $("saveRestrictions").onclick = () => postAction("/restrictions", { peerId: account.peerId, sendDisabled: $("sendDisabled").checked, groupsDisabled: $("groupsDisabled").checked, quickAddHidden: $("quickAddHidden").checked });
@@ -896,6 +902,7 @@ async function createAccount(socket, message = {}) {
     sendAccountResponse(socket, message, false, "That Bypassium code already has a password. Sign in instead.");
     return;
   }
+  const existingProfile = await getProfile(peerId);
   const storedPublicKey = await getPublicKey(peerId);
   if (storedPublicKey && !samePublicKey(storedPublicKey, publicKeyJwk)) {
     sendAccountResponse(socket, message, false, "That code already belongs to another local identity.");
@@ -909,7 +916,7 @@ async function createAccount(socket, message = {}) {
     encryptedIdentityBackup,
     encryptedRecoveryBackup,
     ...hashRecoveryPhrase(recoveryPhrase),
-    profile: sanitizeProfile(message.profile || await getProfile(peerId) || {}),
+    profile: sanitizeProfile({ ...(existingProfile || {}), ...(message.profile || {}), badge: existingProfile?.badge || "" }),
     createdAt: existing?.createdAt || now,
     updatedAt: now
   };
@@ -1455,7 +1462,8 @@ async function publishProfile(socket, profile = {}) {
   const existing = await getProfile(peerId);
   const cleanProfile = sanitizeProfile({
     ...profile,
-    joinedAt: existing?.joinedAt || new Date().toISOString()
+    joinedAt: existing?.joinedAt || new Date().toISOString(),
+    badge: existing?.badge || ""
   }, true);
   await setProfile(peerId, cleanProfile);
   const account = await getAccount(peerId);
@@ -1493,6 +1501,7 @@ async function sendQuickAddResults(socket, message = {}) {
       id,
       displayName: profile.displayName || "Bypassium User",
       profilePicture: profile.profilePicture,
+      badge: profile.badge || "",
       joinedAt: profile.joinedAt || profile.updatedAt || "",
       status: clients.has(id) ? "online" : "offline"
     });
@@ -1535,6 +1544,7 @@ async function searchAccounts(socket, message = {}) {
       id,
       displayName: profile.displayName || "Bypassium User",
       profilePicture: profile.profilePicture,
+      badge: profile.badge || "",
       joinedAt: profile.joinedAt || profile.updatedAt || "",
       status: clients.has(id) ? "online" : "offline",
       score
@@ -2410,6 +2420,7 @@ async function updateAccountIndex(peerId, profile = null, account = null) {
     peerId: clean,
     displayName: indexedProfile.displayName || "Bypassium User",
     profilePicture: indexedProfile.profilePicture || "",
+    badge: indexedProfile.badge || "",
     joinedAt: indexedProfile.joinedAt || indexedAccount?.createdAt || "",
     updatedAt: indexedProfile.updatedAt || indexedAccount?.updatedAt || "",
     quickAddVisible: indexedProfile.quickAddVisible !== false
@@ -2591,6 +2602,7 @@ function adminAccountSummaryFromValues(peerId, account = null, profileValue = nu
     peerId,
     displayName: profile.displayName || "Bypassium User",
     profilePicture: profile.profilePicture || "",
+    badge: profile.badge || "",
     status: clients.has(peerId) ? "online" : "offline",
     hasPassword: Boolean(account?.passwordHash),
     hasRecoveryPhrase: Boolean(account?.recoveryHash),
@@ -2610,7 +2622,7 @@ function adminAccountSummaryFromValues(peerId, account = null, profileValue = nu
 function profileHasAccountFootprint(profile = null) {
   if (!profile || typeof profile !== "object") return false;
   const clean = sanitizeProfile(profile);
-  return Boolean(clean.displayName || clean.profilePicture || clean.joinedAt || clean.updatedAt);
+  return Boolean(clean.displayName || clean.profilePicture || clean.badge || clean.joinedAt || clean.updatedAt);
 }
 
 function parseStoredAccount(value) {
@@ -3209,12 +3221,20 @@ function sanitizeProfile(profile = {}, stampUpdate = false) {
   const cleanProfile = {
     displayName: String(profile?.displayName || "").slice(0, 80),
     profilePicture: sanitizeProfilePicture(profile?.profilePicture),
+    badge: sanitizeProfileBadge(profile?.badge),
     joinedAt: String(profile?.joinedAt || "").slice(0, 40),
     quickAddVisible: profile?.quickAddVisible !== false
   };
   if (stampUpdate) cleanProfile.updatedAt = new Date().toISOString();
   else if (profile?.updatedAt) cleanProfile.updatedAt = String(profile.updatedAt).slice(0, 40);
   return cleanProfile;
+}
+
+function sanitizeProfileBadge(value = "") {
+  return String(value || "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 32);
 }
 
 function sanitizeProfilePicture(value = "") {
