@@ -55,9 +55,7 @@ const server = http.createServer(async (request, response) => {
       ok: true,
       storage: storageMode(),
       onlineClients: clients.size,
-      knownPublicKeys: await countKnownPublicKeys(),
-      groups: await countGroups(),
-      queuedUsers: await countQueuedUsers()
+      uptimeSeconds: Math.round(process.uptime())
     }));
     return;
   }
