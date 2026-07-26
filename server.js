@@ -371,6 +371,7 @@ function adminPageHtml() {
     .status { padding:11px; border:1px solid var(--line); border-radius:16px; background:rgb(255 255 255 / .06); }
     .status strong { display:block; font-size:20px; }
     .list { display:grid; gap:8px; max-height:55vh; overflow:auto; padding-right:3px; }
+    .list-state { padding:11px; border:1px solid var(--line); border-radius:15px; background:rgb(255 255 255 / .045); }
     .row { display:grid; grid-template-columns:46px minmax(0,1fr) auto; align-items:center; gap:10px; padding:10px; border:1px solid var(--line); border-radius:17px; background:rgb(255 255 255 / .055); cursor:pointer; text-align:left; }
     .row:hover { border-color:color-mix(in srgb,var(--accent),white 18%); }
     .avatar { width:46px; height:46px; border-radius:15px; overflow:hidden; display:grid; place-items:center; color:white; font-weight:1000; background:linear-gradient(145deg,var(--accent),var(--accent2)); }
@@ -432,11 +433,12 @@ function adminPageHtml() {
   </main>
   <div id="toast" class="toast hidden"></div>
   <script>
-    const state = { token: localStorage.getItem("bypassiumAdminToken") || "", selected: "" };
+    const state = { token: localStorage.getItem("bypassiumAdminToken") || "", selected: "", searchTimer: 0, searchSeq: 0 };
     const $ = (id) => document.getElementById(id);
     $("token").value = state.token;
     $("saveToken").onclick = () => { state.token = $("token").value.trim(); localStorage.setItem("bypassiumAdminToken", state.token); refreshAll(); };
     $("searchBtn").onclick = () => searchAccounts();
+    $("search").addEventListener("input", () => scheduleAccountSearch());
     $("search").addEventListener("keydown", (event) => { if (event.key === "Enter") searchAccounts(); });
     $("refreshAudit").onclick = () => loadAudit();
 
@@ -462,14 +464,22 @@ function adminPageHtml() {
       }
     }
     async function searchAccounts() {
+      const seq = ++state.searchSeq;
+      $("accountList").innerHTML = '<p class="muted list-state">Searching...</p>';
       try {
         const q = encodeURIComponent($("search").value.trim());
         const payload = await api("/accounts?q=" + q);
-        $("accountList").innerHTML = payload.accounts.length ? payload.accounts.map(accountRow).join("") : '<p class="muted">No accounts found.</p>';
+        if (seq !== state.searchSeq) return;
+        const accounts = Array.isArray(payload.accounts) ? payload.accounts : [];
+        $("accountList").innerHTML = accounts.length ? accounts.map(accountRow).join("") : '<p class="muted list-state">No accounts found. Try their 6-digit code or a shorter name.</p>';
         document.querySelectorAll("[data-peer]").forEach((button) => button.onclick = () => loadAccount(button.dataset.peer));
       } catch (error) {
-        $("accountList").innerHTML = '<p class="muted">' + escapeHtml(error.message) + '</p>';
+        if (seq === state.searchSeq) $("accountList").innerHTML = '<p class="muted list-state">' + escapeHtml(error.message) + '</p>';
       }
+    }
+    function scheduleAccountSearch() {
+      clearTimeout(state.searchTimer);
+      state.searchTimer = setTimeout(() => searchAccounts(), 220);
     }
     function accountRow(account) {
       const avatar = account.profilePicture ? '<img src="' + escapeAttr(account.profilePicture) + '" alt="">' : escapeHtml((account.displayName || "B").slice(0,1).toUpperCase());
@@ -1846,25 +1856,26 @@ function isDiscoverableProfile(profile = {}) {
 
 async function searchAdminAccounts(query = "", limit = 80) {
   const cleanQuery = String(query || "").trim().toLowerCase();
-  const ids = await getKnownPeerIds();
+  const directoryProfiles = new Map((await getQuickAddDirectoryEntries()).map(({ id, profile }) => [id, profile]));
+  const ids = new Set([...(await getKnownPeerIds()), ...directoryProfiles.keys()]);
   const accounts = [];
   for (const id of ids) {
-    const account = await adminAccountSummary(id);
-    const haystack = `${account.peerId} ${account.displayName}`.toLowerCase();
-    if (cleanQuery && !haystack.includes(cleanQuery)) continue;
-    accounts.push(account);
-    if (accounts.length >= limit) break;
+    const account = await adminAccountSummary(id, directoryProfiles.get(id));
+    const score = cleanQuery ? accountSearchScore(cleanQuery, account.peerId, account.displayName) : 0;
+    if (score === null) continue;
+    accounts.push({ ...account, score });
   }
   return accounts.sort((first, second) => {
+    if (first.score !== second.score) return first.score - second.score;
     if (first.banned !== second.banned) return first.banned ? -1 : 1;
     if (first.status !== second.status) return first.status === "online" ? -1 : 1;
     return first.displayName.localeCompare(second.displayName);
-  });
+  }).slice(0, limit).map(({ score, ...account }) => account);
 }
 
-async function adminAccountSummary(peerId) {
+async function adminAccountSummary(peerId, fallbackProfile = null) {
   const account = await getAccount(peerId);
-  const profile = sanitizeProfile(account?.profile || await getProfile(peerId) || {});
+  const profile = sanitizeProfile(account?.profile || await getProfile(peerId) || fallbackProfile || {});
   const restriction = await getAccountRestriction(peerId);
   const banned = restrictionBanned(restriction);
   return {
