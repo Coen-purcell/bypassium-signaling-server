@@ -1481,7 +1481,19 @@ async function relayCallSignal(socket, message) {
   const targetId = String(message.to || "").trim();
   const callId = String(message.callId || "").trim().slice(0, 80);
   const action = String(message.action || "").trim();
-  const allowedActions = new Set(["invite", "answer", "candidate", "end", "decline", "cancel", "busy", "unavailable"]);
+  const allowedActions = new Set([
+    "invite",
+    "answer",
+    "candidate",
+    "renegotiate-offer",
+    "renegotiate-answer",
+    "media-state",
+    "end",
+    "decline",
+    "cancel",
+    "busy",
+    "unavailable"
+  ]);
   if (!/^\d{6}$/.test(targetId) || !callId || !allowedActions.has(action)) {
     send(socket, { type: "error", message: "Call signal target or action is invalid." });
     return;
@@ -1502,6 +1514,7 @@ async function relayCallSignal(socket, message) {
     profile: localProfile(senderId),
     description,
     candidate,
+    media: sanitizeCallMediaState(message.media),
     reason: String(message.reason || "").slice(0, 140),
     sentAt: new Date().toISOString()
   };
@@ -3427,6 +3440,14 @@ function sanitizeCallCandidate(candidate = null) {
   };
   if (!clean.candidate || JSON.stringify(clean).length > 8192) return null;
   return clean;
+}
+
+function sanitizeCallMediaState(media = null) {
+  if (!media || typeof media !== "object") return null;
+  return {
+    cameraEnabled: Boolean(media.cameraEnabled),
+    micMuted: Boolean(media.micMuted)
+  };
 }
 
 function sanitizeAccount(account = {}) {
