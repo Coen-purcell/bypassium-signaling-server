@@ -38,6 +38,7 @@ const memoryAdminAudit = [];
 const memorySafetyLog = [];
 const memoryDirectory = new Map();
 const memoryGroups = new Map();
+const memoryContactLists = new Map();
 const memoryOfflineMessages = new Map();
 const memoryHistoryMessages = new Map();
 const pendingQueuedEnvelopes = new Map();
@@ -123,6 +124,9 @@ wss.on("connection", (socket, request) => {
       if (message.type === "sign-out") await signOutAccount(socket, message);
       if (message.type === "delete-account") await deleteAccount(socket, message);
       if (message.type === "watch-contacts") await sendContactStatuses(socket, message.contacts);
+      if (message.type === "contacts-sync") await syncContacts(socket, message);
+      if (message.type === "contacts-sync-request") await sendSyncedContacts(socket);
+      if (message.type === "contacts-delete") await deleteSyncedContact(socket, message);
       if (message.type === "publish-profile") await publishProfile(socket, message.profile);
       if (message.type === "quick-add-request") await sendQuickAddResults(socket, message);
       if (message.type === "create-group") await createGroup(socket, message);
@@ -792,9 +796,11 @@ async function registerClient(socket, message) {
       historyBackfill: true,
       quickAddDirectory: true,
       audioCalls: true,
-      accounts: true
+      accounts: true,
+      contactSync: true
     },
-    account: publicAccountStatus(account, Boolean(account?.passwordHash))
+    account: publicAccountStatus(account, Boolean(account?.passwordHash)),
+    contacts: await getSyncedContacts(byPassiumId)
   });
   await deliverOfflineMessages(socket);
 }
@@ -805,6 +811,7 @@ async function syncClient(socket) {
   send(socket, {
     type: "sync-complete",
     groups: await getGroupsForMember(peerId),
+    contacts: await getSyncedContacts(peerId),
     syncedAt: new Date().toISOString()
   });
   await sendContactStatuses(socket, [...(socket.watchedContacts || [])]);
@@ -924,6 +931,48 @@ async function sendContactStatuses(socket, contacts = []) {
     if (profile) profiles[contactId] = profile;
   }
   send(socket, { type: "contact-statuses", statuses, publicKeys: knownKeys, profiles });
+}
+
+// Stores the caller's contact list so the same account can restore contacts on another device.
+async function syncContacts(socket, message = {}) {
+  const peerId = getRegisteredSender(socket);
+  if (!peerId) return;
+  const incoming = sanitizeSyncedContacts(message.contacts, peerId);
+  const existing = await getSyncedContacts(peerId);
+  const contacts = mergeSyncedContacts(existing, incoming);
+  await setSyncedContacts(peerId, contacts);
+  send(socket, {
+    type: "contact-sync",
+    contacts,
+    syncedAt: new Date().toISOString()
+  });
+}
+
+async function sendSyncedContacts(socket, providedContacts = null) {
+  const peerId = getRegisteredSender(socket);
+  if (!peerId) return;
+  const contacts = Array.isArray(providedContacts) ? providedContacts : await getSyncedContacts(peerId);
+  send(socket, {
+    type: "contact-sync",
+    contacts,
+    syncedAt: new Date().toISOString()
+  });
+}
+
+// Removes a contact from the server-side contact list when a user deletes it locally.
+async function deleteSyncedContact(socket, message = {}) {
+  const peerId = getRegisteredSender(socket);
+  if (!peerId) return;
+  const contactId = String(message.contactId || "").trim();
+  if (!/^\d{6}$/.test(contactId) || contactId === peerId) return;
+  const contacts = (await getSyncedContacts(peerId)).filter((contact) => contact.id !== contactId);
+  await setSyncedContacts(peerId, contacts);
+  send(socket, {
+    type: "contact-sync",
+    contacts,
+    deletedContactId: contactId,
+    syncedAt: new Date().toISOString()
+  });
 }
 
 function getRegisteredSender(socket) {
@@ -2268,7 +2317,8 @@ async function getHistoryMessages(peerId, limit = 500) {
   const requestedLimit = Math.max(0, Number(limit) || 0);
   if (!redis && !upstashRestEnabled) {
     const history = memoryHistoryMessages.get(peerId) || [];
-    return requestedLimit ? history.slice(-requestedLimit) : history;
+    const limitedHistory = requestedLimit ? history.slice(-requestedLimit) : history;
+    return newestHistoryFirst(limitedHistory);
   }
   const ids = await getHistoryIds(peerId);
   const uniqueIds = requestedLimit ? [...new Set(ids)].slice(-requestedLimit) : [...new Set(ids)];
@@ -2285,7 +2335,16 @@ async function getHistoryMessages(peerId, limit = 500) {
     }
   }
   if (keptIds.length !== ids.length) await replaceHistoryIds(peerId, keptIds);
-  return messages;
+  return newestHistoryFirst(messages);
+}
+
+function newestHistoryFirst(messages = []) {
+  return [...messages].sort((first, second) => historyMessageTime(second) - historyMessageTime(first));
+}
+
+function historyMessageTime(message = {}) {
+  const parsed = Date.parse(message.sentAt || "");
+  return Number.isFinite(parsed) ? parsed : 0;
 }
 
 async function getHistoryIds(peerId) {
@@ -2401,12 +2460,37 @@ async function removeAccount(peerId) {
   await removeAccountIndex(peerId);
 }
 
+async function setSyncedContacts(peerId, contacts = []) {
+  const clean = sanitizeSyncedContacts(contacts, peerId);
+  memoryContactLists.set(peerId, clean);
+  if (redis) await redis.set(contactListKey(peerId), JSON.stringify(clean));
+  if (upstashRestEnabled) await upstashCommand(["SET", contactListKey(peerId), JSON.stringify(clean)]);
+}
+
+async function getSyncedContacts(peerId) {
+  if (memoryContactLists.has(peerId)) return memoryContactLists.get(peerId);
+  let stored = null;
+  if (redis) stored = await redis.get(contactListKey(peerId));
+  if (upstashRestEnabled) stored = await upstashCommand(["GET", contactListKey(peerId)]);
+  if (!stored) return [];
+  const contacts = sanitizeSyncedContacts(JSON.parse(stored), peerId);
+  memoryContactLists.set(peerId, contacts);
+  return contacts;
+}
+
+async function removeSyncedContacts(peerId) {
+  memoryContactLists.delete(peerId);
+  if (redis) await redis.del(contactListKey(peerId));
+  if (upstashRestEnabled) await upstashCommand(["DEL", contactListKey(peerId)]);
+}
+
 async function deleteAccountData(peerId) {
   await Promise.all([
     removeAccount(peerId),
     removePublicKey(peerId),
     removeProfile(peerId),
     removeQuickAddProfile(peerId),
+    removeSyncedContacts(peerId),
     deleteAllQueuedMessages(peerId),
     deleteAllHistoryMessages(peerId),
     removeAccountIndex(peerId)
@@ -3196,6 +3280,56 @@ function cleanPeerId(value) {
   return /^\d{6}$/.test(peerId) ? peerId : "";
 }
 
+function sanitizeSyncedContacts(contacts = [], ownerId = "") {
+  if (!Array.isArray(contacts)) return [];
+  const cleanOwnerId = cleanPeerId(ownerId);
+  const seen = new Set();
+  const clean = [];
+  for (const contact of contacts.slice(0, 1000)) {
+    const normalized = sanitizeSyncedContact(contact);
+    if (!normalized || normalized.id === cleanOwnerId || seen.has(normalized.id)) continue;
+    seen.add(normalized.id);
+    clean.push(normalized);
+  }
+  return clean;
+}
+
+function sanitizeSyncedContact(contact = {}) {
+  const id = cleanPeerId(contact.id);
+  if (!id) return null;
+  return {
+    id,
+    name: String(contact.name || id).trim().slice(0, 80) || id,
+    remoteDisplayName: String(contact.remoteDisplayName || "").trim().slice(0, 80),
+    remoteBadge: sanitizeProfileBadge(contact.remoteBadge),
+    nameEdited: Boolean(contact.nameEdited),
+    accepted: contact.accepted !== false,
+    blocked: Boolean(contact.blocked),
+    notifications: contact.notifications !== false,
+    pinned: Boolean(contact.pinned),
+    chatBackground: sanitizeHexColor(contact.chatBackground),
+    updatedAt: String(contact.updatedAt || contact.createdAt || new Date().toISOString()).slice(0, 40)
+  };
+}
+
+function sanitizeHexColor(value = "") {
+  const color = String(value || "").trim();
+  return /^#[0-9a-f]{6}$/i.test(color) ? color : "";
+}
+
+function mergeSyncedContacts(existing = [], incoming = []) {
+  const contacts = new Map();
+  for (const contact of sanitizeSyncedContacts(existing)) contacts.set(contact.id, contact);
+  for (const contact of sanitizeSyncedContacts(incoming)) {
+    contacts.set(contact.id, {
+      ...(contacts.get(contact.id) || {}),
+      ...contact,
+      updatedAt: new Date().toISOString()
+    });
+  }
+  return [...contacts.values()].slice(0, 1000);
+}
+
 function normalizeAdminDate(value) {
   if (!value) return "";
   const timestamp = Date.parse(value);
@@ -3721,6 +3855,10 @@ function publicKeyKey(peerId) {
 
 function accountKey(peerId) {
   return `bypassium:account:${peerId}`;
+}
+
+function contactListKey(peerId) {
+  return `bypassium:contacts:${peerId}`;
 }
 
 function sessionKey(token) {
