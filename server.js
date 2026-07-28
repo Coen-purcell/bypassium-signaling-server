@@ -541,14 +541,33 @@ function adminPageHtml() {
         signal: controller.signal,
         headers: { "content-type": "application/json", authorization: "Bearer " + state.token, ...(options.headers || {}) }
       }).finally(() => clearTimeout(timeout));
-      const payload = await response.json().catch(() => ({ ok:false, message:"Bad server response." }));
+      const payload = await parseJsonResponse(response);
       if (!response.ok || payload.ok === false) throw new Error(payload.message || "Request failed.");
       return payload;
+    }
+    async function parseJsonResponse(response) {
+      const text = await response.text();
+      if (!text.trim()) {
+        return {
+          ok: false,
+          message: "Empty server response (" + response.status + "). Refresh the admin page; Render may have restarted or timed out."
+        };
+      }
+      try {
+        return JSON.parse(text);
+      } catch {
+        return {
+          ok: false,
+          message: "Bad server response (" + response.status + "): " + text.slice(0, 160)
+        };
+      }
     }
     async function refreshAll() { await Promise.allSettled([loadStatus(), searchAccounts(), loadAudit()]); }
     async function loadStatus() {
       try {
-        const config = await fetch("/admin/api/config").then((r) => r.json());
+        const configResponse = await fetch("/admin/api/config");
+        const config = await parseJsonResponse(configResponse);
+        if (config.ok === false) throw new Error(config.message || "Could not load admin config.");
         if (!config.adminEnabled) $("authStatus").textContent = "ADMIN_TOKEN is not configured on the server.";
         else $("authStatus").textContent = state.token ? "Token saved locally in this browser." : "Enter ADMIN_TOKEN to unlock actions.";
         const status = await api("/status");
