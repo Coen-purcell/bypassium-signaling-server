@@ -212,6 +212,20 @@ async function handleAdminApi(request, response, url, corsHeaders) {
       return;
     }
 
+    if (request.method === "GET" && url.pathname === "/admin/api/groups") {
+      const query = String(url.searchParams.get("q") || "");
+      const groups = await searchAdminGroups(query, 80);
+      sendJson(response, 200, { ok: true, groups }, corsHeaders);
+      return;
+    }
+
+    if (request.method === "GET" && url.pathname === "/admin/api/group") {
+      const groupId = cleanAdminGroupId(url.searchParams.get("groupId"));
+      const group = groupId ? await adminGroupDetail(groupId) : null;
+      sendJson(response, group ? 200 : 404, group ? { ok: true, group } : { ok: false, message: "Group not found." }, corsHeaders);
+      return;
+    }
+
     if (request.method === "GET" && url.pathname === "/admin/api/audit") {
       sendJson(response, 200, { ok: true, audit: await getAdminAudit() }, corsHeaders);
       return;
@@ -223,6 +237,137 @@ async function handleAdminApi(request, response, url, corsHeaders) {
     }
 
     const body = await readRequestJson(request);
+
+    if (url.pathname === "/admin/api/group-update") {
+      const group = await adminGroupOrError(response, corsHeaders, body.groupId);
+      if (!group) return;
+      const previous = { name: group.name, avatar: group.avatar, memberAddLocked: Boolean(group.memberAddLocked) };
+      if (typeof body.name === "string") group.name = sanitizeGroupName(body.name, group.name || "Group chat");
+      if (body.removeAvatar) group.avatar = "";
+      else if (typeof body.avatar === "string" && body.avatar) group.avatar = sanitizeProfilePicture(body.avatar);
+      if (typeof body.memberAddLocked === "boolean") group.memberAddLocked = body.memberAddLocked;
+      group.updatedAt = new Date().toISOString();
+      await setGroup(group);
+      broadcastGroupUpdate(group);
+      await recordAdminAudit("group-update", "", {
+        groupId: group.id,
+        nameChanged: previous.name !== group.name,
+        avatarChanged: previous.avatar !== group.avatar,
+        memberAddLockedChanged: previous.memberAddLocked !== Boolean(group.memberAddLocked)
+      });
+      sendJson(response, 200, { ok: true, group: await adminGroupDetail(group.id) }, corsHeaders);
+      return;
+    }
+
+    if (url.pathname === "/admin/api/group-add-members") {
+      const group = await adminGroupOrError(response, corsHeaders, body.groupId);
+      if (!group) return;
+      const requested = Array.isArray(body.members) ? body.members : String(body.members || "").split(/[^0-9]+/);
+      const additions = normalizeMembers(requested).filter((memberId) => !group.members.includes(memberId));
+      if (!additions.length) {
+        sendJson(response, 400, { ok: false, message: "Enter at least one new 6-digit member code." }, corsHeaders);
+        return;
+      }
+      group.members = normalizeMembers([...group.members, ...additions]);
+      group.admins = normalizeMembers([group.ownerId, ...(group.admins || [])]).filter((memberId) => group.members.includes(memberId));
+      group.updatedAt = new Date().toISOString();
+      await setGroup(group);
+      broadcastGroupUpdate(group, additions);
+      await recordAdminAudit("group-add-members", "", { groupId: group.id, additions });
+      sendJson(response, 200, { ok: true, group: await adminGroupDetail(group.id) }, corsHeaders);
+      return;
+    }
+
+    if (url.pathname === "/admin/api/group-set-admin") {
+      const group = await adminGroupOrError(response, corsHeaders, body.groupId);
+      if (!group) return;
+      const memberId = cleanPeerId(body.memberId);
+      if (!memberId || !group.members.includes(memberId)) {
+        sendJson(response, 400, { ok: false, message: "Choose a current group member." }, corsHeaders);
+        return;
+      }
+      if (memberId === group.ownerId && body.isAdmin === false) {
+        sendJson(response, 400, { ok: false, message: "The owner must stay an admin." }, corsHeaders);
+        return;
+      }
+      const admins = new Set(group.admins || []);
+      if (body.isAdmin === false) admins.delete(memberId);
+      else admins.add(memberId);
+      admins.add(group.ownerId);
+      group.admins = [...admins].filter((adminId) => group.members.includes(adminId));
+      group.updatedAt = new Date().toISOString();
+      await setGroup(group);
+      broadcastGroupUpdate(group);
+      await recordAdminAudit("group-set-admin", "", { groupId: group.id, memberId, isAdmin: body.isAdmin !== false });
+      sendJson(response, 200, { ok: true, group: await adminGroupDetail(group.id) }, corsHeaders);
+      return;
+    }
+
+    if (url.pathname === "/admin/api/group-transfer-owner") {
+      const group = await adminGroupOrError(response, corsHeaders, body.groupId);
+      if (!group) return;
+      const memberId = cleanPeerId(body.memberId);
+      if (!memberId || !group.members.includes(memberId)) {
+        sendJson(response, 400, { ok: false, message: "Choose a current group member." }, corsHeaders);
+        return;
+      }
+      const previousOwner = group.ownerId;
+      group.ownerId = memberId;
+      group.admins = normalizeMembers([memberId, previousOwner, ...(group.admins || [])]).filter((adminId) => group.members.includes(adminId));
+      group.updatedAt = new Date().toISOString();
+      await setGroup(group);
+      broadcastGroupUpdate(group);
+      await recordAdminAudit("group-transfer-owner", "", { groupId: group.id, previousOwner, newOwner: memberId });
+      sendJson(response, 200, { ok: true, group: await adminGroupDetail(group.id) }, corsHeaders);
+      return;
+    }
+
+    if (url.pathname === "/admin/api/group-remove-member") {
+      const group = await adminGroupOrError(response, corsHeaders, body.groupId);
+      if (!group) return;
+      const memberId = cleanPeerId(body.memberId);
+      if (!memberId || !group.members.includes(memberId)) {
+        sendJson(response, 400, { ok: false, message: "Choose a current group member." }, corsHeaders);
+        return;
+      }
+      const previousOwner = group.ownerId;
+      const previousMembers = [...group.members];
+      group.members = group.members.filter((id) => id !== memberId);
+      group.admins = (group.admins || []).filter((id) => id !== memberId && group.members.includes(id));
+      if (!group.members.length) {
+        await deleteGroup(group.id);
+        broadcastGroupUpdate({ ...group, members: [], admins: [], deleted: true, updatedAt: new Date().toISOString() }, previousMembers);
+        await recordAdminAudit("group-delete-empty", "", { groupId: group.id, removedMember: memberId, previousOwner });
+        sendJson(response, 200, { ok: true, deleted: true, message: "Group deleted because no members remain." }, corsHeaders);
+        return;
+      }
+      if (!group.members.includes(group.ownerId)) {
+        group.ownerId = group.admins[0] || group.members[0];
+      }
+      group.admins = normalizeMembers([group.ownerId, ...group.admins]).filter((adminId) => group.members.includes(adminId));
+      group.updatedAt = new Date().toISOString();
+      await setGroup(group);
+      broadcastGroupUpdate(group, [memberId]);
+      await recordAdminAudit("group-remove-member", "", { groupId: group.id, memberId, previousOwner, newOwner: group.ownerId });
+      sendJson(response, 200, { ok: true, group: await adminGroupDetail(group.id) }, corsHeaders);
+      return;
+    }
+
+    if (url.pathname === "/admin/api/delete-group") {
+      const group = await adminGroupOrError(response, corsHeaders, body.groupId);
+      if (!group) return;
+      const confirm = String(body.confirm || "").trim();
+      if (confirm !== group.id && confirm !== group.name) {
+        sendJson(response, 400, { ok: false, message: "Type the exact group ID or group name to confirm deletion." }, corsHeaders);
+        return;
+      }
+      const previousMembers = [...group.members];
+      await deleteGroup(group.id);
+      broadcastGroupUpdate({ ...group, members: [], admins: [], deleted: true, updatedAt: new Date().toISOString() }, previousMembers);
+      await recordAdminAudit("delete-group", "", { groupId: group.id, name: group.name, memberCount: previousMembers.length });
+      sendJson(response, 200, { ok: true, deleted: true, message: "Group deleted." }, corsHeaders);
+      return;
+    }
 
     if (url.pathname === "/admin/api/bulk-delete-accounts") {
       const peerIds = normalizeMembers(Array.isArray(body.peerIds) ? body.peerIds : []).slice(0, 100);
@@ -395,6 +540,20 @@ function safeEqualString(first, second) {
   return timingSafeEqual(firstBuffer, secondBuffer);
 }
 
+async function adminGroupOrError(response, corsHeaders, groupIdValue) {
+  const groupId = cleanAdminGroupId(groupIdValue);
+  if (!groupId) {
+    sendJson(response, 400, { ok: false, message: "Choose a valid group." }, corsHeaders);
+    return null;
+  }
+  const group = await getGroup(groupId);
+  if (!group) {
+    sendJson(response, 404, { ok: false, message: "Group not found." }, corsHeaders);
+    return null;
+  }
+  return group;
+}
+
 async function readRequestJson(request) {
   const chunks = [];
   for await (const chunk of request) chunks.push(chunk);
@@ -452,6 +611,7 @@ function adminPageHtml() {
     .list-state { padding:11px; border:1px solid var(--line); border-radius:15px; background:rgb(255 255 255 / .045); }
     .row { display:grid; grid-template-columns:auto minmax(0,1fr) auto; align-items:center; gap:10px; padding:10px; border:1px solid var(--line); border-radius:17px; background:rgb(255 255 255 / .055); text-align:left; }
     .row:hover { border-color:color-mix(in srgb,var(--accent),white 18%); }
+    .group-row { grid-template-columns:minmax(0,1fr) auto; }
     .account-open { min-width:0; display:grid; grid-template-columns:46px minmax(0,1fr); align-items:center; gap:10px; padding:0; border-radius:0; color:var(--text); background:transparent; box-shadow:none; text-align:left; }
     .avatar { width:46px; height:46px; border-radius:15px; overflow:hidden; display:grid; place-items:center; color:white; font-weight:1000; background:linear-gradient(145deg,var(--accent),var(--accent2)); }
     .avatar img { width:100%; height:100%; object-fit:cover; }
@@ -470,6 +630,12 @@ function adminPageHtml() {
     .info span { display:block; color:var(--muted); font-size:11px; font-weight:900; text-transform:uppercase; }
     .info strong { display:block; margin-top:4px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
     .danger-zone { border-color:color-mix(in srgb,var(--danger),white 8%); }
+    .member-list { display:grid; gap:8px; max-height:390px; overflow:auto; padding-right:3px; }
+    .member-row { display:grid; grid-template-columns:46px minmax(0,1fr); gap:10px; align-items:start; padding:10px; border:1px solid var(--line); border-radius:17px; background:rgb(255 255 255 / .052); }
+    .member-meta strong,.member-meta small { display:block; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .member-actions { grid-column:1 / -1; display:flex; flex-wrap:wrap; gap:8px; }
+    .member-actions button { padding:8px 10px; border-radius:12px; font-size:12px; }
+    .role-chip { display:inline-flex; width:max-content; max-width:100%; margin-top:5px; padding:3px 9px; border-radius:999px; border:1px solid rgb(96 165 250 / .48); color:#dbeafe; background:rgb(96 165 250 / .16); font-size:11px; font-weight:1000; }
     .audit { max-height:240px; overflow:auto; display:grid; gap:7px; }
     .audit div { padding:9px; border:1px solid var(--line); border-radius:13px; background:rgb(255 255 255 / .045); }
     .hidden { display:none !important; }
@@ -507,6 +673,14 @@ function adminPageHtml() {
         </div>
         <div id="accountList" class="list"></div>
       </div>
+      <div class="card stack">
+        <h2>Groups</h2>
+        <div class="search-row">
+          <label>Search<input id="groupSearch" placeholder="Group, owner, or member"></label>
+          <button id="groupSearchBtn">Search</button>
+        </div>
+        <div id="groupList" class="list"></div>
+      </div>
     </section>
     <section class="stack">
       <div id="detail" class="card stack">
@@ -521,13 +695,16 @@ function adminPageHtml() {
   </main>
   <div id="toast" class="toast hidden"></div>
   <script>
-    const state = { token: localStorage.getItem("bypassiumAdminToken") || "", selected: "", selectedPeers: new Set(), searchTimer: 0, searchSeq: 0, profilePictureDraft: "" };
+    const state = { token: localStorage.getItem("bypassiumAdminToken") || "", selected: "", selectedGroup: "", selectedPeers: new Set(), searchTimer: 0, searchSeq: 0, groupSearchTimer: 0, groupSearchSeq: 0, profilePictureDraft: "", groupAvatarDraft: "", groupAvatarRemove: false };
     const $ = (id) => document.getElementById(id);
     $("token").value = state.token;
     $("saveToken").onclick = () => { state.token = $("token").value.trim(); localStorage.setItem("bypassiumAdminToken", state.token); refreshAll(); };
     $("searchBtn").onclick = () => searchAccounts();
     $("search").addEventListener("input", () => scheduleAccountSearch());
     $("search").addEventListener("keydown", (event) => { if (event.key === "Enter") searchAccounts(); });
+    $("groupSearchBtn").onclick = () => searchGroups();
+    $("groupSearch").addEventListener("input", () => scheduleGroupSearch());
+    $("groupSearch").addEventListener("keydown", (event) => { if (event.key === "Enter") searchGroups(); });
     $("refreshAudit").onclick = () => loadAudit();
     $("selectAll").onchange = () => toggleShownSelection($("selectAll").checked);
     $("clearSelected").onclick = () => { state.selectedPeers.clear(); updateSelectionUi(); };
@@ -562,7 +739,7 @@ function adminPageHtml() {
         };
       }
     }
-    async function refreshAll() { await Promise.allSettled([loadStatus(), searchAccounts(), loadAudit()]); }
+    async function refreshAll() { await Promise.allSettled([loadStatus(), searchAccounts(), searchGroups(), loadAudit()]); }
     async function loadStatus() {
       try {
         const configResponse = await fetch("/admin/api/config");
@@ -630,9 +807,10 @@ function adminPageHtml() {
       });
       updateSelectionUi();
     }
-    function clearDetail(message) {
+    function clearDetail(message, title = "Select an account") {
       state.selected = "";
-      $("detail").innerHTML = '<h2>Select an account</h2><p class="muted">' + escapeHtml(message || "Search by code or display name, then choose an account to manage.") + '</p>';
+      state.selectedGroup = "";
+      $("detail").innerHTML = '<h2>' + escapeHtml(title) + '</h2><p class="muted">' + escapeHtml(message || "Search by code or display name, then choose an account to manage.") + '</p>';
     }
     async function bulkDeleteSelected() {
       const peerIds = [...state.selectedPeers];
@@ -659,8 +837,117 @@ function adminPageHtml() {
         await refreshAll();
       } catch (error) { toast(error.message); }
     }
+    async function searchGroups() {
+      const seq = ++state.groupSearchSeq;
+      $("groupList").innerHTML = '<p class="muted list-state">Searching...</p>';
+      try {
+        const q = encodeURIComponent($("groupSearch").value.trim());
+        const payload = await api("/groups?q=" + q);
+        if (seq !== state.groupSearchSeq) return;
+        const groups = Array.isArray(payload.groups) ? payload.groups : [];
+        $("groupList").innerHTML = groups.length ? groups.map(groupRow).join("") : '<p class="muted list-state">No groups found. Try a group name, owner name, or member code.</p>';
+        wireGroupRows();
+      } catch (error) {
+        const message = error.name === "AbortError" ? "Group search timed out. Try again after the server wakes up." : error.message;
+        if (seq === state.groupSearchSeq) $("groupList").innerHTML = '<p class="muted list-state">' + escapeHtml(message) + '</p>';
+      }
+    }
+    function scheduleGroupSearch() {
+      clearTimeout(state.groupSearchTimer);
+      state.groupSearchTimer = setTimeout(() => searchGroups(), 220);
+    }
+    function groupRow(group) {
+      const avatar = group.avatar ? '<img src="' + escapeAttr(group.avatar) + '" alt="">' : escapeHtml((group.name || "G").slice(0,1).toUpperCase());
+      const lock = group.memberAddLocked ? '<span class="badge">Add locked</span>' : '<span class="badge ok">Open add</span>';
+      return '<div class="row group-row"><button class="account-open" data-open-group="' + escapeAttr(group.groupId) + '"><span class="avatar">' + avatar + '</span><span><strong>' + escapeHtml(group.name || "Group chat") + '</strong><small>' + escapeHtml(group.memberCount + " members - owner " + (group.ownerName || group.ownerId || "unknown")) + '</small></span></button>' + lock + '</div>';
+    }
+    function wireGroupRows() {
+      document.querySelectorAll("[data-open-group]").forEach((button) => button.onclick = () => loadGroup(button.dataset.openGroup));
+    }
+    async function loadGroup(groupId) {
+      try {
+        state.selected = "";
+        state.selectedGroup = groupId;
+        const payload = await api("/group?groupId=" + encodeURIComponent(groupId));
+        renderGroupDetail(payload.group);
+      } catch (error) { toast(error.message); }
+    }
+    function renderGroupDetail(group) {
+      state.selected = "";
+      state.selectedGroup = group.groupId;
+      state.groupAvatarDraft = group.avatar || "";
+      state.groupAvatarRemove = false;
+      const avatar = group.avatar ? '<img src="' + escapeAttr(group.avatar) + '" alt="">' : escapeHtml((group.name || "G").slice(0,1).toUpperCase());
+      $("detail").innerHTML = '<div class="detail-head"><span class="avatar">' + avatar + '</span><div><p class="muted">Group</p><h1>' + escapeHtml(group.name || "Group chat") + '</h1><p class="muted">' + escapeHtml(group.groupId) + '</p></div></div>'
+        + '<div class="info-grid">'
+        + info("Members", String(group.memberCount)) + info("Admins", String(group.adminCount)) + info("Owner", (group.ownerName || group.ownerId || "unknown"))
+        + info("Adding", group.memberAddLocked ? "locked" : "members allowed") + info("Created", group.createdAt || "unknown") + info("Updated", group.updatedAt || "unknown")
+        + '</div>'
+        + '<div class="card stack"><h2>Group details</h2><div class="profile-edit"><span id="groupAvatarPreview" class="avatar profile-preview">' + groupAvatarHtml(group.avatar, group.name) + '</span><div class="stack"><label>Group name<input id="groupName" value="' + escapeAttr(group.name || "Group chat") + '" maxlength="80"></label><label>Group picture<input id="groupAvatarFile" type="file" accept="image/*"></label><label><input id="groupAddLocked" type="checkbox" ' + checked(group.memberAddLocked) + '> Only owner/admins can add members</label><div class="actions"><button id="saveGroupProfile">Save group</button><button id="removeGroupAvatar" class="secondary">Remove picture</button></div></div></div></div>'
+        + '<div class="card stack"><h2>Add members</h2><p class="muted">Enter one or more 6-digit Bypassium codes. Existing members are skipped.</p><div class="search-row"><label>Codes<input id="groupAddMembers" placeholder="123456 234567"></label><button id="addGroupMembers">Add</button></div></div>'
+        + '<div class="card stack"><h2>Members</h2><div class="member-list">' + (group.members || []).map((member) => groupMemberRow(member, group)).join("") + '</div></div>'
+        + '<div class="card stack danger-zone"><h2>Delete group</h2><p class="muted">This removes the group record. Message contents are not shown here.</p><label>Type group ID or exact name<input id="deleteGroupConfirm" placeholder="' + escapeAttr(group.groupId) + '"></label><button class="danger" id="deleteGroup">Delete group</button></div>';
+      $("groupAvatarFile").onchange = async () => {
+        try {
+          const file = $("groupAvatarFile").files && $("groupAvatarFile").files[0];
+          if (!file) return;
+          state.groupAvatarDraft = await compressProfileImage(file);
+          state.groupAvatarRemove = false;
+          $("groupAvatarPreview").innerHTML = groupAvatarHtml(state.groupAvatarDraft, $("groupName").value);
+          toast("Group picture ready. Click Save group.");
+        } catch (error) { toast(error.message); }
+      };
+      $("removeGroupAvatar").onclick = () => {
+        state.groupAvatarDraft = "";
+        state.groupAvatarRemove = true;
+        $("groupAvatarPreview").innerHTML = groupAvatarHtml("", $("groupName").value);
+        toast("Picture removed. Click Save group.");
+      };
+      $("saveGroupProfile").onclick = () => postGroupAction("/group-update", { groupId: group.groupId, name: $("groupName").value, avatar: state.groupAvatarDraft, removeAvatar: state.groupAvatarRemove, memberAddLocked: $("groupAddLocked").checked });
+      $("addGroupMembers").onclick = () => postGroupAction("/group-add-members", { groupId: group.groupId, members: parseMemberCodes($("groupAddMembers").value) });
+      $("deleteGroup").onclick = () => deleteGroupFromAdmin(group.groupId);
+      document.querySelectorAll("[data-group-owner]").forEach((button) => button.onclick = () => postGroupAction("/group-transfer-owner", { groupId: group.groupId, memberId: button.dataset.groupOwner }));
+      document.querySelectorAll("[data-group-admin]").forEach((button) => button.onclick = () => postGroupAction("/group-set-admin", { groupId: group.groupId, memberId: button.dataset.groupAdmin, isAdmin: button.dataset.adminValue === "true" }));
+      document.querySelectorAll("[data-group-remove]").forEach((button) => button.onclick = () => postGroupAction("/group-remove-member", { groupId: group.groupId, memberId: button.dataset.groupRemove }));
+    }
+    function groupMemberRow(member, group) {
+      const isOwner = member.peerId === group.ownerId;
+      const isAdmin = (group.admins || []).includes(member.peerId);
+      const avatar = member.profilePicture ? '<img src="' + escapeAttr(member.profilePicture) + '" alt="">' : escapeHtml((member.displayName || member.peerId || "U").slice(0,1).toUpperCase());
+      const badge = member.badge ? '<span class="profile-badge">' + escapeHtml(member.badge) + '</span>' : '';
+      const role = isOwner ? "Owner" : isAdmin ? "Admin" : "Member";
+      const adminButton = isOwner ? '' : '<button class="secondary" data-group-admin="' + escapeAttr(member.peerId) + '" data-admin-value="' + (isAdmin ? "false" : "true") + '">' + (isAdmin ? "Remove admin" : "Make admin") + '</button>';
+      const ownerButton = isOwner ? '' : '<button class="secondary" data-group-owner="' + escapeAttr(member.peerId) + '">Make owner</button>';
+      const removeButton = '<button class="danger" data-group-remove="' + escapeAttr(member.peerId) + '">Remove</button>';
+      return '<div class="member-row"><span class="avatar">' + avatar + '</span><span class="member-meta"><strong>' + escapeHtml(member.displayName || member.peerId) + '</strong>' + badge + '<small class="muted">' + escapeHtml(member.peerId + " - " + member.status) + (member.banned ? ' - banned' : '') + '</small><span class="role-chip">' + escapeHtml(role) + '</span></span><div class="member-actions">' + ownerButton + adminButton + removeButton + '</div></div>';
+    }
+    async function postGroupAction(path, body) {
+      try {
+        const payload = await api(path, { method:"POST", body:JSON.stringify(body) });
+        toast(payload.message || "Done.");
+        if (payload.group) renderGroupDetail(payload.group);
+        else if (payload.deleted) clearDetail(payload.message || "Group deleted.", "Select a group");
+        await Promise.allSettled([loadStatus(), searchGroups(), loadAudit()]);
+        return payload;
+      } catch (error) { toast(error.message); throw error; }
+    }
+    async function deleteGroupFromAdmin(groupId) {
+      try {
+        const payload = await api("/delete-group", { method:"POST", body:JSON.stringify({ groupId, confirm: $("deleteGroupConfirm").value }) });
+        clearDetail(payload.message || "Group deleted.", "Select a group");
+        toast(payload.message || "Group deleted.");
+        await refreshAll();
+      } catch (error) { toast(error.message); }
+    }
+    function parseMemberCodes(value) {
+      return [...new Set(String(value || "").match(/\d{6}/g) || [])];
+    }
+    function groupAvatarHtml(avatar, name) {
+      return avatar ? '<img src="' + escapeAttr(avatar) + '" alt="">' : escapeHtml((name || "G").slice(0,1).toUpperCase());
+    }
     async function loadAccount(peerId) {
       try {
+        state.selectedGroup = "";
         state.selected = peerId;
         const payload = await api("/account?peerId=" + encodeURIComponent(peerId));
         renderDetail(payload.account);
@@ -2931,6 +3218,100 @@ async function adminAccountDetail(peerId) {
     hasPublicKey: Boolean(publicKey),
     storage: storageMode()
   };
+}
+
+async function searchAdminGroups(query = "", limit = 80) {
+  const cleanQuery = String(query || "").trim().toLowerCase();
+  const summaries = [];
+  for (const group of await getAllGroups()) {
+    const summary = await adminGroupSummary(group);
+    const score = groupSearchScore(cleanQuery, summary);
+    if (score === null) continue;
+    summaries.push({ ...summary, score });
+  }
+  return summaries.sort((first, second) => {
+    if (first.score !== second.score) return first.score - second.score;
+    const firstTime = Date.parse(first.updatedAt || "") || 0;
+    const secondTime = Date.parse(second.updatedAt || "") || 0;
+    if (firstTime !== secondTime) return secondTime - firstTime;
+    return first.name.localeCompare(second.name);
+  }).slice(0, limit).map(({ score, ...group }) => group);
+}
+
+async function adminGroupDetail(groupId) {
+  const group = await getGroup(groupId);
+  if (!group) return null;
+  return adminGroupSummary(group);
+}
+
+async function adminGroupSummary(groupValue) {
+  const group = normalizeGroup(groupValue);
+  const members = await Promise.all(group.members.map((memberId) => adminMemberSummary(memberId)));
+  const owner = members.find((member) => member.peerId === group.ownerId) || null;
+  return {
+    groupId: group.id,
+    name: sanitizeGroupName(group.name, "Group chat"),
+    avatar: sanitizeProfilePicture(group.avatar),
+    createdBy: cleanPeerId(group.createdBy),
+    ownerId: group.ownerId,
+    ownerName: owner?.displayName || group.ownerId || "unknown",
+    admins: normalizeMembers(group.admins || []),
+    adminCount: normalizeMembers(group.admins || []).length,
+    members,
+    memberCount: members.length,
+    memberAddLocked: Boolean(group.memberAddLocked),
+    createdAt: String(group.createdAt || "").slice(0, 40),
+    updatedAt: String(group.updatedAt || "").slice(0, 40)
+  };
+}
+
+async function adminMemberSummary(peerId) {
+  const clean = cleanPeerId(peerId);
+  if (!clean) return { peerId: "", displayName: "Unknown", profilePicture: "", badge: "", status: "offline", banned: false };
+  const accountSummary = await adminAccountSummary(clean).catch(() => null);
+  if (accountSummary) {
+    return {
+      peerId: clean,
+      displayName: accountSummary.displayName || clean,
+      profilePicture: accountSummary.profilePicture || "",
+      badge: accountSummary.badge || "",
+      status: accountSummary.status || "offline",
+      banned: Boolean(accountSummary.banned)
+    };
+  }
+  const profile = sanitizeProfile(await getProfile(clean) || {});
+  const restriction = await getAccountRestriction(clean);
+  return {
+    peerId: clean,
+    displayName: profile.displayName || clean,
+    profilePicture: profile.profilePicture || "",
+    badge: profile.badge || "",
+    status: clients.has(clean) ? "online" : "offline",
+    banned: restrictionBanned(restriction)
+  };
+}
+
+function groupSearchScore(query, group) {
+  if (!query) return 0;
+  const scores = [
+    accountSearchScore(query, group.groupId, group.name),
+    accountSearchScore(query, group.ownerId, group.ownerName),
+    ...group.members.map((member) => accountSearchScore(query, member.peerId, member.displayName))
+  ].filter((score) => Number.isFinite(score));
+  return scores.length ? Math.min(...scores) : null;
+}
+
+function cleanAdminGroupId(value) {
+  const groupId = String(value || "").trim();
+  return groupId && groupId.length <= 120 && /^[A-Za-z0-9_-]+$/.test(groupId) ? groupId : "";
+}
+
+function sanitizeGroupName(value = "", fallback = "Group chat") {
+  return String(value || "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 80)
+    || fallback;
 }
 
 async function getKnownPeerIds() {
