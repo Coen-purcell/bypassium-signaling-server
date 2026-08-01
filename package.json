@@ -5,7 +5,9 @@
   "main": "server.js",
   "type": "module",
   "scripts": {
-    "start": "node server.js"
+    "start": "node start-all.js",
+    "start:server": "node server.js",
+    "test": "node tests/account-protocol.test.mjs"
   },
   "engines": {
     "node": ">=20"
