@@ -12,8 +12,8 @@ const ADMIN_AUDIT_LIMIT = 500;
 const SAFETY_LOG_LIMIT = 1000;
 const MAX_OFFLINE_MESSAGES_PER_USER = 500;
 const MAX_HISTORY_MESSAGES_PER_USER = Number(process.env.MAX_HISTORY_MESSAGES_PER_USER || 0);
-const DEFAULT_HISTORY_SYNC_LIMIT = Number(process.env.DEFAULT_HISTORY_SYNC_LIMIT || 5000);
-const MAX_HISTORY_SYNC_LIMIT = Number(process.env.MAX_HISTORY_SYNC_LIMIT || 50000);
+const DEFAULT_HISTORY_SYNC_LIMIT = Number(process.env.DEFAULT_HISTORY_SYNC_LIMIT || 300);
+const MAX_HISTORY_SYNC_LIMIT = Number(process.env.MAX_HISTORY_SYNC_LIMIT || 5000);
 const MAX_PROFILE_PICTURE_CHARS = 18000;
 const MAX_UPSTASH_RPUSH_ITEMS = 4;
 const MAX_UPSTASH_RPUSH_CHARS = 6_000_000;
@@ -1669,7 +1669,7 @@ async function relayDirectMessage(socket, message) {
   });
 
   if (!targets?.size) {
-    await queueForDelivery(targetId, envelope, { awaitWrite: true });
+    queueForDelivery(targetId, envelope);
     send(socket, { type: "message-queued", peerId: targetId, sentAt: envelope.sentAt, persistent: storageMode() !== "memory" });
     return;
   }
@@ -1702,7 +1702,7 @@ async function relayDirectSetting(socket, message) {
     sentAt: message.sentAt || new Date().toISOString()
   };
   const targets = clients.get(targetId);
-  if (!targets?.size) await queueForDelivery(targetId, envelope, { awaitWrite: true });
+  if (!targets?.size) queueForDelivery(targetId, envelope);
   for (const target of targets || []) {
     if (target !== socket && target.readyState === 1) send(target, envelope);
   }
@@ -1749,7 +1749,7 @@ async function relayGroupMessage(socket, message) {
       }
       queueForDelivery(targetId, envelope);
     } else {
-      await queueForDelivery(targetId, envelope, { awaitWrite: true });
+      queueForDelivery(targetId, envelope);
     }
     return targetId;
   });
@@ -2368,10 +2368,11 @@ async function getOfflineMessages(targetId) {
   if (!redis && !upstashRestEnabled) return memoryOfflineMessages.get(targetId) || [];
   const ids = await getInboxIds(targetId);
   const uniqueIds = [...new Set(ids)].slice(-maxOfflineMessagesPerUser());
+  const storedValues = await getQueuedMessages(targetId, uniqueIds);
   const messages = [];
   const keptIds = [];
-  for (const id of uniqueIds) {
-    const stored = await getQueuedMessage(targetId, id);
+  for (const [index, id] of uniqueIds.entries()) {
+    const stored = storedValues[index];
     if (!stored) continue;
     try {
       messages.push(JSON.parse(stored));
@@ -2417,6 +2418,14 @@ async function getQueuedMessage(targetId, messageId) {
   if (redis) return redis.get(queuedMessageKey(targetId, messageId));
   if (upstashRestEnabled) return upstashCommand(["GET", queuedMessageKey(targetId, messageId)]);
   return null;
+}
+
+async function getQueuedMessages(targetId, messageIds = []) {
+  const ids = messageIds.filter(Boolean);
+  if (!ids.length) return [];
+  if (redis) return redis.mget(ids.map((id) => queuedMessageKey(targetId, id)));
+  if (upstashRestEnabled) return batchedUpstashGets(ids.map((id) => queuedMessageKey(targetId, id)));
+  return ids.map(() => null);
 }
 
 async function deleteQueuedMessage(targetId, messageId) {
@@ -2627,11 +2636,13 @@ async function getHistoryMessages(peerId, limit = 500) {
     return newestHistoryFirst(limitedHistory);
   }
   const ids = await getHistoryIds(peerId);
-  const uniqueIds = requestedLimit ? [...new Set(ids)].slice(-requestedLimit) : [...new Set(ids)];
+  const allUniqueIds = [...new Set(ids)];
+  const uniqueIds = requestedLimit ? allUniqueIds.slice(-requestedLimit) : allUniqueIds;
+  const storedValues = await getHistoryMessageValues(peerId, uniqueIds);
   const messages = [];
   const keptIds = [];
-  for (const id of uniqueIds) {
-    const stored = await getHistoryMessage(peerId, id);
+  for (const [index, id] of uniqueIds.entries()) {
+    const stored = storedValues[index];
     if (!stored) continue;
     try {
       messages.push(JSON.parse(stored));
@@ -2640,7 +2651,7 @@ async function getHistoryMessages(peerId, limit = 500) {
       await deleteHistoryMessage(peerId, id);
     }
   }
-  if (keptIds.length !== ids.length) await replaceHistoryIds(peerId, keptIds);
+  if (!requestedLimit && keptIds.length !== allUniqueIds.length) await replaceHistoryIds(peerId, keptIds);
   return newestHistoryFirst(messages);
 }
 
@@ -2663,6 +2674,14 @@ async function getHistoryMessage(peerId, historyId) {
   if (redis) return redis.get(historyMessageKey(peerId, historyId));
   if (upstashRestEnabled) return upstashCommand(["GET", historyMessageKey(peerId, historyId)]);
   return null;
+}
+
+async function getHistoryMessageValues(peerId, historyIds = []) {
+  const ids = historyIds.filter(Boolean);
+  if (!ids.length) return [];
+  if (redis) return redis.mget(ids.map((id) => historyMessageKey(peerId, id)));
+  if (upstashRestEnabled) return batchedUpstashGets(ids.map((id) => historyMessageKey(peerId, id)));
+  return ids.map(() => null);
 }
 
 async function deleteHistoryMessage(peerId, historyId) {
@@ -3902,6 +3921,16 @@ async function upstashPipeline(commands) {
   return payload.map((result) => result.result);
 }
 
+async function batchedUpstashGets(keys = []) {
+  const results = [];
+  const batchSize = 25;
+  for (let index = 0; index < keys.length; index += batchSize) {
+    const batch = keys.slice(index, index + batchSize);
+    results.push(...await upstashPipeline(batch.map((key) => ["GET", key])));
+  }
+  return results;
+}
+
 async function upstashPushList(key, items) {
   let chunk = [];
   let chunkSize = 0;
@@ -4238,11 +4267,11 @@ function maxHistoryMessagesPerUser() {
 }
 
 function defaultHistorySyncLimit() {
-  return Math.max(50, Number(DEFAULT_HISTORY_SYNC_LIMIT) || 5000);
+  return Math.max(50, Number(DEFAULT_HISTORY_SYNC_LIMIT) || 300);
 }
 
 function maxHistorySyncLimit() {
-  return Math.max(defaultHistorySyncLimit(), Number(MAX_HISTORY_SYNC_LIMIT) || 50000);
+  return Math.max(defaultHistorySyncLimit(), Number(MAX_HISTORY_SYNC_LIMIT) || 5000);
 }
 
 function localProfile(peerId) {
