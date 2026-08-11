@@ -24,7 +24,7 @@ function startBot() {
 
   const bot = spawnNode("support-bot", ["support-bot.js"], {
     BYPASSIUM_SERVER_URL: localServerUrl,
-    PORT: "0"
+    BOT_DISABLE_HEALTH_SERVER: "true"
   });
 
   bot.on("exit", (code, signal) => {

@@ -25,7 +25,8 @@ const config = {
   adminBaseUrl: normalizeAdminBaseUrl(process.env.BYPASSIUM_ADMIN_BASE_URL || process.env.BYPASSIUM_SERVER_URL || "wss://bypassium-signaling-server.onrender.com"),
   publishProfile: process.env.BOT_PUBLISH_PROFILE === "true",
   maxReplyChars: Math.max(120, Math.min(2000, Number(process.env.BOT_MAX_REPLY_CHARS) || 900)),
-  port: Number(process.env.PORT || 10000)
+  port: Number(process.env.PORT || 10000),
+  healthServerEnabled: process.env.BOT_DISABLE_HEALTH_SERVER !== "true"
 };
 
 const metrics = {
@@ -283,7 +284,7 @@ class SupportBot {
       text: userVisibleText(message),
       conversationKey: `direct:${payload.from}`
     });
-    await this.sendDirectText(payload.from, reply, payload.publicKeyJwk);
+    await this.sendDirectText(payload.from, reply, payload.publicKeyJwk, payload.sentAt);
     metrics.directReplies += 1;
     metrics.lastReplyAt = new Date().toISOString();
   }
@@ -310,7 +311,7 @@ class SupportBot {
       text: stripSupportMention(userVisibleText(message), this.options),
       conversationKey: `group:${payload.groupId}`
     });
-    await this.sendGroupText(group, reply);
+    await this.sendGroupText(group, reply, payload.sentAt);
     metrics.groupReplies += 1;
     metrics.lastReplyAt = new Date().toISOString();
   }
@@ -353,11 +354,11 @@ class SupportBot {
     const publicKeyJwk = payload.publicKeyJwk || this.knownPublicKeys.get(payload.from);
     if (!this.isOwner(payload.from)) {
       const reply = "Admin commands are only available to owner-approved Bypassium codes.";
-      if (channel === "direct") await this.sendDirectText(payload.from, reply, publicKeyJwk);
+      if (channel === "direct") await this.sendDirectText(payload.from, reply, publicKeyJwk, payload.sentAt);
       return true;
     }
     const reply = await this.runAdminIntent(intent);
-    await this.sendDirectText(payload.from, reply, publicKeyJwk);
+    await this.sendDirectText(payload.from, reply, publicKeyJwk, payload.sentAt);
     metrics.adminReplies += 1;
     metrics.lastReplyAt = new Date().toISOString();
     return true;
@@ -547,12 +548,12 @@ class SupportBot {
   }
 
   // Sends an encrypted direct message from Support to one user.
-  async sendDirectText(to, text, publicKeyJwk = null) {
+  async sendDirectText(to, text, publicKeyJwk = null, afterSentAt = "") {
     if (!publicKeyJwk && !this.knownPublicKeys.has(to)) await this.ensurePublicKeys([to]);
     const targetPublicKey = publicKeyJwk || this.knownPublicKeys.get(to);
     if (!targetPublicKey) throw new Error(`No public key for ${to}.`);
     const messageId = randomUUID();
-    const sentAt = new Date().toISOString();
+    const sentAt = causalReplySentAt(afterSentAt);
     const serialized = serializeChatPayload({ text, presentation: supportPresentation() });
     const [encrypted, senderEncrypted] = await Promise.all([
       this.relayKey(to, targetPublicKey).then((key) => encryptText(key, serialized)),
@@ -571,7 +572,7 @@ class SupportBot {
   }
 
   // Sends an encrypted group reply, one encrypted copy per group member.
-  async sendGroupText(group, text) {
+  async sendGroupText(group, text, afterSentAt = "") {
     const members = normalizeMembers(group.members || []).filter((memberId) => memberId !== this.identity.id);
     await this.ensurePublicKeys(members);
     const serialized = serializeChatPayload({ text, presentation: supportPresentation() });
@@ -586,7 +587,7 @@ class SupportBot {
     }
     if (!recipients.length) throw new Error(`No group recipients had public keys for ${group.id}.`);
     const messageId = randomUUID();
-    const sentAt = new Date().toISOString();
+    const sentAt = causalReplySentAt(afterSentAt);
     const senderEncrypted = await this.relayKey(this.identity.id, this.identity.publicKeyJwk)
       .then((key) => encryptText(key, serialized));
     this.send({
@@ -631,7 +632,7 @@ class SupportBot {
   }
 }
 
-startHealthServer(config.port);
+if (config.healthServerEnabled) startHealthServer(config.port);
 
 const bot = new SupportBot(config);
 bot.start().catch((error) => {
@@ -771,6 +772,13 @@ function userVisibleText(message) {
 
 function supportPresentation() {
   return { colorId: "sky", fontId: 0 };
+}
+
+// Keeps a bot reply causally after the message it answers even when device clocks differ.
+function causalReplySentAt(afterSentAt = "") {
+  const triggerTime = Date.parse(String(afterSentAt || ""));
+  const minimumReplyTime = Number.isFinite(triggerTime) ? triggerTime + 1 : 0;
+  return new Date(Math.max(Date.now(), minimumReplyTime)).toISOString();
 }
 
 function fixedSupportReply(text) {
