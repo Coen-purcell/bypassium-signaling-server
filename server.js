@@ -21,6 +21,8 @@ const MAX_UPSTASH_COMMAND_CHARS = 8_500_000;
 const MAX_QUEUED_ENVELOPE_CHARS = 7_500_000;
 const MAX_WEBSOCKET_PAYLOAD_CHARS = 8_500_000;
 const MAX_CALL_SIGNAL_CHARS = 64_000;
+const MAX_GROUP_CALL_MEMBERS = 5;
+const GROUP_CALL_TTL_MS = 4 * 60 * 60 * 1000;
 const REDIS_URL = process.env.REDIS_URL || process.env.RENDER_REDIS_URL || process.env.KEY_VALUE_URL || "";
 const UPSTASH_REST_URL = process.env.UPSTASH_REDIS_REST_URL || "";
 const UPSTASH_REST_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN || "";
@@ -43,6 +45,7 @@ const memoryOfflineMessages = new Map();
 const memoryHistoryMessages = new Map();
 const pendingQueuedEnvelopes = new Map();
 const cancelledQueuedEnvelopes = new Set();
+const groupCallRooms = new Map();
 let accountIndexHydrated = false;
 let accountIndexHydrationPromise = null;
 const redis = createRedisClient();
@@ -144,6 +147,9 @@ wss.on("connection", (socket, request) => {
       if (message.type === "typing") await relayTyping(socket, message);
       if (message.type === "read-receipt") await relayReadReceipt(socket, message);
       if (message.type === "reaction") await relayReaction(socket, message);
+      if (message.type === "group-call-start") await startGroupCall(socket, message);
+      if (message.type === "group-call-join") await joinGroupCall(socket, message);
+      if (message.type === "group-call-leave") await leaveGroupCall(socket, message);
       if (message.type === "call-signal") await relayCallSignal(socket, message);
       if (message.type === "history-sync") await syncHistoryMessages(socket, message);
       if (message.type === "history-backfill") await backfillHistoryMessages(socket, message);
@@ -1102,6 +1108,8 @@ async function registerClient(socket, message) {
       historyBackfill: true,
       quickAddDirectory: true,
       audioCalls: true,
+      groupCalls: true,
+      maxGroupCallMembers: MAX_GROUP_CALL_MEMBERS,
       accounts: true,
       contactSync: true
     },
@@ -1215,7 +1223,10 @@ function unregisterClient(socket) {
   const sockets = clients.get(socket.bypassiumId);
   if (sockets) {
     sockets.delete(socket);
-    if (sockets.size === 0) clients.delete(socket.bypassiumId);
+    if (sockets.size === 0) {
+      clients.delete(socket.bypassiumId);
+      leaveAllGroupCalls(disconnectedId, "Disconnected from the call.");
+    }
   }
   socket.bypassiumId = null;
 }
@@ -1835,6 +1846,7 @@ async function relayCallSignal(socket, message) {
 
   const targetId = String(message.to || "").trim();
   const callId = String(message.callId || "").trim().slice(0, 80);
+  const groupId = String(message.groupId || "").trim().slice(0, 120);
   const action = String(message.action || "").trim();
   const allowedActions = new Set([
     "invite",
@@ -1854,6 +1866,14 @@ async function relayCallSignal(socket, message) {
     return;
   }
 
+  if (groupId) {
+    const room = groupCallRooms.get(callId);
+    if (!room || room.groupId !== groupId || !room.joined.has(senderId) || !room.joined.has(targetId)) {
+      send(socket, { type: "error", message: "That group call participant is no longer available." });
+      return;
+    }
+  }
+
   const description = sanitizeCallDescription(message.description);
   const candidate = sanitizeCallCandidate(message.candidate);
   if ((message.description && !description) || (message.candidate && !candidate)) {
@@ -1864,6 +1884,7 @@ async function relayCallSignal(socket, message) {
   const envelope = {
     type: "call-signal",
     callId,
+    groupId,
     action,
     from: senderId,
     profile: localProfile(senderId),
@@ -1879,6 +1900,7 @@ async function relayCallSignal(socket, message) {
     send(socket, {
       type: "call-signal",
       callId,
+      groupId,
       action: "unavailable",
       from: targetId,
       reason: "That contact is not online for calls.",
@@ -1898,12 +1920,193 @@ async function relayCallSignal(socket, message) {
     send(socket, {
       type: "call-signal",
       callId,
+      groupId,
       action: "unavailable",
       from: targetId,
       reason: "That contact is already connected from this browser only.",
       sentAt: envelope.sentAt
     });
   }
+}
+
+// Creates a short-lived group call room. Audio and video remain peer-to-peer.
+async function startGroupCall(socket, message = {}) {
+  const peerId = getRegisteredSender(socket);
+  if (!peerId) return;
+  if (!(await enforceAccountAction(socket, peerId, "send"))) return;
+  if (!allowUserAction(socket, "message")) return;
+  cleanupStaleGroupCalls();
+
+  const group = await getGroup(message.groupId);
+  if (!group || !group.members.includes(peerId)) {
+    sendGroupCallResult(socket, message, false, "Only members of this group can start its call.");
+    return;
+  }
+  if (group.members.length > MAX_GROUP_CALL_MEMBERS) {
+    sendGroupCallResult(socket, message, false, `Group calls currently support up to ${MAX_GROUP_CALL_MEMBERS} people.`);
+    return;
+  }
+
+  let room = activeGroupCallForGroup(group.id);
+  const created = !room;
+  if (!room) {
+    const callId = cleanGroupCallId(message.callId) || randomUUID();
+    room = {
+      callId,
+      groupId: group.id,
+      startedBy: peerId,
+      joined: new Set(),
+      createdAt: Date.now()
+    };
+    groupCallRooms.set(callId, room);
+  }
+
+  const peers = joinGroupCallRoom(room, peerId);
+  if (created) {
+    const invite = {
+      type: "group-call-invite",
+      callId: room.callId,
+      groupId: group.id,
+      from: peerId,
+      profile: localProfile(peerId),
+      group: publicGroupCallGroup(group),
+      sentAt: new Date().toISOString()
+    };
+    for (const memberId of group.members) {
+      if (memberId !== peerId) sendToClient(memberId, invite);
+    }
+  }
+
+  send(socket, {
+    type: "group-call-started",
+    requestId: String(message.requestId || ""),
+    ok: true,
+    callId: room.callId,
+    groupId: room.groupId,
+    existing: !created,
+    peers: groupCallPeerList(peers)
+  });
+}
+
+// Adds a member to a room and announces them to the existing mesh.
+async function joinGroupCall(socket, message = {}) {
+  const peerId = getRegisteredSender(socket);
+  if (!peerId) return;
+  cleanupStaleGroupCalls();
+  const callId = cleanGroupCallId(message.callId);
+  const room = groupCallRooms.get(callId);
+  const group = room ? await getGroup(room.groupId) : null;
+  if (!room || !group || group.id !== String(message.groupId || "").trim() || !group.members.includes(peerId)) {
+    sendGroupCallResult(socket, message, false, "That group call has ended or you are not a member.");
+    return;
+  }
+  if (group.members.length > MAX_GROUP_CALL_MEMBERS) {
+    sendGroupCallResult(socket, message, false, `Group calls currently support up to ${MAX_GROUP_CALL_MEMBERS} people.`);
+    return;
+  }
+  const peers = joinGroupCallRoom(room, peerId);
+  send(socket, {
+    type: "group-call-joined",
+    requestId: String(message.requestId || ""),
+    ok: true,
+    callId: room.callId,
+    groupId: room.groupId,
+    peers: groupCallPeerList(peers)
+  });
+}
+
+// Removes a participant immediately and destroys the room when it becomes empty.
+async function leaveGroupCall(socket, message = {}) {
+  const peerId = getRegisteredSender(socket);
+  if (!peerId) return;
+  const room = groupCallRooms.get(cleanGroupCallId(message.callId));
+  if (room && room.groupId === String(message.groupId || "").trim()) {
+    removeGroupCallPeer(room, peerId, String(message.reason || "Left the call.").slice(0, 140));
+  }
+  if (message.requestId) send(socket, { type: "group-call-left", requestId: String(message.requestId), ok: true });
+}
+
+function joinGroupCallRoom(room, peerId) {
+  const peers = [...room.joined].filter((id) => id !== peerId);
+  const wasJoined = room.joined.has(peerId);
+  room.joined.add(peerId);
+  if (!wasJoined) {
+    for (const existingPeerId of peers) {
+      sendToClient(existingPeerId, {
+        type: "group-call-peer-joined",
+        callId: room.callId,
+        groupId: room.groupId,
+        peerId,
+        profile: localProfile(peerId)
+      });
+    }
+  }
+  return peers;
+}
+
+function removeGroupCallPeer(room, peerId, reason = "Left the call.") {
+  if (!room?.joined.delete(peerId)) return;
+  for (const existingPeerId of room.joined) {
+    sendToClient(existingPeerId, {
+      type: "group-call-peer-left",
+      callId: room.callId,
+      groupId: room.groupId,
+      peerId,
+      reason
+    });
+  }
+  if (!room.joined.size) groupCallRooms.delete(room.callId);
+}
+
+function leaveAllGroupCalls(peerId, reason) {
+  for (const room of [...groupCallRooms.values()]) removeGroupCallPeer(room, peerId, reason);
+}
+
+function activeGroupCallForGroup(groupId) {
+  return [...groupCallRooms.values()].find((room) => room.groupId === groupId) || null;
+}
+
+function cleanupStaleGroupCalls() {
+  const cutoff = Date.now() - GROUP_CALL_TTL_MS;
+  for (const room of [...groupCallRooms.values()]) {
+    if (room.createdAt >= cutoff) continue;
+    for (const peerId of room.joined) {
+      sendToClient(peerId, {
+        type: "group-call-ended",
+        callId: room.callId,
+        groupId: room.groupId,
+        reason: "The group call expired."
+      });
+    }
+    groupCallRooms.delete(room.callId);
+  }
+}
+
+function cleanGroupCallId(value) {
+  const callId = String(value || "").trim().slice(0, 80);
+  return /^[A-Za-z0-9_-]{8,80}$/.test(callId) ? callId : "";
+}
+
+function publicGroupCallGroup(group) {
+  return {
+    id: group.id,
+    name: String(group.name || "Group call").slice(0, 80),
+    avatar: sanitizeProfilePicture(group.avatar),
+    members: normalizeMembers(group.members || [])
+  };
+}
+
+function groupCallPeerList(peerIds) {
+  return peerIds.map((peerId) => ({ peerId, profile: localProfile(peerId) }));
+}
+
+function sendGroupCallResult(socket, message, ok, responseMessage) {
+  send(socket, {
+    type: "group-call-result",
+    requestId: String(message.requestId || ""),
+    ok,
+    message: responseMessage
+  });
 }
 
 async function relayReadReceipt(socket, message) {
