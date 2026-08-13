@@ -51,6 +51,9 @@ const memoryHistoryMessages = new Map();
 const memoryStories = new Map();
 const memoryStoryIndexes = new Map();
 const memoryStoryViews = new Map();
+const memoryStoryReactions = new Map();
+const memoryStoryComments = new Map();
+const memoryStoryShares = new Map();
 const pendingQueuedEnvelopes = new Map();
 const cancelledQueuedEnvelopes = new Set();
 const groupCallRooms = new Map();
@@ -164,6 +167,8 @@ wss.on("connection", (socket, request) => {
       if (message.type === "story-publish") await publishStory(socket, message);
       if (message.type === "story-sync") await syncStories(socket);
       if (message.type === "story-view") await viewStory(socket, message);
+      if (message.type === "story-feedback") await submitStoryFeedback(socket, message);
+      if (message.type === "story-share") await recordStoryShare(socket, message);
       if (message.type === "story-delete") await deleteStory(socket, message);
       if (message.type === "sync") await syncClient(socket);
     } catch (error) {
@@ -1123,6 +1128,7 @@ async function registerClient(socket, message) {
       groupCalls: true,
       maxGroupCallMembers: MAX_GROUP_CALL_MEMBERS,
       encryptedStories: true,
+      encryptedStoryFeedback: true,
       accounts: true,
       contactSync: true
     },
@@ -1304,13 +1310,76 @@ async function viewStory(socket, message = {}) {
   if (!viewerId || !storyId) return;
   const story = await getStoryRecord(storyId);
   if (!story || !story.encryptedKeys?.[viewerId] || story.ownerId === viewerId) return;
-  await addStoryView(storyId, viewerId);
+  const viewerProfile = sanitizeProfile(await getProfile(viewerId) || localProfile(viewerId));
+  const view = await addStoryView(storyId, viewerId, viewerProfile);
   sendToClient(story.ownerId, {
     type: "story-viewed",
     storyId,
     viewerId,
-    viewedAt: new Date().toISOString()
+    viewedAt: view.viewedAt,
+    profile: viewerProfile
   });
+}
+
+// Stores owner-readable encrypted comments and one replaceable reaction per
+// viewer. Comment text never needs to be visible to the relay server.
+async function submitStoryFeedback(socket, message = {}) {
+  const viewerId = getRegisteredSender(socket);
+  if (!viewerId || !(await enforceAccountAction(socket, viewerId, "send")) || !allowUserAction(socket, "story")) return;
+  const storyId = String(message.storyId || "").trim();
+  const story = storyId ? await getStoryRecord(storyId) : null;
+  if (!story || story.ownerId === viewerId || !story.encryptedKeys?.[viewerId]) {
+    send(socket, { type: "story-feedback-result", requestId: String(message.requestId || ""), ok: false, message: "That story is no longer available." });
+    return;
+  }
+  const kind = message.kind === "comment" ? "comment" : message.kind === "reaction" ? "reaction" : "";
+  const feedbackId = String(message.feedbackId || "").trim();
+  const encrypted = message.encrypted;
+  if (!kind || !/^[a-zA-Z0-9-]{12,80}$/.test(feedbackId) || !validEncryptedPayload(encrypted) || JSON.stringify(message).length > 100_000) {
+    send(socket, { type: "story-feedback-result", requestId: String(message.requestId || ""), ok: false, message: "That response could not be sent." });
+    return;
+  }
+  const reaction = kind === "reaction" && ["like", "dislike", "none"].includes(message.reaction) ? message.reaction : "";
+  if (kind === "reaction" && !reaction) {
+    send(socket, { type: "story-feedback-result", requestId: String(message.requestId || ""), ok: false, message: "Choose Like or Dislike." });
+    return;
+  }
+  const record = {
+    feedbackId,
+    storyId,
+    ownerId: story.ownerId,
+    viewerId,
+    kind,
+    reaction,
+    encrypted,
+    createdAt: new Date().toISOString(),
+    profile: sanitizeProfile(await getProfile(viewerId) || localProfile(viewerId)),
+    viewerPublicKeyJwk: socket.publicKeyJwk
+  };
+  if (kind === "reaction") await setStoryReaction(record);
+  else await appendStoryComment(record);
+  const envelope = await storyFeedbackEnvelope(record, story);
+  sendToClient(story.ownerId, { type: "story-feedback", feedback: envelope });
+  send(socket, {
+    type: "story-feedback-result",
+    requestId: String(message.requestId || ""),
+    ok: true,
+    feedback: envelope
+  });
+}
+
+async function recordStoryShare(socket, message = {}) {
+  const viewerId = getRegisteredSender(socket);
+  const storyId = String(message.storyId || "").trim();
+  const story = viewerId && storyId ? await getStoryRecord(storyId) : null;
+  if (!story || !story.encryptedKeys?.[viewerId]) {
+    send(socket, { type: "story-share-result", requestId: String(message.requestId || ""), ok: false, message: "That story is no longer available." });
+    return;
+  }
+  const recipients = Math.max(1, Math.min(100, Number(message.recipients) || 1));
+  const shareCount = await addStoryShares(storyId, recipients);
+  if (story.ownerId !== viewerId) sendToClient(story.ownerId, { type: "story-shared", storyId, shares: recipients, shareCount });
+  send(socket, { type: "story-share-result", requestId: String(message.requestId || ""), ok: true, shareCount });
 }
 
 async function deleteStory(socket, message = {}) {
@@ -3229,6 +3298,10 @@ async function getStoriesForViewer(viewerId) {
 async function storyEnvelopeForViewer(story, viewerId) {
   const encryptedKey = story?.encryptedKeys?.[viewerId];
   if (!encryptedKey) return null;
+  const allFeedback = await getStoryFeedback(story.storyId);
+  const feedback = story.ownerId === viewerId
+    ? allFeedback
+    : allFeedback.filter((record) => record.viewerId === viewerId);
   return {
     storyId: story.storyId,
     ownerId: story.ownerId,
@@ -3238,43 +3311,144 @@ async function storyEnvelopeForViewer(story, viewerId) {
     publicKeyJwk: await getPublicKey(story.ownerId),
     encryptedContent: story.encryptedContent,
     encryptedKey,
-    viewers: story.ownerId === viewerId ? await getStoryViews(story.storyId) : []
+    viewers: story.ownerId === viewerId ? await getStoryViews(story.storyId) : [],
+    feedback: await Promise.all(feedback.map((record) => storyFeedbackEnvelope(record, story))),
+    shareCount: story.ownerId === viewerId ? await getStoryShares(story.storyId) : 0
   };
 }
 
-async function addStoryView(storyId, viewerId) {
-  if (!memoryStoryViews.has(storyId)) memoryStoryViews.set(storyId, new Set());
-  memoryStoryViews.get(storyId).add(viewerId);
+async function addStoryView(storyId, viewerId, profile = {}) {
+  if (!memoryStoryViews.has(storyId) || !(memoryStoryViews.get(storyId) instanceof Map)) memoryStoryViews.set(storyId, new Map());
+  const existing = memoryStoryViews.get(storyId).get(viewerId);
+  const record = existing
+    ? { ...existing, profile: Object.keys(profile || {}).length ? profile : existing.profile || {} }
+    : { viewerId, viewedAt: new Date().toISOString(), profile };
+  memoryStoryViews.get(storyId).set(viewerId, record);
   if (redis) {
-    await redis.sadd(storyViewsKey(storyId), viewerId);
-    await redis.expire(storyViewsKey(storyId), STORY_TTL_SECONDS + 300);
+    await redis.hset(storyViewDetailsKey(storyId), viewerId, JSON.stringify(record));
+    await redis.expire(storyViewDetailsKey(storyId), STORY_TTL_SECONDS + 300);
   }
   if (upstashRestEnabled) await upstashPipeline([
-    ["SADD", storyViewsKey(storyId), viewerId],
-    ["EXPIRE", storyViewsKey(storyId), STORY_TTL_SECONDS + 300]
+    ["HSET", storyViewDetailsKey(storyId), viewerId, JSON.stringify(record)],
+    ["EXPIRE", storyViewDetailsKey(storyId), STORY_TTL_SECONDS + 300]
   ]);
+  return record;
 }
 
 async function getStoryViews(storyId) {
-  if (redis) return redis.smembers(storyViewsKey(storyId));
-  if (upstashRestEnabled) return await upstashCommand(["SMEMBERS", storyViewsKey(storyId)]) || [];
-  return [...(memoryStoryViews.get(storyId) || [])];
+  let values = [];
+  if (redis) values = Object.values(await redis.hgetall(storyViewDetailsKey(storyId)) || {});
+  if (upstashRestEnabled) {
+    const raw = await upstashCommand(["HGETALL", storyViewDetailsKey(storyId)]) || [];
+    values = Array.isArray(raw) ? raw.filter((_, index) => index % 2 === 1) : Object.values(raw);
+  }
+  if (!redis && !upstashRestEnabled) return [...(memoryStoryViews.get(storyId)?.values?.() || [])];
+  return values.map(safeJsonParse).filter((record) => record?.viewerId && record?.viewedAt);
+}
+
+async function setStoryReaction(record) {
+  if (!memoryStoryReactions.has(record.storyId)) memoryStoryReactions.set(record.storyId, new Map());
+  if (record.reaction === "none") memoryStoryReactions.get(record.storyId).delete(record.viewerId);
+  else memoryStoryReactions.get(record.storyId).set(record.viewerId, record);
+  if (redis) {
+    if (record.reaction === "none") await redis.hdel(storyReactionsKey(record.storyId), record.viewerId);
+    else await redis.hset(storyReactionsKey(record.storyId), record.viewerId, JSON.stringify(record));
+    await redis.expire(storyReactionsKey(record.storyId), STORY_TTL_SECONDS + 300);
+  }
+  if (upstashRestEnabled) await upstashPipeline([
+    record.reaction === "none"
+      ? ["HDEL", storyReactionsKey(record.storyId), record.viewerId]
+      : ["HSET", storyReactionsKey(record.storyId), record.viewerId, JSON.stringify(record)],
+    ["EXPIRE", storyReactionsKey(record.storyId), STORY_TTL_SECONDS + 300]
+  ]);
+}
+
+async function appendStoryComment(record) {
+  if (!memoryStoryComments.has(record.storyId)) memoryStoryComments.set(record.storyId, []);
+  const comments = memoryStoryComments.get(record.storyId);
+  comments.push(record);
+  if (comments.length > 200) comments.splice(0, comments.length - 200);
+  if (redis) {
+    await redis.rpush(storyCommentsKey(record.storyId), JSON.stringify(record));
+    await redis.ltrim(storyCommentsKey(record.storyId), -200, -1);
+    await redis.expire(storyCommentsKey(record.storyId), STORY_TTL_SECONDS + 300);
+  }
+  if (upstashRestEnabled) await upstashPipeline([
+    ["RPUSH", storyCommentsKey(record.storyId), JSON.stringify(record)],
+    ["LTRIM", storyCommentsKey(record.storyId), -200, -1],
+    ["EXPIRE", storyCommentsKey(record.storyId), STORY_TTL_SECONDS + 300]
+  ]);
+}
+
+async function getStoryFeedback(storyId) {
+  let reactions = [];
+  let comments = [];
+  if (!redis && !upstashRestEnabled) {
+    reactions = [...(memoryStoryReactions.get(storyId)?.values?.() || [])];
+    comments = [...(memoryStoryComments.get(storyId) || [])];
+  }
+  if (redis) {
+    reactions = Object.values(await redis.hgetall(storyReactionsKey(storyId)) || {}).map(safeJsonParse).filter(Boolean);
+    comments = (await redis.lrange(storyCommentsKey(storyId), 0, -1)).map(safeJsonParse).filter(Boolean);
+  }
+  if (upstashRestEnabled) {
+    const rawReactions = await upstashCommand(["HGETALL", storyReactionsKey(storyId)]) || [];
+    const reactionValues = Array.isArray(rawReactions) ? rawReactions.filter((_, index) => index % 2 === 1) : Object.values(rawReactions);
+    reactions = reactionValues.map(safeJsonParse).filter(Boolean);
+    comments = (await upstashCommand(["LRANGE", storyCommentsKey(storyId), 0, -1]) || []).map(safeJsonParse).filter(Boolean);
+  }
+  return [...reactions, ...comments].sort((left, right) => Date.parse(left.createdAt) - Date.parse(right.createdAt));
+}
+
+async function storyFeedbackEnvelope(record, story) {
+  return {
+    ...record,
+    ownerPublicKeyJwk: await getPublicKey(story.ownerId),
+    viewerPublicKeyJwk: record.viewerPublicKeyJwk || await getPublicKey(record.viewerId)
+  };
+}
+
+async function addStoryShares(storyId, count) {
+  const next = Number(memoryStoryShares.get(storyId) || 0) + count;
+  memoryStoryShares.set(storyId, next);
+  if (redis) {
+    const result = Number(await redis.incrby(storySharesKey(storyId), count));
+    await redis.expire(storySharesKey(storyId), STORY_TTL_SECONDS + 300);
+    return result;
+  }
+  if (upstashRestEnabled) {
+    const [increment] = await upstashPipeline([
+      ["INCRBY", storySharesKey(storyId), count],
+      ["EXPIRE", storySharesKey(storyId), STORY_TTL_SECONDS + 300]
+    ]);
+    return Number(increment || next);
+  }
+  return next;
+}
+
+async function getStoryShares(storyId) {
+  if (redis) return Number(await redis.get(storySharesKey(storyId)) || 0);
+  if (upstashRestEnabled) return Number(await upstashCommand(["GET", storySharesKey(storyId)]) || 0);
+  return Number(memoryStoryShares.get(storyId) || 0);
 }
 
 async function removeStoryRecord(story) {
   memoryStories.delete(story.storyId);
   memoryStoryViews.delete(story.storyId);
+  memoryStoryReactions.delete(story.storyId);
+  memoryStoryComments.delete(story.storyId);
+  memoryStoryShares.delete(story.storyId);
   const viewerIds = Object.keys(story.encryptedKeys || {});
   for (const viewerId of viewerIds) memoryStoryIndexes.get(viewerId)?.delete(story.storyId);
   if (redis) {
     const pipeline = redis.multi();
-    pipeline.del(storyKey(story.storyId), storyViewsKey(story.storyId));
+    pipeline.del(storyKey(story.storyId), storyViewsKey(story.storyId), storyViewDetailsKey(story.storyId), storyReactionsKey(story.storyId), storyCommentsKey(story.storyId), storySharesKey(story.storyId));
     for (const viewerId of viewerIds) pipeline.zrem(storyIndexKey(viewerId), story.storyId);
     pipeline.zrem(storyOwnerIndexKey(story.ownerId), story.storyId);
     await pipeline.exec();
   }
   if (upstashRestEnabled) {
-    const commands = [["DEL", storyKey(story.storyId), storyViewsKey(story.storyId)]];
+    const commands = [["DEL", storyKey(story.storyId), storyViewsKey(story.storyId), storyViewDetailsKey(story.storyId), storyReactionsKey(story.storyId), storyCommentsKey(story.storyId), storySharesKey(story.storyId)]];
     for (const viewerId of viewerIds) commands.push(["ZREM", storyIndexKey(viewerId), story.storyId]);
     commands.push(["ZREM", storyOwnerIndexKey(story.ownerId), story.storyId]);
     await upstashPipeline(commands);
@@ -4883,6 +5057,30 @@ function storyOwnerIndexKey(peerId) {
 
 function storyViewsKey(storyId) {
   return `bypassium:story-views:${storyId}`;
+}
+
+function storyViewDetailsKey(storyId) {
+  return `bypassium:story-view-details:${storyId}`;
+}
+
+function storyReactionsKey(storyId) {
+  return `bypassium:story-reactions:${storyId}`;
+}
+
+function storyCommentsKey(storyId) {
+  return `bypassium:story-comments:${storyId}`;
+}
+
+function storySharesKey(storyId) {
+  return `bypassium:story-shares:${storyId}`;
+}
+
+function safeJsonParse(value) {
+  try {
+    return typeof value === "string" ? JSON.parse(value) : value;
+  } catch {
+    return null;
+  }
 }
 
 function validEncryptedPayload(value) {
