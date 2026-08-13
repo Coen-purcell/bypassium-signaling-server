@@ -20,9 +20,14 @@ const MAX_UPSTASH_RPUSH_CHARS = 6_000_000;
 const MAX_UPSTASH_COMMAND_CHARS = 8_500_000;
 const MAX_QUEUED_ENVELOPE_CHARS = 7_500_000;
 const MAX_WEBSOCKET_PAYLOAD_CHARS = 8_500_000;
+const MAX_HISTORY_BATCH_CHARS = 240_000;
+const OFFLINE_DELIVERY_BATCH_SIZE = 6;
+const BACKGROUND_DELIVERY_YIELD_MS = 8;
 const MAX_CALL_SIGNAL_CHARS = 64_000;
 const MAX_GROUP_CALL_MEMBERS = 5;
 const GROUP_CALL_TTL_MS = 4 * 60 * 60 * 1000;
+const STORY_TTL_SECONDS = 24 * 60 * 60;
+const MAX_STORY_RECIPIENTS = 250;
 const REDIS_URL = process.env.REDIS_URL || process.env.RENDER_REDIS_URL || process.env.KEY_VALUE_URL || "";
 const UPSTASH_REST_URL = process.env.UPSTASH_REDIS_REST_URL || "";
 const UPSTASH_REST_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN || "";
@@ -43,6 +48,9 @@ const memoryGroups = new Map();
 const memoryContactLists = new Map();
 const memoryOfflineMessages = new Map();
 const memoryHistoryMessages = new Map();
+const memoryStories = new Map();
+const memoryStoryIndexes = new Map();
+const memoryStoryViews = new Map();
 const pendingQueuedEnvelopes = new Map();
 const cancelledQueuedEnvelopes = new Set();
 const groupCallRooms = new Map();
@@ -153,6 +161,10 @@ wss.on("connection", (socket, request) => {
       if (message.type === "call-signal") await relayCallSignal(socket, message);
       if (message.type === "history-sync") await syncHistoryMessages(socket, message);
       if (message.type === "history-backfill") await backfillHistoryMessages(socket, message);
+      if (message.type === "story-publish") await publishStory(socket, message);
+      if (message.type === "story-sync") await syncStories(socket);
+      if (message.type === "story-view") await viewStory(socket, message);
+      if (message.type === "story-delete") await deleteStory(socket, message);
       if (message.type === "sync") await syncClient(socket);
     } catch (error) {
       console.error("Message handler failed:", error.message);
@@ -1110,6 +1122,7 @@ async function registerClient(socket, message) {
       audioCalls: true,
       groupCalls: true,
       maxGroupCallMembers: MAX_GROUP_CALL_MEMBERS,
+      encryptedStories: true,
       accounts: true,
       contactSync: true
     },
@@ -1216,6 +1229,104 @@ async function backfillHistoryMessages(socket, message = {}) {
   });
 }
 
+// Stores one encrypted story payload plus a separately wrapped content key for
+// each approved contact. The server can route the story but cannot decrypt it.
+async function publishStory(socket, message = {}) {
+  const ownerId = getRegisteredSender(socket);
+  if (!ownerId || !(await enforceAccountAction(socket, ownerId, "send"))) return;
+  if (!allowUserAction(socket, "story")) return;
+  const storyId = String(message.storyId || "").trim();
+  const encryptedContent = message.encryptedContent;
+  if (!/^[a-zA-Z0-9-]{12,80}$/.test(storyId) || !validEncryptedPayload(encryptedContent)) {
+    send(socket, { type: "story-publish-result", requestId: String(message.requestId || ""), ok: false, message: "That story could not be prepared." });
+    return;
+  }
+  const commandSize = JSON.stringify(message).length;
+  if (commandSize > MAX_WEBSOCKET_PAYLOAD_CHARS - 200_000) {
+    send(socket, { type: "story-publish-result", requestId: String(message.requestId || ""), ok: false, message: "That story is too large to upload." });
+    return;
+  }
+  const allowedContacts = new Set((await getSyncedContacts(ownerId))
+    .filter((contact) => contact.accepted !== false && !contact.blocked)
+    .map((contact) => contact.id));
+  allowedContacts.add(ownerId);
+  const encryptedKeys = {};
+  for (const entry of (Array.isArray(message.keys) ? message.keys : []).slice(0, MAX_STORY_RECIPIENTS + 1)) {
+    const peerId = cleanPeerId(entry?.to);
+    if (!peerId || !allowedContacts.has(peerId) || !validEncryptedPayload(entry?.encryptedKey)) continue;
+    encryptedKeys[peerId] = entry.encryptedKey;
+  }
+  if (!encryptedKeys[ownerId]) {
+    send(socket, { type: "story-publish-result", requestId: String(message.requestId || ""), ok: false, message: "The story could not be encrypted for this account." });
+    return;
+  }
+  const createdAtMs = Date.now();
+  const expiresAtMs = createdAtMs + STORY_TTL_SECONDS * 1000;
+  const record = {
+    storyId,
+    ownerId,
+    createdAt: new Date(createdAtMs).toISOString(),
+    expiresAt: new Date(expiresAtMs).toISOString(),
+    profile: sanitizeProfile(message.profile || localProfile(ownerId)),
+    encryptedContent,
+    encryptedKeys
+  };
+  await setStoryRecord(record);
+  for (const viewerId of Object.keys(encryptedKeys)) {
+    const envelope = await storyEnvelopeForViewer(record, viewerId);
+    if (envelope) sendToClient(viewerId, { type: "story-updated", story: envelope });
+  }
+  send(socket, {
+    type: "story-publish-result",
+    requestId: String(message.requestId || ""),
+    ok: true,
+    storyId,
+    expiresAt: record.expiresAt,
+    recipientCount: Math.max(0, Object.keys(encryptedKeys).length - 1)
+  });
+}
+
+async function syncStories(socket) {
+  const viewerId = getRegisteredSender(socket);
+  if (!viewerId) return;
+  const stories = await getStoriesForViewer(viewerId);
+  for (const story of stories) {
+    const envelope = await storyEnvelopeForViewer(story, viewerId);
+    if (envelope) send(socket, { type: "story-items", stories: [envelope] });
+    await yieldToSocketTraffic();
+  }
+  send(socket, { type: "story-sync-complete", count: stories.length });
+}
+
+async function viewStory(socket, message = {}) {
+  const viewerId = getRegisteredSender(socket);
+  const storyId = String(message.storyId || "").trim();
+  if (!viewerId || !storyId) return;
+  const story = await getStoryRecord(storyId);
+  if (!story || !story.encryptedKeys?.[viewerId] || story.ownerId === viewerId) return;
+  await addStoryView(storyId, viewerId);
+  sendToClient(story.ownerId, {
+    type: "story-viewed",
+    storyId,
+    viewerId,
+    viewedAt: new Date().toISOString()
+  });
+}
+
+async function deleteStory(socket, message = {}) {
+  const ownerId = getRegisteredSender(socket);
+  const storyId = String(message.storyId || "").trim();
+  const story = ownerId && storyId ? await getStoryRecord(storyId) : null;
+  if (!story || story.ownerId !== ownerId) {
+    send(socket, { type: "story-delete-result", requestId: String(message.requestId || ""), ok: false, message: "Story not found." });
+    return;
+  }
+  const viewers = Object.keys(story.encryptedKeys || {});
+  await removeStoryRecord(story);
+  for (const viewerId of viewers) sendToClient(viewerId, { type: "story-deleted", storyId, ownerId });
+  send(socket, { type: "story-delete-result", requestId: String(message.requestId || ""), ok: true, storyId });
+}
+
 // Removes a browser session from the online directory without deleting its persisted public key.
 function unregisterClient(socket) {
   if (!socket.bypassiumId) return;
@@ -1236,17 +1347,28 @@ async function sendContactStatuses(socket, contacts = []) {
   const statuses = {};
   const knownKeys = {};
   const profiles = {};
+  const watcherId = getRegisteredSender(socket);
   socket.watchedContacts = new Set();
+  const contactIds = [];
   for (const rawContactId of contacts) {
     const contactId = String(rawContactId || "").trim();
-    if (!/^\d{6}$/.test(contactId)) continue;
+    if (!/^\d{6}$/.test(contactId) || socket.watchedContacts.has(contactId)) continue;
     socket.watchedContacts.add(contactId);
-    statuses[contactId] = clients.has(contactId) ? "online" : "offline";
+    contactIds.push(contactId);
+  }
+  await Promise.all(contactIds.map(async (contactId) => {
+    let canSeePresence = true;
+    if (watcherId && watcherId !== contactId) {
+      const targetContacts = await getSyncedContacts(contactId);
+      const watcher = targetContacts.find((contact) => contact.id === watcherId);
+      canSeePresence = watcher?.sharePresence !== false;
+    }
+    statuses[contactId] = canSeePresence && clients.has(contactId) ? "online" : "offline";
     const publicKeyJwk = await getPublicKey(contactId);
     if (publicKeyJwk) knownKeys[contactId] = publicKeyJwk;
     const profile = await getProfile(contactId);
     if (profile) profiles[contactId] = profile;
-  }
+  }));
   send(socket, { type: "contact-statuses", statuses, publicKeys: knownKeys, profiles });
 }
 
@@ -1671,6 +1793,25 @@ async function relayDirectMessage(socket, message) {
     senderEncrypted: message.senderEncrypted
   }).catch((error) => console.error("Direct history write failed:", error.message));
   const targets = clients.get(targetId);
+  if (!targets?.size) {
+    queueForDelivery(targetId, envelope);
+    send(socket, {
+      type: "message-status",
+      messageId: envelope.messageId,
+      peerId: targetId,
+      status: "queued",
+      updatedAt: new Date().toISOString()
+    });
+    send(socket, {
+      type: "message-queued",
+      messageId: envelope.messageId,
+      peerId: targetId,
+      sentAt: envelope.sentAt,
+      persistent: storageMode() !== "memory"
+    });
+    return;
+  }
+
   send(socket, {
     type: "message-status",
     messageId: envelope.messageId,
@@ -1678,12 +1819,6 @@ async function relayDirectMessage(socket, message) {
     status: "sent",
     updatedAt: new Date().toISOString()
   });
-
-  if (!targets?.size) {
-    queueForDelivery(targetId, envelope);
-    send(socket, { type: "message-queued", peerId: targetId, sentAt: envelope.sentAt, persistent: storageMode() !== "memory" });
-    return;
-  }
 
   for (const target of targets) {
     if (target !== socket && target.readyState === 1) send(target, envelope);
@@ -2225,7 +2360,9 @@ async function sendQuickAddResults(socket, message = {}) {
       profilePicture: profile.profilePicture,
       badge: profile.badge || "",
       joinedAt: profile.joinedAt || profile.updatedAt || "",
-      status: clients.has(id) ? "online" : "offline"
+      status: clients.has(id) ? "online" : "offline",
+      statusText: activeProfileStatus(profile).text,
+      statusExpiresAt: activeProfileStatus(profile).expiresAt
     });
   }
   const results = matches.slice(offset, offset + limit);
@@ -2562,7 +2699,11 @@ async function deliverOfflineMessages(socket) {
     }
     fresh.push(message);
   }
-  for (const message of fresh) send(socket, message);
+  const newestFirst = fresh.sort((first, second) => queuedEnvelopeTime(second) - queuedEnvelopeTime(first));
+  for (let index = 0; index < newestFirst.length; index += OFFLINE_DELIVERY_BATCH_SIZE) {
+    for (const message of newestFirst.slice(index, index + OFFLINE_DELIVERY_BATCH_SIZE)) send(socket, message);
+    if (index + OFFLINE_DELIVERY_BATCH_SIZE < newestFirst.length) await yieldToSocketTraffic(BACKGROUND_DELIVERY_YIELD_MS);
+  }
   for (const id of expiredIds) await removeOfflineMessage(socket.bypassiumId, id);
   if (legacyQueue.length) await deleteLegacyInbox(socket.bypassiumId);
 }
@@ -2808,7 +2949,7 @@ async function deliverHistoryMessages(socket, limit = defaultHistorySyncLimit())
   const peerId = socket.bypassiumId;
   if (!peerId) return;
   const history = await getHistoryMessages(peerId, limit);
-  if (history.length) sendHistoryItems(socket, history);
+  if (history.length) await sendHistoryItems(socket, history);
   send(socket, {
     type: "history-sync-complete",
     count: history.length,
@@ -2816,19 +2957,29 @@ async function deliverHistoryMessages(socket, limit = defaultHistorySyncLimit())
   });
 }
 
-function sendHistoryItems(socket, history) {
+async function sendHistoryItems(socket, history) {
   let batch = [];
   for (const item of history) {
     const candidate = [...batch, item];
     const size = JSON.stringify({ type: "history-items", items: candidate }).length;
-    if (batch.length && size > MAX_WEBSOCKET_PAYLOAD_CHARS - 300_000) {
+    if (batch.length && size > MAX_HISTORY_BATCH_CHARS) {
       send(socket, { type: "history-items", items: batch });
+      await yieldToSocketTraffic();
       batch = [item];
     } else {
       batch = candidate;
     }
   }
   if (batch.length) send(socket, { type: "history-items", items: batch });
+}
+
+function queuedEnvelopeTime(message = {}) {
+  const value = Date.parse(message.sentAt || message.queuedAt || "");
+  return Number.isFinite(value) ? value : 0;
+}
+
+function yieldToSocketTraffic(delay = 0) {
+  return new Promise((resolve) => setTimeout(resolve, delay));
 }
 
 async function getHistoryMessages(peerId, limit = 500) {
@@ -3012,6 +3163,138 @@ async function removeSyncedContacts(peerId) {
   if (upstashRestEnabled) await upstashCommand(["DEL", contactListKey(peerId)]);
 }
 
+async function setStoryRecord(record) {
+  memoryStories.set(record.storyId, record);
+  const expiresAtMs = Date.parse(record.expiresAt);
+  for (const viewerId of Object.keys(record.encryptedKeys || {})) {
+    if (!memoryStoryIndexes.has(viewerId)) memoryStoryIndexes.set(viewerId, new Set());
+    memoryStoryIndexes.get(viewerId).add(record.storyId);
+  }
+  const serialized = JSON.stringify(record);
+  if (redis) {
+    const pipeline = redis.multi();
+    pipeline.set(storyKey(record.storyId), serialized, "EX", STORY_TTL_SECONDS);
+    for (const viewerId of Object.keys(record.encryptedKeys || {})) {
+      pipeline.zadd(storyIndexKey(viewerId), expiresAtMs, record.storyId);
+      pipeline.expire(storyIndexKey(viewerId), STORY_TTL_SECONDS + 300);
+    }
+    pipeline.zadd(storyOwnerIndexKey(record.ownerId), expiresAtMs, record.storyId);
+    pipeline.expire(storyOwnerIndexKey(record.ownerId), STORY_TTL_SECONDS + 300);
+    await pipeline.exec();
+  }
+  if (upstashRestEnabled) {
+    const commands = [["SET", storyKey(record.storyId), serialized, "EX", STORY_TTL_SECONDS]];
+    for (const viewerId of Object.keys(record.encryptedKeys || {})) {
+      commands.push(["ZADD", storyIndexKey(viewerId), expiresAtMs, record.storyId]);
+      commands.push(["EXPIRE", storyIndexKey(viewerId), STORY_TTL_SECONDS + 300]);
+    }
+    commands.push(["ZADD", storyOwnerIndexKey(record.ownerId), expiresAtMs, record.storyId]);
+    commands.push(["EXPIRE", storyOwnerIndexKey(record.ownerId), STORY_TTL_SECONDS + 300]);
+    await upstashPipeline(commands);
+  }
+}
+
+async function getStoryRecord(storyId) {
+  const cached = memoryStories.get(storyId);
+  if (cached && Date.parse(cached.expiresAt) > Date.now()) return cached;
+  let stored = null;
+  if (redis) stored = await redis.get(storyKey(storyId));
+  if (upstashRestEnabled) stored = await upstashCommand(["GET", storyKey(storyId)]);
+  if (!stored) return null;
+  const story = JSON.parse(stored);
+  if (Date.parse(story.expiresAt) <= Date.now()) return null;
+  memoryStories.set(storyId, story);
+  return story;
+}
+
+async function getStoriesForViewer(viewerId) {
+  let ids = [];
+  if (!redis && !upstashRestEnabled) ids = [...(memoryStoryIndexes.get(viewerId) || [])];
+  if (redis) {
+    await redis.zremrangebyscore(storyIndexKey(viewerId), 0, Date.now());
+    ids = await redis.zrangebyscore(storyIndexKey(viewerId), Date.now(), "+inf");
+  }
+  if (upstashRestEnabled) {
+    await upstashCommand(["ZREMRANGEBYSCORE", storyIndexKey(viewerId), 0, Date.now()]);
+    ids = await upstashCommand(["ZRANGEBYSCORE", storyIndexKey(viewerId), Date.now(), "+inf"]);
+  }
+  const stories = [];
+  for (const storyId of [...new Set(ids)].slice(-100)) {
+    const story = await getStoryRecord(storyId);
+    if (story?.encryptedKeys?.[viewerId]) stories.push(story);
+  }
+  return stories.sort((first, second) => Date.parse(first.createdAt) - Date.parse(second.createdAt));
+}
+
+async function storyEnvelopeForViewer(story, viewerId) {
+  const encryptedKey = story?.encryptedKeys?.[viewerId];
+  if (!encryptedKey) return null;
+  return {
+    storyId: story.storyId,
+    ownerId: story.ownerId,
+    createdAt: story.createdAt,
+    expiresAt: story.expiresAt,
+    profile: story.profile,
+    publicKeyJwk: await getPublicKey(story.ownerId),
+    encryptedContent: story.encryptedContent,
+    encryptedKey,
+    viewers: story.ownerId === viewerId ? await getStoryViews(story.storyId) : []
+  };
+}
+
+async function addStoryView(storyId, viewerId) {
+  if (!memoryStoryViews.has(storyId)) memoryStoryViews.set(storyId, new Set());
+  memoryStoryViews.get(storyId).add(viewerId);
+  if (redis) {
+    await redis.sadd(storyViewsKey(storyId), viewerId);
+    await redis.expire(storyViewsKey(storyId), STORY_TTL_SECONDS + 300);
+  }
+  if (upstashRestEnabled) await upstashPipeline([
+    ["SADD", storyViewsKey(storyId), viewerId],
+    ["EXPIRE", storyViewsKey(storyId), STORY_TTL_SECONDS + 300]
+  ]);
+}
+
+async function getStoryViews(storyId) {
+  if (redis) return redis.smembers(storyViewsKey(storyId));
+  if (upstashRestEnabled) return await upstashCommand(["SMEMBERS", storyViewsKey(storyId)]) || [];
+  return [...(memoryStoryViews.get(storyId) || [])];
+}
+
+async function removeStoryRecord(story) {
+  memoryStories.delete(story.storyId);
+  memoryStoryViews.delete(story.storyId);
+  const viewerIds = Object.keys(story.encryptedKeys || {});
+  for (const viewerId of viewerIds) memoryStoryIndexes.get(viewerId)?.delete(story.storyId);
+  if (redis) {
+    const pipeline = redis.multi();
+    pipeline.del(storyKey(story.storyId), storyViewsKey(story.storyId));
+    for (const viewerId of viewerIds) pipeline.zrem(storyIndexKey(viewerId), story.storyId);
+    pipeline.zrem(storyOwnerIndexKey(story.ownerId), story.storyId);
+    await pipeline.exec();
+  }
+  if (upstashRestEnabled) {
+    const commands = [["DEL", storyKey(story.storyId), storyViewsKey(story.storyId)]];
+    for (const viewerId of viewerIds) commands.push(["ZREM", storyIndexKey(viewerId), story.storyId]);
+    commands.push(["ZREM", storyOwnerIndexKey(story.ownerId), story.storyId]);
+    await upstashPipeline(commands);
+  }
+}
+
+async function deleteStoriesOwnedBy(peerId) {
+  let ids = [...memoryStories.values()]
+    .filter((story) => story.ownerId === peerId)
+    .map((story) => story.storyId);
+  if (redis) ids = await redis.zrange(storyOwnerIndexKey(peerId), 0, -1);
+  if (upstashRestEnabled) ids = await upstashCommand(["ZRANGE", storyOwnerIndexKey(peerId), 0, -1]) || [];
+  for (const storyId of new Set(ids)) {
+    const story = await getStoryRecord(storyId);
+    if (story) await removeStoryRecord(story);
+  }
+  if (redis) await redis.del(storyOwnerIndexKey(peerId));
+  if (upstashRestEnabled) await upstashCommand(["DEL", storyOwnerIndexKey(peerId)]);
+}
+
 async function deleteAccountData(peerId) {
   await Promise.all([
     removeAccount(peerId),
@@ -3021,6 +3304,7 @@ async function deleteAccountData(peerId) {
     removeSyncedContacts(peerId),
     deleteAllQueuedMessages(peerId),
     deleteAllHistoryMessages(peerId),
+    deleteStoriesOwnedBy(peerId),
     removeAccountIndex(peerId)
   ]);
 }
@@ -3609,7 +3893,12 @@ async function getAccountRestriction(peerId) {
   let stored = null;
   if (redis) stored = await redis.get(restrictionKey(clean));
   if (upstashRestEnabled) stored = await upstashCommand(["GET", restrictionKey(clean)]);
-  if (!stored) return {};
+  // Cache the unrestricted case too. Without this negative cache, every normal
+  // message paid for a remote Redis/Upstash GET before it could be accepted.
+  if (!stored) {
+    memoryRestrictions.set(clean, {});
+    return {};
+  }
   const restriction = normalizeRestriction(JSON.parse(stored));
   memoryRestrictions.set(clean, restriction);
   return restriction;
@@ -3928,6 +4217,11 @@ function sanitizeSyncedContact(contact = {}) {
     accepted: contact.accepted !== false,
     blocked: Boolean(contact.blocked),
     notifications: contact.notifications !== false,
+    notificationMode: ["all", "mentions", "off"].includes(contact.notificationMode) ? contact.notificationMode : "all",
+    mutedUntil: normalizeAdminDate(contact.mutedUntil),
+    shareReadReceipts: contact.shareReadReceipts !== false,
+    shareTyping: contact.shareTyping !== false,
+    sharePresence: contact.sharePresence !== false,
     pinned: Boolean(contact.pinned),
     chatBackground: sanitizeHexColor(contact.chatBackground),
     updatedAt: String(contact.updatedAt || contact.createdAt || new Date().toISOString()).slice(0, 40)
@@ -4158,16 +4452,29 @@ function storageMode() {
 }
 
 function sanitizeProfile(profile = {}, stampUpdate = false) {
+  const status = activeProfileStatus(profile);
   const cleanProfile = {
     displayName: String(profile?.displayName || "").slice(0, 80),
     profilePicture: sanitizeProfilePicture(profile?.profilePicture),
     badge: sanitizeProfileBadge(profile?.badge),
     joinedAt: String(profile?.joinedAt || "").slice(0, 40),
-    quickAddVisible: profile?.quickAddVisible !== false
+    quickAddVisible: profile?.quickAddVisible !== false,
+    statusText: status.text,
+    statusExpiresAt: status.expiresAt
   };
   if (stampUpdate) cleanProfile.updatedAt = new Date().toISOString();
   else if (profile?.updatedAt) cleanProfile.updatedAt = String(profile.updatedAt).slice(0, 40);
   return cleanProfile;
+}
+
+function activeProfileStatus(profile = {}) {
+  const text = String(profile?.statusText || "").replace(/\s+/g, " ").trim().slice(0, 80);
+  if (!text) return { text: "", expiresAt: "" };
+  const rawExpiry = String(profile?.statusExpiresAt || "").trim();
+  if (!rawExpiry) return { text, expiresAt: "" };
+  const timestamp = Date.parse(rawExpiry);
+  if (!Number.isFinite(timestamp) || timestamp <= Date.now()) return { text: "", expiresAt: "" };
+  return { text, expiresAt: new Date(timestamp).toISOString() };
 }
 
 function sanitizeProfileBadge(value = "") {
@@ -4435,6 +4742,7 @@ function enforceSocketRateLimit(socket, action = "general") {
     message: 120,
     "group-message": 120,
     "group-manage": 40,
+    story: 30,
     "directory-search": 80,
     "account-recovery": 50,
     general: 90
@@ -4559,6 +4867,22 @@ function historyIndexKey(peerId) {
 
 function historyMessageKey(peerId, historyId) {
   return `bypassium:history:${peerId}:${historyId}`;
+}
+
+function storyKey(storyId) {
+  return `bypassium:story:${storyId}`;
+}
+
+function storyIndexKey(peerId) {
+  return `bypassium:stories:${peerId}`;
+}
+
+function storyOwnerIndexKey(peerId) {
+  return `bypassium:story-owner:${peerId}`;
+}
+
+function storyViewsKey(storyId) {
+  return `bypassium:story-views:${storyId}`;
 }
 
 function validEncryptedPayload(value) {
