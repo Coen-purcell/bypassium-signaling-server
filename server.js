@@ -27,6 +27,7 @@ const MAX_CALL_SIGNAL_CHARS = 64_000;
 const MAX_GROUP_CALL_MEMBERS = 5;
 const GROUP_CALL_TTL_MS = 4 * 60 * 60 * 1000;
 const STORY_TTL_SECONDS = 24 * 60 * 60;
+const REEL_TTL_SECONDS = Math.max(7 * 24 * 60 * 60, Number(process.env.REEL_TTL_SECONDS || 365 * 24 * 60 * 60));
 const MAX_STORY_RECIPIENTS = 250;
 const REDIS_URL = process.env.REDIS_URL || process.env.RENDER_REDIS_URL || process.env.KEY_VALUE_URL || "";
 const UPSTASH_REST_URL = process.env.UPSTASH_REDIS_REST_URL || "";
@@ -1129,6 +1130,7 @@ async function registerClient(socket, message) {
       maxGroupCallMembers: MAX_GROUP_CALL_MEMBERS,
       encryptedStories: true,
       encryptedStoryFeedback: true,
+      encryptedReels: true,
       accounts: true,
       contactSync: true
     },
@@ -1267,10 +1269,12 @@ async function publishStory(socket, message = {}) {
     return;
   }
   const createdAtMs = Date.now();
-  const expiresAtMs = createdAtMs + STORY_TTL_SECONDS * 1000;
+  const contentKind = message.contentKind === "reel" ? "reel" : "story";
+  const expiresAtMs = createdAtMs + contentRecordTtlSeconds({ contentKind }) * 1000;
   const record = {
     storyId,
     ownerId,
+    contentKind,
     createdAt: new Date(createdAtMs).toISOString(),
     expiresAt: new Date(expiresAtMs).toISOString(),
     profile: sanitizeProfile(message.profile || localProfile(ownerId)),
@@ -1311,7 +1315,7 @@ async function viewStory(socket, message = {}) {
   const story = await getStoryRecord(storyId);
   if (!story || !story.encryptedKeys?.[viewerId] || story.ownerId === viewerId) return;
   const viewerProfile = sanitizeProfile(await getProfile(viewerId) || localProfile(viewerId));
-  const view = await addStoryView(storyId, viewerId, viewerProfile);
+  const view = await addStoryView(storyId, viewerId, viewerProfile, story);
   sendToClient(story.ownerId, {
     type: "story-viewed",
     storyId,
@@ -1328,7 +1332,7 @@ async function submitStoryFeedback(socket, message = {}) {
   if (!viewerId || !(await enforceAccountAction(socket, viewerId, "send")) || !allowUserAction(socket, "story")) return;
   const storyId = String(message.storyId || "").trim();
   const story = storyId ? await getStoryRecord(storyId) : null;
-  if (!story || story.ownerId === viewerId || !story.encryptedKeys?.[viewerId]) {
+  if (!story || !story.encryptedKeys?.[viewerId]) {
     send(socket, { type: "story-feedback-result", requestId: String(message.requestId || ""), ok: false, message: "That story is no longer available." });
     return;
   }
@@ -1344,22 +1348,33 @@ async function submitStoryFeedback(socket, message = {}) {
     send(socket, { type: "story-feedback-result", requestId: String(message.requestId || ""), ok: false, message: "Choose Like or Dislike." });
     return;
   }
+  if (kind === "reaction" && story.ownerId === viewerId) {
+    send(socket, { type: "story-feedback-result", requestId: String(message.requestId || ""), ok: false, message: "You cannot react to your own story." });
+    return;
+  }
   const record = {
     feedbackId,
     storyId,
     ownerId: story.ownerId,
     viewerId,
     kind,
+    encryptionMode: kind === "comment" && message.encryptionMode === "story" ? "story" : "pair",
     reaction,
     encrypted,
     createdAt: new Date().toISOString(),
     profile: sanitizeProfile(await getProfile(viewerId) || localProfile(viewerId)),
     viewerPublicKeyJwk: socket.publicKeyJwk
   };
-  if (kind === "reaction") await setStoryReaction(record);
-  else await appendStoryComment(record);
+  if (kind === "reaction") await setStoryReaction(record, story);
+  else await appendStoryComment(record, story);
   const envelope = await storyFeedbackEnvelope(record, story);
-  sendToClient(story.ownerId, { type: "story-feedback", feedback: envelope });
+  if (record.encryptionMode === "story") {
+    for (const recipientId of Object.keys(story.encryptedKeys || {})) {
+      sendToClient(recipientId, { type: "story-feedback", feedback: envelope });
+    }
+  } else {
+    sendToClient(story.ownerId, { type: "story-feedback", feedback: envelope });
+  }
   send(socket, {
     type: "story-feedback-result",
     requestId: String(message.requestId || ""),
@@ -1377,7 +1392,7 @@ async function recordStoryShare(socket, message = {}) {
     return;
   }
   const recipients = Math.max(1, Math.min(100, Number(message.recipients) || 1));
-  const shareCount = await addStoryShares(storyId, recipients);
+  const shareCount = await addStoryShares(storyId, recipients, story);
   if (story.ownerId !== viewerId) sendToClient(story.ownerId, { type: "story-shared", storyId, shares: recipients, shareCount });
   send(socket, { type: "story-share-result", requestId: String(message.requestId || ""), ok: true, shareCount });
 }
@@ -3226,6 +3241,12 @@ async function getSyncedContacts(peerId) {
   return contacts;
 }
 
+// Stories expire after 24 hours; Reels remain available for a longer creator
+// library window while retaining the same encrypted content envelope.
+function contentRecordTtlSeconds(record = {}) {
+  return record.contentKind === "reel" ? REEL_TTL_SECONDS : STORY_TTL_SECONDS;
+}
+
 async function removeSyncedContacts(peerId) {
   memoryContactLists.delete(peerId);
   if (redis) await redis.del(contactListKey(peerId));
@@ -3235,6 +3256,7 @@ async function removeSyncedContacts(peerId) {
 async function setStoryRecord(record) {
   memoryStories.set(record.storyId, record);
   const expiresAtMs = Date.parse(record.expiresAt);
+  const ttl = contentRecordTtlSeconds(record);
   for (const viewerId of Object.keys(record.encryptedKeys || {})) {
     if (!memoryStoryIndexes.has(viewerId)) memoryStoryIndexes.set(viewerId, new Set());
     memoryStoryIndexes.get(viewerId).add(record.storyId);
@@ -3242,23 +3264,23 @@ async function setStoryRecord(record) {
   const serialized = JSON.stringify(record);
   if (redis) {
     const pipeline = redis.multi();
-    pipeline.set(storyKey(record.storyId), serialized, "EX", STORY_TTL_SECONDS);
+    pipeline.set(storyKey(record.storyId), serialized, "EX", ttl);
     for (const viewerId of Object.keys(record.encryptedKeys || {})) {
       pipeline.zadd(storyIndexKey(viewerId), expiresAtMs, record.storyId);
-      pipeline.expire(storyIndexKey(viewerId), STORY_TTL_SECONDS + 300);
+      pipeline.expire(storyIndexKey(viewerId), ttl + 300);
     }
     pipeline.zadd(storyOwnerIndexKey(record.ownerId), expiresAtMs, record.storyId);
-    pipeline.expire(storyOwnerIndexKey(record.ownerId), STORY_TTL_SECONDS + 300);
+    pipeline.expire(storyOwnerIndexKey(record.ownerId), ttl + 300);
     await pipeline.exec();
   }
   if (upstashRestEnabled) {
-    const commands = [["SET", storyKey(record.storyId), serialized, "EX", STORY_TTL_SECONDS]];
+    const commands = [["SET", storyKey(record.storyId), serialized, "EX", ttl]];
     for (const viewerId of Object.keys(record.encryptedKeys || {})) {
       commands.push(["ZADD", storyIndexKey(viewerId), expiresAtMs, record.storyId]);
-      commands.push(["EXPIRE", storyIndexKey(viewerId), STORY_TTL_SECONDS + 300]);
+      commands.push(["EXPIRE", storyIndexKey(viewerId), ttl + 300]);
     }
     commands.push(["ZADD", storyOwnerIndexKey(record.ownerId), expiresAtMs, record.storyId]);
-    commands.push(["EXPIRE", storyOwnerIndexKey(record.ownerId), STORY_TTL_SECONDS + 300]);
+    commands.push(["EXPIRE", storyOwnerIndexKey(record.ownerId), ttl + 300]);
     await upstashPipeline(commands);
   }
 }
@@ -3301,10 +3323,11 @@ async function storyEnvelopeForViewer(story, viewerId) {
   const allFeedback = await getStoryFeedback(story.storyId);
   const feedback = story.ownerId === viewerId
     ? allFeedback
-    : allFeedback.filter((record) => record.viewerId === viewerId);
+    : allFeedback.filter((record) => record.viewerId === viewerId || (record.kind === "comment" && record.encryptionMode === "story"));
   return {
     storyId: story.storyId,
     ownerId: story.ownerId,
+    contentKind: story.contentKind === "reel" ? "reel" : "story",
     createdAt: story.createdAt,
     expiresAt: story.expiresAt,
     profile: story.profile,
@@ -3317,7 +3340,8 @@ async function storyEnvelopeForViewer(story, viewerId) {
   };
 }
 
-async function addStoryView(storyId, viewerId, profile = {}) {
+async function addStoryView(storyId, viewerId, profile = {}, story = {}) {
+  const ttl = contentRecordTtlSeconds(story);
   if (!memoryStoryViews.has(storyId) || !(memoryStoryViews.get(storyId) instanceof Map)) memoryStoryViews.set(storyId, new Map());
   const existing = memoryStoryViews.get(storyId).get(viewerId);
   const record = existing
@@ -3326,11 +3350,11 @@ async function addStoryView(storyId, viewerId, profile = {}) {
   memoryStoryViews.get(storyId).set(viewerId, record);
   if (redis) {
     await redis.hset(storyViewDetailsKey(storyId), viewerId, JSON.stringify(record));
-    await redis.expire(storyViewDetailsKey(storyId), STORY_TTL_SECONDS + 300);
+    await redis.expire(storyViewDetailsKey(storyId), ttl + 300);
   }
   if (upstashRestEnabled) await upstashPipeline([
     ["HSET", storyViewDetailsKey(storyId), viewerId, JSON.stringify(record)],
-    ["EXPIRE", storyViewDetailsKey(storyId), STORY_TTL_SECONDS + 300]
+    ["EXPIRE", storyViewDetailsKey(storyId), ttl + 300]
   ]);
   return record;
 }
@@ -3346,24 +3370,26 @@ async function getStoryViews(storyId) {
   return values.map(safeJsonParse).filter((record) => record?.viewerId && record?.viewedAt);
 }
 
-async function setStoryReaction(record) {
+async function setStoryReaction(record, story = {}) {
+  const ttl = contentRecordTtlSeconds(story);
   if (!memoryStoryReactions.has(record.storyId)) memoryStoryReactions.set(record.storyId, new Map());
   if (record.reaction === "none") memoryStoryReactions.get(record.storyId).delete(record.viewerId);
   else memoryStoryReactions.get(record.storyId).set(record.viewerId, record);
   if (redis) {
     if (record.reaction === "none") await redis.hdel(storyReactionsKey(record.storyId), record.viewerId);
     else await redis.hset(storyReactionsKey(record.storyId), record.viewerId, JSON.stringify(record));
-    await redis.expire(storyReactionsKey(record.storyId), STORY_TTL_SECONDS + 300);
+    await redis.expire(storyReactionsKey(record.storyId), ttl + 300);
   }
   if (upstashRestEnabled) await upstashPipeline([
     record.reaction === "none"
       ? ["HDEL", storyReactionsKey(record.storyId), record.viewerId]
       : ["HSET", storyReactionsKey(record.storyId), record.viewerId, JSON.stringify(record)],
-    ["EXPIRE", storyReactionsKey(record.storyId), STORY_TTL_SECONDS + 300]
+    ["EXPIRE", storyReactionsKey(record.storyId), ttl + 300]
   ]);
 }
 
-async function appendStoryComment(record) {
+async function appendStoryComment(record, story = {}) {
+  const ttl = contentRecordTtlSeconds(story);
   if (!memoryStoryComments.has(record.storyId)) memoryStoryComments.set(record.storyId, []);
   const comments = memoryStoryComments.get(record.storyId);
   comments.push(record);
@@ -3371,12 +3397,12 @@ async function appendStoryComment(record) {
   if (redis) {
     await redis.rpush(storyCommentsKey(record.storyId), JSON.stringify(record));
     await redis.ltrim(storyCommentsKey(record.storyId), -200, -1);
-    await redis.expire(storyCommentsKey(record.storyId), STORY_TTL_SECONDS + 300);
+    await redis.expire(storyCommentsKey(record.storyId), ttl + 300);
   }
   if (upstashRestEnabled) await upstashPipeline([
     ["RPUSH", storyCommentsKey(record.storyId), JSON.stringify(record)],
     ["LTRIM", storyCommentsKey(record.storyId), -200, -1],
-    ["EXPIRE", storyCommentsKey(record.storyId), STORY_TTL_SECONDS + 300]
+    ["EXPIRE", storyCommentsKey(record.storyId), ttl + 300]
   ]);
 }
 
@@ -3408,18 +3434,19 @@ async function storyFeedbackEnvelope(record, story) {
   };
 }
 
-async function addStoryShares(storyId, count) {
+async function addStoryShares(storyId, count, story = {}) {
+  const ttl = contentRecordTtlSeconds(story);
   const next = Number(memoryStoryShares.get(storyId) || 0) + count;
   memoryStoryShares.set(storyId, next);
   if (redis) {
     const result = Number(await redis.incrby(storySharesKey(storyId), count));
-    await redis.expire(storySharesKey(storyId), STORY_TTL_SECONDS + 300);
+    await redis.expire(storySharesKey(storyId), ttl + 300);
     return result;
   }
   if (upstashRestEnabled) {
     const [increment] = await upstashPipeline([
       ["INCRBY", storySharesKey(storyId), count],
-      ["EXPIRE", storySharesKey(storyId), STORY_TTL_SECONDS + 300]
+      ["EXPIRE", storySharesKey(storyId), ttl + 300]
     ]);
     return Number(increment || next);
   }
