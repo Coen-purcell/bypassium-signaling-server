@@ -33,6 +33,8 @@ const REDIS_URL = process.env.REDIS_URL || process.env.RENDER_REDIS_URL || proce
 const UPSTASH_REST_URL = process.env.UPSTASH_REDIS_REST_URL || "";
 const UPSTASH_REST_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN || "";
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "";
+const ADMIN_HUB_IDS = new Set(String(process.env.ADMIN_HUB_IDS || "904674,907623,137096,396172,767838")
+  .split(",").map((value) => value.trim()).filter((value) => /^\d{6}$/.test(value)));
 const clients = new Map();
 const sessions = new Map();
 const memoryPublicKeys = new Map();
@@ -55,6 +57,7 @@ const memoryStoryViews = new Map();
 const memoryStoryReactions = new Map();
 const memoryStoryComments = new Map();
 const memoryStoryShares = new Map();
+let memoryAdminHubState = null;
 const pendingQueuedEnvelopes = new Map();
 const cancelledQueuedEnvelopes = new Set();
 const groupCallRooms = new Map();
@@ -67,7 +70,7 @@ const server = http.createServer(async (request, response) => {
   const corsHeaders = {
     "access-control-allow-origin": "*",
     "access-control-allow-methods": "GET, POST, OPTIONS",
-    "access-control-allow-headers": "content-type, authorization, x-admin-token"
+    "access-control-allow-headers": "content-type, authorization, x-admin-token, x-bypassium-id"
   };
   if (request.method === "OPTIONS") {
     response.writeHead(204, corsHeaders);
@@ -100,6 +103,11 @@ const server = http.createServer(async (request, response) => {
 
   if (url.pathname.startsWith("/admin/api/")) {
     await handleAdminApi(request, response, url, corsHeaders);
+    return;
+  }
+
+  if (url.pathname.startsWith("/admin-hub/api/")) {
+    await handleAdminHubApi(request, response, url, corsHeaders);
     return;
   }
 
@@ -555,6 +563,234 @@ function adminAuthorized(request) {
   const bearer = header.toLowerCase().startsWith("bearer ") ? header.slice(7).trim() : "";
   const token = bearer || String(request.headers["x-admin-token"] || "");
   return safeEqualString(token, ADMIN_TOKEN);
+}
+
+const ADMIN_HUB_SECTIONS = {
+  owen: { label: "Owen", ownerIds: ["907623", "137096"] },
+  riley: { label: "Riley", ownerIds: ["396172"] },
+  coen: { label: "Coen", ownerIds: ["904674"] },
+  bypassium: { label: "Bypassium Admin", ownerIds: ["767838"] },
+  shared: { label: "Shared", ownerIds: [] }
+};
+
+async function handleAdminHubApi(request, response, url, corsHeaders) {
+  try {
+    if (request.method === "POST" && url.pathname === "/admin-hub/api/sign-in") {
+      const body = await readRequestJson(request);
+      const peerId = String(body.peerId || "").trim();
+      const password = String(body.password || "");
+      if (!ADMIN_HUB_IDS.has(peerId)) {
+        sendJson(response, 403, { ok: false, message: "This Bypassium account does not have admin access." }, corsHeaders);
+        return;
+      }
+      const account = await getAccount(peerId);
+      if (!account?.passwordHash || !verifyPassword(password, account)) {
+        sendJson(response, 401, { ok: false, message: "Code or password is incorrect." }, corsHeaders);
+        return;
+      }
+      const token = issueSession(peerId);
+      const profile = await getProfile(peerId) || account.profile || {};
+      sendJson(response, 200, { ok: true, token, user: adminHubUser(peerId, profile) }, corsHeaders);
+      return;
+    }
+
+    const peerId = String(request.headers["x-bypassium-id"] || "").trim();
+    const token = String(request.headers.authorization || "").replace(/^Bearer\s+/i, "").trim();
+    if (!ADMIN_HUB_IDS.has(peerId) || !(await validSession(peerId, token))) {
+      sendJson(response, 401, { ok: false, message: "Your admin session expired. Sign in again." }, corsHeaders);
+      return;
+    }
+    const accountBlock = await accountBlockInfo(peerId, "account");
+    if (accountBlock) {
+      sendJson(response, 403, { ok: false, message: accountBlock.message }, corsHeaders);
+      return;
+    }
+
+    if (request.method === "GET" && url.pathname === "/admin-hub/api/state") {
+      const state = await getAdminHubState();
+      const admins = await Promise.all([...ADMIN_HUB_IDS].map(adminHubUserFromId));
+      sendJson(response, 200, {
+        ok: true,
+        state: visibleAdminHubState(state, peerId),
+        user: await adminHubUserFromId(peerId),
+        admins
+      }, corsHeaders);
+      return;
+    }
+
+    if (request.method === "POST" && url.pathname === "/admin-hub/api/chat") {
+      const body = await readRequestJson(request);
+      const text = String(body.text || "").trim().slice(0, 2000);
+      if (!text) throw new Error("Write a message first.");
+      const state = await getAdminHubState();
+      state.chat.push({ id: randomUUID(), authorId: peerId, text, createdAt: new Date().toISOString() });
+      state.chat = state.chat.slice(-400);
+      await setAdminHubState(state);
+      sendJson(response, 200, { ok: true, state: visibleAdminHubState(state, peerId) }, corsHeaders);
+      return;
+    }
+
+    if (request.method === "POST" && url.pathname === "/admin-hub/api/board") {
+      const body = await readRequestJson(request);
+      const section = String(body.section || "");
+      const state = await getAdminHubState();
+      const current = state.boards[section];
+      if (!current || !canEditAdminBoard(section, current, peerId)) {
+        sendJson(response, 403, { ok: false, message: "You do not have permission to edit this board." }, corsHeaders);
+        return;
+      }
+      const collaborators = Array.isArray(body.collaborators)
+        ? [...new Set(body.collaborators.map(String).filter((id) => ADMIN_HUB_IDS.has(id) && id !== peerId))]
+        : current.collaborators;
+      state.boards[section] = {
+        ...current,
+        title: String(body.title || current.title).trim().slice(0, 100) || current.title,
+        contentHtml: sanitizeAdminHubHtml(body.contentHtml),
+        collaborators,
+        published: body.published === true,
+        updatedAt: new Date().toISOString(),
+        updatedBy: peerId
+      };
+      await setAdminHubState(state);
+      sendJson(response, 200, { ok: true, state: visibleAdminHubState(state, peerId) }, corsHeaders);
+      return;
+    }
+
+    if (request.method === "POST" && url.pathname === "/admin-hub/api/feature") {
+      const body = await readRequestJson(request);
+      const section = String(body.section || "");
+      const state = await getAdminHubState();
+      const board = state.boards[section];
+      if (!board || !canEditAdminBoard(section, board, peerId)) throw new Error("You cannot edit this board.");
+      const feature = {
+        id: randomUUID(),
+        text: String(body.text || "").trim().slice(0, 300),
+        completed: false,
+        votes: {},
+        createdAt: new Date().toISOString(),
+        createdBy: peerId
+      };
+      if (!feature.text) throw new Error("Name the update idea first.");
+      board.features.push(feature);
+      board.updatedAt = new Date().toISOString();
+      board.updatedBy = peerId;
+      await setAdminHubState(state);
+      sendJson(response, 200, { ok: true, state: visibleAdminHubState(state, peerId) }, corsHeaders);
+      return;
+    }
+
+    if (request.method === "POST" && url.pathname === "/admin-hub/api/feature-update") {
+      const body = await readRequestJson(request);
+      const section = String(body.section || "");
+      const state = await getAdminHubState();
+      const board = state.boards[section];
+      const feature = board?.features.find((item) => item.id === body.featureId);
+      if (!board || !feature || !canEditAdminBoard(section, board, peerId)) throw new Error("You cannot edit that update idea.");
+      if (Object.prototype.hasOwnProperty.call(body, "completed")) feature.completed = body.completed === true;
+      if (Object.prototype.hasOwnProperty.call(body, "text")) feature.text = String(body.text || "").trim().slice(0, 300) || feature.text;
+      if (body.remove === true) board.features = board.features.filter((item) => item.id !== feature.id);
+      board.updatedAt = new Date().toISOString();
+      board.updatedBy = peerId;
+      await setAdminHubState(state);
+      sendJson(response, 200, { ok: true, state: visibleAdminHubState(state, peerId) }, corsHeaders);
+      return;
+    }
+
+    if (request.method === "POST" && url.pathname === "/admin-hub/api/vote") {
+      const body = await readRequestJson(request);
+      const state = await getAdminHubState();
+      const board = state.boards[String(body.section || "")];
+      const feature = board?.features.find((item) => item.id === body.featureId);
+      if (!board?.published || !feature) throw new Error("That published idea is no longer available.");
+      const vote = body.vote === "yes" ? "yes" : body.vote === "no" ? "no" : "";
+      if (vote) feature.votes[peerId] = vote;
+      else delete feature.votes[peerId];
+      await setAdminHubState(state);
+      sendJson(response, 200, { ok: true, state: visibleAdminHubState(state, peerId) }, corsHeaders);
+      return;
+    }
+
+    sendJson(response, 404, { ok: false, message: "Unknown admin hub endpoint." }, corsHeaders);
+  } catch (error) {
+    sendJson(response, 400, { ok: false, message: error.message || "The admin hub request failed." }, corsHeaders);
+  }
+}
+
+function defaultAdminHubState() {
+  const now = new Date().toISOString();
+  const boards = {};
+  for (const [section, config] of Object.entries(ADMIN_HUB_SECTIONS)) {
+    boards[section] = {
+      section,
+      title: section === "shared" ? "Shared roadmap" : `${config.label}'s update ideas`,
+      contentHtml: "<p>Collect release ideas, decisions, and useful notes here.</p>",
+      ownerIds: config.ownerIds,
+      collaborators: [],
+      published: section === "shared",
+      features: [],
+      updatedAt: now,
+      updatedBy: ""
+    };
+  }
+  return { version: 1, chat: [], boards };
+}
+
+async function getAdminHubState() {
+  let stored = null;
+  if (redis) stored = await redis.get("bypassium:admin-hub:state");
+  else if (upstashRestEnabled) stored = await upstashCommand(["GET", "bypassium:admin-hub:state"]);
+  else stored = memoryAdminHubState;
+  if (!stored) return defaultAdminHubState();
+  const parsed = typeof stored === "string" ? JSON.parse(stored) : stored;
+  const fallback = defaultAdminHubState();
+  return { ...fallback, ...parsed, boards: { ...fallback.boards, ...(parsed.boards || {}) }, chat: Array.isArray(parsed.chat) ? parsed.chat : [] };
+}
+
+async function setAdminHubState(state) {
+  const payload = JSON.stringify(state);
+  memoryAdminHubState = payload;
+  if (redis) await redis.set("bypassium:admin-hub:state", payload);
+  else if (upstashRestEnabled) await upstashCommand(["SET", "bypassium:admin-hub:state", payload]);
+}
+
+function visibleAdminHubState(state, peerId) {
+  const boards = {};
+  for (const [section, board] of Object.entries(state.boards || {})) {
+    if (board.published || canEditAdminBoard(section, board, peerId)) {
+      boards[section] = { ...board, canEdit: canEditAdminBoard(section, board, peerId) };
+    } else {
+      boards[section] = { section, title: board.title, published: false, private: true, canEdit: false, features: [] };
+    }
+  }
+  return { version: state.version || 1, chat: state.chat || [], boards };
+}
+
+function canEditAdminBoard(section, board, peerId) {
+  return section === "shared"
+    || (board.ownerIds || ADMIN_HUB_SECTIONS[section]?.ownerIds || []).includes(peerId)
+    || (board.collaborators || []).includes(peerId);
+}
+
+function sanitizeAdminHubHtml(value = "") {
+  return String(value || "")
+    .replace(/<\/?(?:script|style|iframe|object|embed|form)[^>]*>/gi, "")
+    .replace(/\son\w+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, "")
+    .replace(/javascript:/gi, "")
+    .slice(0, 50000);
+}
+
+async function adminHubUserFromId(peerId) {
+  const profile = await getProfile(peerId) || {};
+  return adminHubUser(peerId, profile);
+}
+
+function adminHubUser(peerId, profile = {}) {
+  return {
+    peerId,
+    displayName: profile.displayName || ADMIN_HUB_SECTIONS[Object.keys(ADMIN_HUB_SECTIONS).find((key) => ADMIN_HUB_SECTIONS[key].ownerIds.includes(peerId))]?.label || peerId,
+    profilePicture: profile.profilePicture || "",
+    badge: profile.badge || "Admin"
+  };
 }
 
 function safeEqualString(first, second) {
