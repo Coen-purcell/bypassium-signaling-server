@@ -17,9 +17,9 @@ const MAX_HISTORY_SYNC_LIMIT = Number(process.env.MAX_HISTORY_SYNC_LIMIT || 5000
 const MAX_PROFILE_PICTURE_CHARS = 18000;
 const MAX_UPSTASH_RPUSH_ITEMS = 4;
 const MAX_UPSTASH_RPUSH_CHARS = 6_000_000;
-const MAX_UPSTASH_COMMAND_CHARS = 50_000_000; // Increased to 50MB
-const MAX_QUEUED_ENVELOPE_CHARS = 50_000_000; // Increased to 50MB
-const MAX_WEBSOCKET_PAYLOAD_CHARS = 50_000_000; // Increased to 50MB
+const MAX_UPSTASH_COMMAND_CHARS = 8_500_000;
+const MAX_QUEUED_ENVELOPE_CHARS = 7_500_000;
+const MAX_WEBSOCKET_PAYLOAD_CHARS = 8_500_000;
 const MAX_HISTORY_BATCH_CHARS = 240_000;
 const OFFLINE_DELIVERY_BATCH_SIZE = 6;
 const BACKGROUND_DELIVERY_YIELD_MS = 8;
@@ -51,6 +51,7 @@ const memoryGroups = new Map();
 const memoryContactLists = new Map();
 const memoryOfflineMessages = new Map();
 const memoryHistoryMessages = new Map();
+const memoryConversationReadStates = new Map();
 const memoryStories = new Map();
 const memoryStoryIndexes = new Map();
 const memoryStoryViews = new Map();
@@ -167,6 +168,7 @@ wss.on("connection", (socket, request) => {
       if (message.type === "ack-message") await acknowledgeMessage(socket, message);
       if (message.type === "typing") await relayTyping(socket, message);
       if (message.type === "read-receipt") await relayReadReceipt(socket, message);
+      if (message.type === "read-state") await relayReadState(socket, message);
       if (message.type === "reaction") await relayReaction(socket, message);
       if (message.type === "group-call-start") await startGroupCall(socket, message);
       if (message.type === "group-call-join") await joinGroupCall(socket, message);
@@ -183,7 +185,17 @@ wss.on("connection", (socket, request) => {
       if (message.type === "sync") await syncClient(socket);
     } catch (error) {
       console.error("Message handler failed:", error.message);
-      send(socket, { type: "error", message: "The message server could not process that request. Try again in a moment." });
+      if (message?.type === "direct-message" || message?.type === "group-message") {
+        send(socket, {
+          type: "message-error",
+          messageId: String(message.messageId || ""),
+          groupId: String(message.groupId || ""),
+          peerId: String(message.to || message.groupId || ""),
+          message: "The message could not be stored. Retry it in a moment."
+        });
+      } else {
+        send(socket, { type: "error", message: "The message server could not process that request. Try again in a moment." });
+      }
     }
   });
 
@@ -1519,7 +1531,7 @@ async function registerClient(socket, message) {
   }
   const storedPublicKey = await getPublicKey(byPassiumId);
   const storedKeyMatches = !storedPublicKey || samePublicKey(storedPublicKey, message.publicKeyJwk);
-  if (account?.passwordHash && !storedKeyMatches && !(await validSession(byPassiumId, message.sessionToken))) {
+  if (account?.passwordHash && !(await validSession(byPassiumId, message.sessionToken))) {
     send(socket, { type: "account-auth-required", peerId: byPassiumId, message: "Sign in before using this Bypassium code on this device." });
     return;
   }
@@ -2290,7 +2302,7 @@ async function relayDirectMessage(socket, message) {
 
   const targetId = String(message.to || "").trim();
   if (!/^\d{6}$/.test(targetId) || !message.encrypted) {
-    send(socket, { type: "error", message: "Message target or encrypted payload is invalid." });
+    send(socket, { type: "message-error", messageId: String(message.messageId || ""), peerId: targetId, message: "Message target or encrypted payload is invalid." });
     return;
   }
 
@@ -2303,12 +2315,15 @@ async function relayDirectMessage(socket, message) {
     encrypted: message.encrypted,
     sentAt: message.sentAt || new Date().toISOString()
   };
-  void storeDirectMessageHistory(senderId, targetId, envelope, {
-    senderEncrypted: message.senderEncrypted
-  }).catch((error) => console.error("Direct history write failed:", error.message));
   const targets = clients.get(targetId);
+  const persistence = Promise.all([
+    storeDirectMessageHistory(senderId, targetId, envelope, {
+      senderEncrypted: message.senderEncrypted
+    }),
+    queueForDelivery(targetId, envelope, { awaitWrite: true })
+  ]);
   if (!targets?.size) {
-    queueForDelivery(targetId, envelope);
+    await persistence;
     send(socket, {
       type: "message-status",
       messageId: envelope.messageId,
@@ -2326,6 +2341,12 @@ async function relayDirectMessage(socket, message) {
     return;
   }
 
+  for (const target of targets) {
+    if (target !== socket && target.readyState === 1) send(target, envelope);
+  }
+  // The recipient sees the live event immediately, while the sender only gets
+  // a success state after the durable inbox and history copies are committed.
+  await persistence;
   send(socket, {
     type: "message-status",
     messageId: envelope.messageId,
@@ -2333,11 +2354,6 @@ async function relayDirectMessage(socket, message) {
     status: "sent",
     updatedAt: new Date().toISOString()
   });
-
-  for (const target of targets) {
-    if (target !== socket && target.readyState === 1) send(target, envelope);
-  }
-  queueForDelivery(targetId, envelope);
   send(socket, { type: "message-relayed", messageId: envelope.messageId, peerId: targetId, sentAt: envelope.sentAt });
 }
 
@@ -2379,7 +2395,7 @@ async function relayGroupMessage(socket, message) {
   if (!validateContentType(socket, message)) return;
   const group = await getGroup(message.groupId);
   if (!group || !group.members.includes(senderId)) {
-    send(socket, { type: "error", message: "You are not a member of this group." });
+    send(socket, { type: "message-error", messageId: String(message.messageId || ""), groupId: String(message.groupId || ""), message: "You are not a member of this group." });
     return;
   }
   const recipients = Array.isArray(message.recipients) ? message.recipients : [];
@@ -2407,21 +2423,22 @@ async function relayGroupMessage(socket, message) {
       for (const target of targets) {
         if (target !== socket && target.readyState === 1) send(target, envelope);
       }
-      queueForDelivery(targetId, envelope);
-    } else {
-      queueForDelivery(targetId, envelope);
     }
+    await queueForDelivery(targetId, envelope, { awaitWrite: true });
     return targetId;
   });
-  const deliveredTo = (await Promise.all(deliveries)).filter(Boolean);
-  void storeGroupMessageHistory(senderId, group, {
-    messageId,
-    sentAt,
-    senderProfile,
-    senderPublicKeyJwk: socket.publicKeyJwk,
-    senderEncrypted,
-    recipients
-  }).catch((error) => console.error("Group history write failed:", error.message));
+  const [deliveryResults] = await Promise.all([
+    Promise.all(deliveries),
+    storeGroupMessageHistory(senderId, group, {
+      messageId,
+      sentAt,
+      senderProfile,
+      senderPublicKeyJwk: socket.publicKeyJwk,
+      senderEncrypted,
+      recipients
+    })
+  ]);
+  const deliveredTo = deliveryResults.filter(Boolean);
   send(socket, {
     type: "message-status",
     messageId,
@@ -2779,6 +2796,37 @@ async function relayReadReceipt(socket, message) {
   };
   sendToClient(targetId, envelope, socket);
   queueForDelivery(targetId, envelope);
+}
+
+// Persists the user's own conversation read position and mirrors it to their
+// other connected devices without exposing message contents.
+async function relayReadState(socket, message) {
+  const peerId = getRegisteredSender(socket);
+  if (!peerId) return;
+  const groupId = String(message.groupId || "").trim();
+  const contactId = String(message.contactId || "").trim();
+  let conversationKey = "";
+  if (groupId) {
+    const group = await getGroup(groupId);
+    if (!group?.members.includes(peerId)) return;
+    conversationKey = `group:${groupId}`;
+  } else if (/^\d{6}$/.test(contactId) && contactId !== peerId) {
+    conversationKey = `direct:${contactId}`;
+  }
+  if (!conversationKey) return;
+  const candidate = new Date(message.readAt || Date.now());
+  if (!Number.isFinite(candidate.getTime())) return;
+  const readAt = candidate.toISOString();
+  await setConversationReadState(peerId, conversationKey, readAt);
+  const envelope = {
+    type: "read-state-sync",
+    groupId,
+    contactId,
+    readAt
+  };
+  for (const target of clients.get(peerId) || []) {
+    if (target !== socket && target.readyState === 1) send(target, envelope);
+  }
 }
 
 async function relayReaction(socket, message) {
@@ -3184,6 +3232,7 @@ function queueForDelivery(targetId, envelope, { awaitWrite = false } = {}) {
     })
     .catch((error) => {
       console.error("Offline queue write failed:", error.message);
+      if (awaitWrite) throw error;
     })
     .finally(() => {
       pendingQueuedEnvelopes.delete(pendingKey);
@@ -3333,7 +3382,7 @@ async function replaceInboxIds(targetId, ids) {
 
 async function storeDirectMessageHistory(senderId, targetId, envelope, { senderEncrypted = null } = {}) {
   const sentAt = envelope.sentAt || new Date().toISOString();
-  await queueHistoryMessage(targetId, {
+  const writes = [queueHistoryMessage(targetId, {
     type: "direct-message",
     historyKind: "direct",
     historyDirection: "inbound",
@@ -3344,12 +3393,14 @@ async function storeDirectMessageHistory(senderId, targetId, envelope, { senderE
     publicKeyJwk: envelope.publicKeyJwk,
     encrypted: envelope.encrypted,
     sentAt
-  });
+  })];
 
   if (validEncryptedPayload(senderEncrypted)) {
-    const targetProfile = await getProfile(targetId) || {};
-    const targetPublicKeyJwk = await getPublicKey(targetId);
-    await queueHistoryMessage(senderId, {
+    const [targetProfile, targetPublicKeyJwk] = await Promise.all([
+      getProfile(targetId).then((profile) => profile || {}),
+      getPublicKey(targetId)
+    ]);
+    writes.push(queueHistoryMessage(senderId, {
       type: "direct-message",
       historyKind: "direct",
       historyDirection: "outbound",
@@ -3363,8 +3414,9 @@ async function storeDirectMessageHistory(senderId, targetId, envelope, { senderE
       encrypted: senderEncrypted,
       sentAt,
       selfEncrypted: true
-    });
+    }));
   }
+  await Promise.all(writes);
 }
 
 async function storeGroupMessageHistory(senderId, group, options = {}) {
@@ -3374,11 +3426,12 @@ async function storeGroupMessageHistory(senderId, group, options = {}) {
   const recipientById = new Map((options.recipients || []).map((recipient) => [String(recipient.to || ""), recipient]));
   const senderPublicKeyJwk = options.senderPublicKeyJwk || null;
 
+  const writes = [];
   for (const memberId of group.members || []) {
     if (memberId === senderId) continue;
     const recipient = recipientById.get(memberId);
     if (!validEncryptedPayload(recipient?.encrypted)) continue;
-    await queueHistoryMessage(memberId, {
+    writes.push(queueHistoryMessage(memberId, {
       type: "group-message",
       historyKind: "group",
       historyDirection: "inbound",
@@ -3392,11 +3445,11 @@ async function storeGroupMessageHistory(senderId, group, options = {}) {
       publicKeyJwk: senderPublicKeyJwk,
       encrypted: recipient.encrypted,
       sentAt
-    });
+    }));
   }
 
   if (validEncryptedPayload(options.senderEncrypted) && senderPublicKeyJwk) {
-    await queueHistoryMessage(senderId, {
+    writes.push(queueHistoryMessage(senderId, {
       type: "group-message",
       historyKind: "group",
       historyDirection: "outbound",
@@ -3412,8 +3465,9 @@ async function storeGroupMessageHistory(senderId, group, options = {}) {
       encrypted: options.senderEncrypted,
       sentAt,
       selfEncrypted: true
-    });
+    }));
   }
+  await Promise.all(writes);
 }
 
 async function queueHistoryMessage(peerId, entry) {
@@ -3462,12 +3516,34 @@ async function queueHistoryMessage(peerId, entry) {
 async function deliverHistoryMessages(socket, limit = defaultHistorySyncLimit()) {
   const peerId = socket.bypassiumId;
   if (!peerId) return;
-  const history = await getHistoryMessages(peerId, limit);
+  const history = await annotateHistoryReadState(peerId, await getHistoryMessages(peerId, limit));
   if (history.length) await sendHistoryItems(socket, history);
   send(socket, {
     type: "history-sync-complete",
     count: history.length,
     syncedAt: new Date().toISOString()
+  });
+}
+
+async function annotateHistoryReadState(peerId, history = []) {
+  const conversationKeys = [...new Set(history
+    .filter((item) => item.historyDirection === "inbound")
+    .map((item) => item.historyKind === "group" ? `group:${item.groupId}` : `direct:${item.historyPeerId}`)
+    .filter((key) => !key.endsWith(":")))];
+  const states = new Map(await Promise.all(conversationKeys.map(async (key) => [
+    key,
+    await getConversationReadState(peerId, key)
+  ])));
+  return history.map((item) => {
+    if (item.historyDirection !== "inbound") return item;
+    const key = item.historyKind === "group" ? `group:${item.groupId}` : `direct:${item.historyPeerId}`;
+    const readAt = states.get(key) || "";
+    const messageTime = Date.parse(item.sentAt || "");
+    return {
+      ...item,
+      readBySelf: Boolean(readAt && Number.isFinite(messageTime) && messageTime <= Date.parse(readAt)),
+      selfReadAt: readAt
+    };
   });
 }
 
@@ -3494,6 +3570,26 @@ function queuedEnvelopeTime(message = {}) {
 
 function yieldToSocketTraffic(delay = 0) {
   return new Promise((resolve) => setTimeout(resolve, delay));
+}
+
+async function setConversationReadState(peerId, conversationKey, readAt) {
+  const key = conversationReadStateKey(peerId, conversationKey);
+  const existing = await getConversationReadState(peerId, conversationKey);
+  if (existing && Date.parse(existing) >= Date.parse(readAt)) return existing;
+  memoryConversationReadStates.set(key, readAt);
+  if (redis) await redis.set(key, readAt);
+  else if (upstashRestEnabled) await upstashCommand(["SET", key, readAt]);
+  return readAt;
+}
+
+async function getConversationReadState(peerId, conversationKey) {
+  const key = conversationReadStateKey(peerId, conversationKey);
+  if (memoryConversationReadStates.has(key)) return memoryConversationReadStates.get(key);
+  let stored = "";
+  if (redis) stored = await redis.get(key);
+  else if (upstashRestEnabled) stored = await upstashCommand(["GET", key]);
+  if (stored) memoryConversationReadStates.set(key, String(stored));
+  return String(stored || "");
 }
 
 async function getHistoryMessages(peerId, limit = 500) {
@@ -5498,6 +5594,10 @@ function historyIndexKey(peerId) {
 
 function historyMessageKey(peerId, historyId) {
   return `bypassium:history:${peerId}:${historyId}`;
+}
+
+function conversationReadStateKey(peerId, conversationKey) {
+  return `bypassium:read-state:${peerId}:${conversationKey}`;
 }
 
 function storyKey(storyId) {
