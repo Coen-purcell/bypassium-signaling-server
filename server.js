@@ -1711,7 +1711,7 @@ async function publishStory(socket, message = {}) {
     return;
   }
   const createdAtMs = Date.now();
-  const contentKind = message.contentKind === "reel" ? "reel" : "story";
+  const contentKind = ["reel", "highlight"].includes(message.contentKind) ? message.contentKind : "story";
   const expiresAtMs = createdAtMs + contentRecordTtlSeconds({ contentKind }) * 1000;
   const record = {
     storyId,
@@ -2515,6 +2515,7 @@ async function relayCallSignal(socket, message) {
   const groupId = String(message.groupId || "").trim().slice(0, 120);
   const action = String(message.action || "").trim();
   const allowedActions = new Set([
+    "ring",
     "invite",
     "answer",
     "candidate",
@@ -3770,7 +3771,7 @@ async function getSyncedContacts(peerId) {
 // Stories expire after 24 hours; Reels remain available for a longer creator
 // library window while retaining the same encrypted content envelope.
 function contentRecordTtlSeconds(record = {}) {
-  return record.contentKind === "reel" ? REEL_TTL_SECONDS : STORY_TTL_SECONDS;
+  return ["reel", "highlight"].includes(record.contentKind) ? REEL_TTL_SECONDS : STORY_TTL_SECONDS;
 }
 
 async function removeSyncedContacts(peerId) {
@@ -3853,7 +3854,7 @@ async function storyEnvelopeForViewer(story, viewerId) {
   return {
     storyId: story.storyId,
     ownerId: story.ownerId,
-    contentKind: story.contentKind === "reel" ? "reel" : "story",
+    contentKind: ["reel", "highlight"].includes(story.contentKind) ? story.contentKind : "story",
     createdAt: story.createdAt,
     expiresAt: story.expiresAt,
     profile: story.profile,
