@@ -6169,6 +6169,7 @@ async function purchaseArcadeItem(socket, message = {}) {
       return record;
     });
     send(socket, { type: "arcade-purchase-result", requestId, ok: true, transaction, wallet: await walletSummary(peerId) });
+    await notifyWalletUpdated(peerId, transaction);
   } catch (error) {
     send(socket, { type: "arcade-purchase-result", requestId, ok: false, message: error.message || "Purchase failed." });
   }
@@ -6223,6 +6224,7 @@ async function claimArcadeReward(socket, message = {}) {
       return record;
     });
     send(socket, { type: "arcade-reward-result", requestId, ok: true, transaction, reward: transaction.amount, wallet: await walletSummary(peerId) });
+    await notifyWalletUpdated(peerId, transaction);
   } catch (error) {
     send(socket, { type: "arcade-reward-result", requestId, ok: false, message: error.message || "Reward claim failed." });
   }
