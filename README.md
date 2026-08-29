@@ -10,6 +10,13 @@ The server:
 - Relays Sent, Delivered, and Read status updates.
 - Stores public profiles, public encryption keys, group membership, ownership, and group roles.
 - Never receives plaintext message bodies.
+- Keeps B-Coin balances, transfers, attachment charges, call reservations, refunds, and Arcade rewards authoritative on the server.
+
+## Admin pricing
+
+Open `/admin`, unlock it with `ADMIN_TOKEN`, then use **B-Coin pricing** to change attachment tiers, direct and group call rates, the daily direct-call allowance, Deck Flip cost, and every Memory Flip reward tier. Pricing is persisted in Redis/Upstash and broadcast to connected clients immediately.
+
+Defaults are 12 B-Coins per direct-call minute and 32 B-Coins per group-call minute. Group-call starters fund the first minute; any participant can top up, and unused paid time is refunded in five-second increments.
 
 This package can also run the Bypassium Support bot in the same Render service. When `npm start` runs, `start-all.js` starts the main server first, then starts `support-bot.js` against the local server URL. That means if Render wakes the main server, the Support bot wakes with it too.
 

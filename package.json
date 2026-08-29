@@ -1,6 +1,6 @@
 {
   "name": "bypassium-signaling-server",
-  "version": "1.0.0",
+  "version": "5.5.7",
   "description": "Encrypted relay and persistent offline inbox server for Bypassium Messenger.",
   "main": "server.js",
   "type": "module",

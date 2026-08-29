@@ -16,17 +16,44 @@ const DEFAULT_HISTORY_SYNC_LIMIT = Number(process.env.DEFAULT_HISTORY_SYNC_LIMIT
 const MAX_HISTORY_SYNC_LIMIT = Number(process.env.MAX_HISTORY_SYNC_LIMIT || 5000);
 const MAX_PROFILE_PICTURE_CHARS = 18000;
 const MAX_UPSTASH_RPUSH_ITEMS = 4;
-const MAX_UPSTASH_RPUSH_CHARS = 70_000_000;
-const MAX_UPSTASH_COMMAND_CHARS = 75_000_000;
-const MAX_QUEUED_ENVELOPE_CHARS = 70_000_000;
-const MAX_WEBSOCKET_PAYLOAD_CHARS = 75_000_000;
+const MAX_UPSTASH_RPUSH_CHARS = 6_000_000;
+const MAX_UPSTASH_COMMAND_CHARS = 8_500_000;
+const MAX_QUEUED_ENVELOPE_CHARS = 7_500_000;
+const MAX_WEBSOCKET_PAYLOAD_CHARS = 8_500_000;
 const MAX_HISTORY_BATCH_CHARS = 240_000;
 const OFFLINE_DELIVERY_BATCH_SIZE = 6;
 const BACKGROUND_DELIVERY_YIELD_MS = 8;
 const MAX_CALL_SIGNAL_CHARS = 64_000;
 const MAX_GROUP_CALL_MEMBERS = 5;
 const GROUP_CALL_TTL_MS = 4 * 60 * 60 * 1000;
+const WALLET_STARTING_BALANCE = Math.max(0, Math.round(Number(process.env.WALLET_STARTING_BALANCE || 2500)));
+const WALLET_MAX_TRANSFER = Math.max(1, Math.round(Number(process.env.WALLET_MAX_TRANSFER || 100000)));
+const WALLET_DAILY_TRANSFER_LIMIT = Math.max(WALLET_MAX_TRANSFER, Math.round(Number(process.env.WALLET_DAILY_TRANSFER_LIMIT || 250000)));
+const WALLET_HISTORY_LIMIT = 100;
+const MEMORY_REWARD_COOLDOWN_MS = 20_000;
+const DEFAULT_PRICING = Object.freeze({
+  attachmentUpTo256Kb: 2,
+  attachmentUpTo1Mb: 5,
+  attachmentUpTo5Mb: 12,
+  attachmentUpTo10Mb: 20,
+  attachmentOver10Mb: 35,
+  directCallPerMinute: Math.max(1, Math.round(Number(process.env.CALL_BLOCK_COST || 12))),
+  groupCallPerMinute: Math.max(1, Math.round(Number(process.env.GROUP_CALL_BLOCK_COST || 32))),
+  directCallDailyFreeSeconds: Math.max(0, Math.round(Number(process.env.CALL_DAILY_FREE_SECONDS || 300))),
+  memoryDeckFlip: 350,
+  memoryUnder10Seconds: 1160,
+  memoryUnder20Seconds: 960,
+  memoryUnder30Seconds: 760,
+  memoryUnder40Seconds: 560,
+  memoryUnder50Seconds: 460,
+  memoryUnder60Seconds: 360,
+  memoryOver60Seconds: 260
+});
+let pricing = { ...DEFAULT_PRICING };
+const CALL_BLOCK_SECONDS = 60;
+const CALL_BILLING_TTL_SECONDS = 6 * 60 * 60;
 const STORY_TTL_SECONDS = 24 * 60 * 60;
+const SOCIAL_DRAFT_TTL_SECONDS = 30 * 24 * 60 * 60;
 const REEL_TTL_SECONDS = Math.max(7 * 24 * 60 * 60, Number(process.env.REEL_TTL_SECONDS || 365 * 24 * 60 * 60));
 const MAX_STORY_RECIPIENTS = 250;
 const REDIS_URL = process.env.REDIS_URL || process.env.RENDER_REDIS_URL || process.env.KEY_VALUE_URL || "";
@@ -58,6 +85,17 @@ const memoryStoryViews = new Map();
 const memoryStoryReactions = new Map();
 const memoryStoryComments = new Map();
 const memoryStoryShares = new Map();
+const memorySocialDrafts = new Map();
+const memoryWallets = new Map();
+const memoryWalletTransactions = new Map();
+const memoryWalletIndexes = new Map();
+const memoryWalletDailySpend = new Map();
+const memoryArcadeRounds = new Map();
+const memoryArcadeCooldowns = new Map();
+const memoryCallBilling = new Map();
+const memoryCallFreeUsage = new Map();
+const PRICING_STORAGE_KEY = "bypassium:pricing:v1";
+let walletOperationQueue = Promise.resolve();
 let memoryAdminHubState = null;
 const adminHubTyping = new Map();
 const pendingQueuedEnvelopes = new Map();
@@ -83,11 +121,17 @@ const server = http.createServer(async (request, response) => {
   const url = new URL(request.url || "/", `http://${request.headers.host || "localhost"}`);
 
   if (url.pathname === "/health") {
+    const supportBotId = String(process.env.BOT_PEER_ID || "").trim();
+    const supportBotConfigured = /^\d{6}$/.test(supportBotId)
+      && Boolean(process.env.BOT_PASSWORD)
+      && Boolean(process.env.GROQ_API_KEY || process.env.OPENAI_API_KEY);
     response.writeHead(200, { ...corsHeaders, "content-type": "application/json" });
     response.end(JSON.stringify({
       ok: true,
       storage: storageMode(),
       onlineClients: clients.size,
+      supportBotConfigured,
+      supportBotOnline: supportBotConfigured && Boolean(clients.get(supportBotId)?.size),
       uptimeSeconds: Math.round(process.uptime())
     }));
     return;
@@ -182,6 +226,18 @@ wss.on("connection", (socket, request) => {
       if (message.type === "story-feedback") await submitStoryFeedback(socket, message);
       if (message.type === "story-share") await recordStoryShare(socket, message);
       if (message.type === "story-delete") await deleteStory(socket, message);
+      if (message.type === "story-watch") await recordStoryWatch(socket, message);
+      if (message.type === "draft-save") await saveSocialDraft(socket, message);
+      if (message.type === "draft-sync") await syncSocialDrafts(socket, message);
+      if (message.type === "draft-delete") await deleteSocialDraft(socket, message);
+      if (message.type === "wallet-sync") await syncWallet(socket, message);
+      if (message.type === "wallet-pay") await payWalletUser(socket, message);
+      if (message.type === "call-billing-start") await startCallBilling(socket, message);
+      if (message.type === "call-billing-top-up") await topUpCallBilling(socket, message);
+      if (message.type === "call-billing-sync") await syncCallBilling(socket, message);
+      if (message.type === "arcade-round-start") await startArcadeRound(socket, message);
+      if (message.type === "arcade-reward") await claimArcadeReward(socket, message);
+      if (message.type === "arcade-purchase") await purchaseArcadeItem(socket, message);
       if (message.type === "sync") await syncClient(socket);
     } catch (error) {
       console.error("Message handler failed:", error.message);
@@ -276,12 +332,25 @@ async function handleAdminApi(request, response, url, corsHeaders) {
       return;
     }
 
+    if (request.method === "GET" && url.pathname === "/admin/api/pricing") {
+      sendJson(response, 200, { ok: true, pricing: publicPricing() }, corsHeaders);
+      return;
+    }
+
     if (request.method !== "POST") {
       sendJson(response, 405, { ok: false, message: "Method not allowed." }, corsHeaders);
       return;
     }
 
     const body = await readRequestJson(request);
+
+    if (url.pathname === "/admin/api/pricing") {
+      const next = await savePricingConfig(body.pricing || body);
+      await recordAdminAudit("pricing-update", "", next);
+      broadcastPricingUpdated();
+      sendJson(response, 200, { ok: true, pricing: publicPricing(), message: "Pricing saved and sent to connected users." }, corsHeaders);
+      return;
+    }
 
     if (url.pathname === "/admin/api/group-update") {
       const group = await adminGroupOrError(response, corsHeaders, body.groupId);
@@ -435,6 +504,51 @@ async function handleAdminApi(request, response, url, corsHeaders) {
           ? `Could not fully delete ${failed.length} account(s).`
           : `Deleted ${cleaned.length} account(s).`
       }, corsHeaders);
+      return;
+    }
+
+    if (url.pathname === "/admin/api/wallet-adjust") {
+      const walletPeerId = cleanPeerId(body.peerId);
+      const delta = Number(body.delta);
+      const reason = String(body.reason || "").replace(/\s+/g, " ").trim().slice(0, 240);
+      if (!walletPeerId || !Number.isSafeInteger(delta) || delta === 0 || Math.abs(delta) > 1_000_000 || !reason) {
+        sendJson(response, 400, { ok: false, message: "Choose an account, enter a whole non-zero amount, and provide a reason." }, corsHeaders);
+        return;
+      }
+      const transaction = await adjustWalletByAdmin(walletPeerId, delta, reason);
+      await recordAdminAudit("wallet-adjust", walletPeerId, { delta, reason, transactionId: transaction.transactionId });
+      notifyWalletUpdated(walletPeerId, transaction);
+      sendJson(response, 200, { ok: true, wallet: await walletSummary(walletPeerId), transaction }, corsHeaders);
+      return;
+    }
+
+    if (url.pathname === "/admin/api/wallet-freeze") {
+      const walletPeerId = cleanPeerId(body.peerId);
+      const frozen = Boolean(body.frozen);
+      const reason = String(body.reason || "").replace(/\s+/g, " ").trim().slice(0, 240);
+      if (!walletPeerId || !reason) {
+        sendJson(response, 400, { ok: false, message: "Choose an account and provide a reason." }, corsHeaders);
+        return;
+      }
+      await setWalletFrozen(walletPeerId, frozen, reason);
+      await recordAdminAudit(frozen ? "wallet-freeze" : "wallet-unfreeze", walletPeerId, { reason });
+      notifyWalletUpdated(walletPeerId);
+      sendJson(response, 200, { ok: true, wallet: await walletSummary(walletPeerId) }, corsHeaders);
+      return;
+    }
+
+    if (url.pathname === "/admin/api/wallet-reverse") {
+      const transactionId = String(body.transactionId || "").trim().slice(0, 100);
+      const reason = String(body.reason || "").replace(/\s+/g, " ").trim().slice(0, 240);
+      if (!transactionId || !reason) {
+        sendJson(response, 400, { ok: false, message: "Choose a transaction and provide a reversal reason." }, corsHeaders);
+        return;
+      }
+      const reversal = await reverseWalletTransaction(transactionId, reason);
+      await recordAdminAudit("wallet-reverse", reversal.recipientId || reversal.senderId || "", { transactionId, reversalId: reversal.transactionId, reason });
+      if (/^\d{6}$/.test(reversal.senderId)) void notifyWalletUpdated(reversal.senderId, reversal);
+      if (/^\d{6}$/.test(reversal.recipientId)) void notifyWalletUpdated(reversal.recipientId, reversal);
+      sendJson(response, 200, { ok: true, transaction: reversal }, corsHeaders);
       return;
     }
 
@@ -1126,6 +1240,28 @@ function adminPageHtml() {
         <div id="statusGrid" class="status-grid"></div>
       </div>
       <div class="card stack">
+        <div class="split"><div><h2>B-Coin pricing</h2><p class="muted">Changes apply immediately to connected users.</p></div><button id="savePricing">Save prices</button></div>
+        <div class="info-grid" id="pricingGrid">
+          <label>Attachment to 256 KB<input id="priceAttachment256" type="number" min="0" step="1"></label>
+          <label>Attachment to 1 MB<input id="priceAttachment1" type="number" min="0" step="1"></label>
+          <label>Attachment to 5 MB<input id="priceAttachment5" type="number" min="0" step="1"></label>
+          <label>Attachment to 10 MB<input id="priceAttachment10" type="number" min="0" step="1"></label>
+          <label>Attachment over 10 MB<input id="priceAttachmentOver10" type="number" min="0" step="1"></label>
+          <label>Direct call / minute<input id="priceDirectCall" type="number" min="0" step="1"></label>
+          <label>Group call / minute<input id="priceGroupCall" type="number" min="0" step="1"></label>
+          <label>Free direct-call seconds / day<input id="priceFreeCallSeconds" type="number" min="0" step="1"></label>
+          <label>Memory Deck Flip<input id="priceMemoryDeckFlip" type="number" min="0" step="1"></label>
+          <label>Memory under 10s<input id="priceMemory10" type="number" min="0" step="1"></label>
+          <label>Memory under 20s<input id="priceMemory20" type="number" min="0" step="1"></label>
+          <label>Memory under 30s<input id="priceMemory30" type="number" min="0" step="1"></label>
+          <label>Memory under 40s<input id="priceMemory40" type="number" min="0" step="1"></label>
+          <label>Memory under 50s<input id="priceMemory50" type="number" min="0" step="1"></label>
+          <label>Memory under 60s<input id="priceMemory60" type="number" min="0" step="1"></label>
+          <label>Memory over 60s<input id="priceMemoryOver60" type="number" min="0" step="1"></label>
+        </div>
+        <p id="pricingStatus" class="muted">Unlock the dashboard to load pricing.</p>
+      </div>
+      <div class="card stack">
         <h2>Accounts</h2>
         <div class="search-row">
           <label>Search<input id="search" placeholder="Code or username"></label>
@@ -1175,6 +1311,39 @@ function adminPageHtml() {
     $("selectAll").onchange = () => toggleShownSelection($("selectAll").checked);
     $("clearSelected").onclick = () => { state.selectedPeers.clear(); updateSelectionUi(); };
     $("bulkDelete").onclick = () => bulkDeleteSelected();
+    $("savePricing").onclick = () => savePricing();
+
+    const pricingFields = {
+      attachmentUpTo256Kb: "priceAttachment256", attachmentUpTo1Mb: "priceAttachment1",
+      attachmentUpTo5Mb: "priceAttachment5", attachmentUpTo10Mb: "priceAttachment10",
+      attachmentOver10Mb: "priceAttachmentOver10", directCallPerMinute: "priceDirectCall",
+      groupCallPerMinute: "priceGroupCall", directCallDailyFreeSeconds: "priceFreeCallSeconds",
+      memoryDeckFlip: "priceMemoryDeckFlip",
+      memoryUnder10Seconds: "priceMemory10", memoryUnder20Seconds: "priceMemory20",
+      memoryUnder30Seconds: "priceMemory30", memoryUnder40Seconds: "priceMemory40",
+      memoryUnder50Seconds: "priceMemory50", memoryUnder60Seconds: "priceMemory60",
+      memoryOver60Seconds: "priceMemoryOver60"
+    };
+
+    async function loadPricing() {
+      try {
+        const payload = await api("/pricing");
+        for (const [key, id] of Object.entries(pricingFields)) $(id).value = payload.pricing[key];
+        $("pricingStatus").textContent = "Current server pricing loaded.";
+      } catch (error) { $("pricingStatus").textContent = error.message; }
+    }
+
+    async function savePricing() {
+      try {
+        const values = {};
+        for (const [key, id] of Object.entries(pricingFields)) values[key] = Math.max(0, Math.round(Number($(id).value) || 0));
+        const payload = await api("/pricing", { method:"POST", body:JSON.stringify({ pricing:values }) });
+        for (const [key, id] of Object.entries(pricingFields)) $(id).value = payload.pricing[key];
+        $("pricingStatus").textContent = payload.message;
+        toast(payload.message);
+        await loadAudit();
+      } catch (error) { $("pricingStatus").textContent = error.message; toast(error.message); }
+    }
 
     async function api(path, options = {}) {
       const controller = new AbortController();
@@ -1205,7 +1374,7 @@ function adminPageHtml() {
         };
       }
     }
-    async function refreshAll() { await Promise.allSettled([loadStatus(), searchAccounts(), searchGroups(), loadAudit()]); }
+    async function refreshAll() { await Promise.allSettled([loadStatus(), loadPricing(), searchAccounts(), searchGroups(), loadAudit()]); }
     async function loadStatus() {
       try {
         const configResponse = await fetch("/admin/api/config");
@@ -1349,6 +1518,7 @@ function adminPageHtml() {
         + info("Members", String(group.memberCount)) + info("Admins", String(group.adminCount)) + info("Owner", (group.ownerName || group.ownerId || "unknown"))
         + info("Adding", group.memberAddLocked ? "locked" : "members allowed") + info("Created", group.createdAt || "unknown") + info("Updated", group.updatedAt || "unknown")
         + '</div>'
+        + '<div class="card stack"><h2>Wallet</h2><div class="info-grid">' + info("Balance", Number(account.wallet?.balance || 0).toLocaleString() + " B") + info("Status", account.wallet?.frozen ? "Frozen" : "Active") + '</div><label>Adjustment (whole B-Coins; use a negative number to remove)<input id="walletDelta" type="number" step="1" placeholder="500"></label><label>Mandatory reason<input id="walletReason" maxlength="240" placeholder="Why is this adjustment needed?"></label><div class="actions"><button id="adjustWallet">Apply adjustment</button><button id="freezeWallet" class="warn">' + (account.wallet?.frozen ? "Unfreeze wallet" : "Freeze wallet") + '</button></div><div class="stack">' + (account.wallet?.history || []).map(walletTransactionHtml).join("") + '</div></div>'
         + '<div class="card stack"><h2>Group details</h2><div class="profile-edit"><span id="groupAvatarPreview" class="avatar profile-preview">' + groupAvatarHtml(group.avatar, group.name) + '</span><div class="stack"><label>Group name<input id="groupName" value="' + escapeAttr(group.name || "Group chat") + '" maxlength="80"></label><label>Group picture<input id="groupAvatarFile" type="file" accept="image/*"></label><label><input id="groupAddLocked" type="checkbox" ' + checked(group.memberAddLocked) + '> Only owner/admins can add members</label><div class="actions"><button id="saveGroupProfile">Save group</button><button id="removeGroupAvatar" class="secondary">Remove picture</button></div></div></div></div>'
         + '<div class="card stack"><h2>Add members</h2><p class="muted">Enter one or more 6-digit Bypassium codes. Existing members are skipped.</p><div class="search-row"><label>Codes<input id="groupAddMembers" placeholder="123456 234567"></label><button id="addGroupMembers">Add</button></div></div>'
         + '<div class="card stack"><h2>Members</h2><div class="member-list">' + (group.members || []).map((member) => groupMemberRow(member, group)).join("") + '</div></div>'
@@ -1449,6 +1619,9 @@ function adminPageHtml() {
         toast("Picture removed. Click Save profile.");
       };
       $("saveProfile").onclick = () => postAction("/profile", { peerId: account.peerId, displayName: $("profileDisplayName").value, badge: $("profileBadge").value, profilePicture: state.profilePictureDraft, removeProfilePicture: !state.profilePictureDraft });
+      $("adjustWallet").onclick = () => postAction("/wallet-adjust", { peerId: account.peerId, delta: Number($("walletDelta").value), reason: $("walletReason").value });
+      $("freezeWallet").onclick = () => postAction("/wallet-freeze", { peerId: account.peerId, frozen: !account.wallet?.frozen, reason: $("walletReason").value || (account.wallet?.frozen ? "Wallet restored" : "Frozen by Bypassium Support") });
+      document.querySelectorAll("[data-wallet-reverse]").forEach((button) => button.onclick = () => postAction("/wallet-reverse", { transactionId: button.dataset.walletReverse, reason: $("walletReason").value || "Admin reversal" }));
       $("banBtn").onclick = () => postAction("/ban", { peerId: account.peerId, reason: $("banReason").value, bannedUntil: $("banUntil").value });
       $("unbanBtn").onclick = () => postAction("/unban", { peerId: account.peerId });
       $("saveRestrictions").onclick = () => postAction("/restrictions", { peerId: account.peerId, sendDisabled: $("sendDisabled").checked, groupsDisabled: $("groupsDisabled").checked, quickAddHidden: $("quickAddHidden").checked });
@@ -1461,6 +1634,10 @@ function adminPageHtml() {
       return profilePicture ? '<img src="' + escapeAttr(profilePicture) + '" alt="">' : escapeHtml((displayName || "B").slice(0,1).toUpperCase());
     }
     function info(label, value) { return '<div class="info"><span>' + escapeHtml(label) + '</span><strong>' + escapeHtml(value) + '</strong></div>'; }
+    function walletTransactionHtml(transaction) {
+      const reversible = ["payment", "admin_adjustment"].includes(transaction.type) && transaction.status === "completed";
+      return '<div class="member-row"><span class="member-meta"><strong>' + escapeHtml(transaction.type.replaceAll("_", " ") + " · " + Number(transaction.amount || 0).toLocaleString() + " B") + '</strong><small class="muted">' + escapeHtml((transaction.caption || transaction.reason || "") + " · " + new Date(transaction.createdAt).toLocaleString()) + '</small></span>' + (reversible ? '<button class="secondary" data-wallet-reverse="' + escapeAttr(transaction.transactionId) + '">Reverse</button>' : '') + '</div>';
+    }
     function checked(value) { return value ? "checked" : ""; }
     async function postAction(path, body, reload = true) {
       try {
@@ -1573,11 +1750,24 @@ async function registerClient(socket, message) {
       encryptedStories: true,
       encryptedStoryFeedback: true,
       encryptedReels: true,
+      encryptedSocialDrafts: true,
+      storyWatchAnalytics: true,
       accounts: true,
-      contactSync: true
+      contactSync: true,
+      authoritativeWallets: true,
+      attachmentDeliveryBilling: true,
+      callTimeBilling: true,
+      callDailyFreeSeconds: pricing.directCallDailyFreeSeconds,
+      callBlockSeconds: CALL_BLOCK_SECONDS,
+      callBlockCost: pricing.directCallPerMinute,
+      groupCallBlockCost: pricing.groupCallPerMinute,
+      pricing: publicPricing(),
+      walletLedger: true,
+      serverArcadeRewards: true
     },
     account: publicAccountStatus(account, Boolean(account?.passwordHash)),
-    contacts: await getSyncedContacts(byPassiumId)
+    contacts: await getSyncedContacts(byPassiumId),
+    wallet: await walletSummary(byPassiumId)
   });
   await deliverOfflineMessages(socket);
 }
@@ -1742,12 +1932,29 @@ async function syncStories(socket) {
   const viewerId = getRegisteredSender(socket);
   if (!viewerId) return;
   const stories = await getStoriesForViewer(viewerId);
-  for (const story of stories) {
-    const envelope = await storyEnvelopeForViewer(story, viewerId);
-    if (envelope) send(socket, { type: "story-items", stories: [envelope] });
+  let sent = 0;
+  for (let index = 0; index < stories.length; index += 8) {
+    const envelopes = (await Promise.all(stories.slice(index, index + 8).map((story) => storyEnvelopeForViewer(story, viewerId)))).filter(Boolean);
+    let batch = [];
+    let batchCharacters = 64;
+    for (const envelope of envelopes) {
+      const envelopeCharacters = JSON.stringify(envelope).length + 1;
+      if (batch.length && batchCharacters + envelopeCharacters > MAX_WEBSOCKET_PAYLOAD_CHARS - 250_000) {
+        send(socket, { type: "story-items", stories: batch });
+        sent += batch.length;
+        batch = [];
+        batchCharacters = 64;
+      }
+      batch.push(envelope);
+      batchCharacters += envelopeCharacters;
+    }
+    if (batch.length) {
+      send(socket, { type: "story-items", stories: batch });
+      sent += batch.length;
+    }
     await yieldToSocketTraffic();
   }
-  send(socket, { type: "story-sync-complete", count: stories.length });
+  send(socket, { type: "story-sync-complete", count: sent });
 }
 
 async function viewStory(socket, message = {}) {
@@ -1765,6 +1972,77 @@ async function viewStory(socket, message = {}) {
     viewedAt: view.viewedAt,
     profile: viewerProfile
   });
+}
+
+// Updates the viewer's aggregate watch record without storing watched content.
+async function recordStoryWatch(socket, message = {}) {
+  const viewerId = getRegisteredSender(socket);
+  const storyId = String(message.storyId || "").trim();
+  const story = viewerId && storyId ? await getStoryRecord(storyId) : null;
+  if (!story || !story.encryptedKeys?.[viewerId] || story.ownerId === viewerId) return;
+  const watchedMs = Math.max(0, Math.min(24 * 60 * 60 * 1000, Math.round(Number(message.watchedMs) || 0)));
+  const durationMs = Math.max(1, Math.min(24 * 60 * 60 * 1000, Math.round(Number(message.durationMs) || 1)));
+  const existing = (await getStoryViews(storyId)).find((record) => record.viewerId === viewerId) || {};
+  const record = {
+    ...existing,
+    viewerId,
+    viewedAt: existing.viewedAt || new Date().toISOString(),
+    profile: existing.profile || sanitizeProfile(await getProfile(viewerId) || localProfile(viewerId)),
+    watchedMs: Math.max(Number(existing.watchedMs) || 0, watchedMs),
+    durationMs: Math.max(Number(existing.durationMs) || 0, durationMs),
+    completed: Boolean(existing.completed || message.completed || watchedMs >= durationMs * 0.9),
+    lastWatchedAt: new Date().toISOString()
+  };
+  await addStoryView(storyId, viewerId, record.profile, story, record);
+  sendToClient(story.ownerId, { type: "story-viewed", storyId, ...record });
+}
+
+async function saveSocialDraft(socket, message = {}) {
+  const peerId = getRegisteredSender(socket);
+  const kind = message.kind === "reel" ? "reel" : message.kind === "story" ? "story" : "";
+  const encrypted = message.encrypted;
+  const requestId = String(message.requestId || "");
+  if (!peerId || !kind || !validEncryptedPayload(encrypted) || JSON.stringify(message).length > MAX_WEBSOCKET_PAYLOAD_CHARS - 200_000) {
+    send(socket, { type: "draft-save-result", requestId, ok: false, message: "That encrypted draft is too large to sync." });
+    return;
+  }
+  const record = { kind, encrypted, updatedAt: new Date().toISOString() };
+  if (!memorySocialDrafts.has(peerId)) memorySocialDrafts.set(peerId, new Map());
+  memorySocialDrafts.get(peerId).set(kind, record);
+  if (redis) await redis.set(socialDraftKey(peerId, kind), JSON.stringify(record), "EX", SOCIAL_DRAFT_TTL_SECONDS);
+  if (upstashRestEnabled) await upstashCommand(["SET", socialDraftKey(peerId, kind), JSON.stringify(record), "EX", SOCIAL_DRAFT_TTL_SECONDS]);
+  send(socket, { type: "draft-save-result", requestId, ok: true, kind, updatedAt: record.updatedAt });
+}
+
+async function syncSocialDrafts(socket, message = {}) {
+  const peerId = getRegisteredSender(socket);
+  const requestId = String(message.requestId || "");
+  if (!peerId) return;
+  const drafts = [];
+  for (const kind of ["story", "reel"]) {
+    let record = memorySocialDrafts.get(peerId)?.get(kind) || null;
+    let stored = null;
+    if (!record && redis) stored = await redis.get(socialDraftKey(peerId, kind));
+    if (!record && upstashRestEnabled) stored = await upstashCommand(["GET", socialDraftKey(peerId, kind)]);
+    if (!record && stored) record = safeJsonParse(stored);
+    if (record?.encrypted) {
+      if (!memorySocialDrafts.has(peerId)) memorySocialDrafts.set(peerId, new Map());
+      memorySocialDrafts.get(peerId).set(kind, record);
+      drafts.push(record);
+    }
+  }
+  send(socket, { type: "draft-sync-result", requestId, ok: true, drafts });
+}
+
+async function deleteSocialDraft(socket, message = {}) {
+  const peerId = getRegisteredSender(socket);
+  const kind = message.kind === "reel" ? "reel" : message.kind === "story" ? "story" : "";
+  const requestId = String(message.requestId || "");
+  if (!peerId || !kind) return;
+  memorySocialDrafts.get(peerId)?.delete(kind);
+  if (redis) await redis.del(socialDraftKey(peerId, kind));
+  if (upstashRestEnabled) await upstashCommand(["DEL", socialDraftKey(peerId, kind)]);
+  send(socket, { type: "draft-delete-result", requestId, ok: true, kind });
 }
 
 // Stores owner-readable encrypted comments and one replaceable reaction per
@@ -2306,14 +2584,26 @@ async function relayDirectMessage(socket, message) {
     return;
   }
 
+  const messageId = message.messageId || randomUUID();
+  let attachmentTransaction = null;
+  try {
+    attachmentTransaction = await reserveAttachmentCharge(senderId, messageId, message.attachmentBytes, message.contentType);
+  } catch (error) {
+    send(socket, { type: "message-error", messageId, peerId: targetId, message: error.message });
+    return;
+  }
   const envelope = {
     type: "direct-message",
-    messageId: message.messageId || randomUUID(),
+    messageId,
     from: senderId,
+    to: targetId,
     profile: localProfile(senderId),
     publicKeyJwk: socket.publicKeyJwk,
     encrypted: message.encrypted,
-    sentAt: message.sentAt || new Date().toISOString()
+    sentAt: message.sentAt || new Date().toISOString(),
+    contentType: String(message.contentType || "text").slice(0, 40),
+    attachmentBytes: Math.max(0, Math.round(Number(message.attachmentBytes) || 0)),
+    attachmentTransactionId: attachmentTransaction?.transactionId || ""
   };
   const targets = clients.get(targetId);
   const persistence = Promise.all([
@@ -2323,7 +2613,12 @@ async function relayDirectMessage(socket, message) {
     queueForDelivery(targetId, envelope, { awaitWrite: true })
   ]);
   if (!targets?.size) {
-    await persistence;
+    try { await persistence; }
+    catch (error) {
+      await refundAttachmentCharge(envelope.attachmentTransactionId, "The attachment could not be stored.");
+      throw error;
+    }
+    if (attachmentTransaction) await notifyWalletUpdated(senderId, attachmentTransaction);
     send(socket, {
       type: "message-status",
       messageId: envelope.messageId,
@@ -2346,7 +2641,12 @@ async function relayDirectMessage(socket, message) {
   }
   // The recipient sees the live event immediately, while the sender only gets
   // a success state after the durable inbox and history copies are committed.
-  await persistence;
+  try { await persistence; }
+  catch (error) {
+    await refundAttachmentCharge(envelope.attachmentTransactionId, "The attachment could not be stored.");
+    throw error;
+  }
+  if (attachmentTransaction) await notifyWalletUpdated(senderId, attachmentTransaction);
   send(socket, {
     type: "message-status",
     messageId: envelope.messageId,
@@ -2401,6 +2701,13 @@ async function relayGroupMessage(socket, message) {
   const recipients = Array.isArray(message.recipients) ? message.recipients : [];
   const sentAt = message.sentAt || new Date().toISOString();
   const messageId = message.messageId || randomUUID();
+  let attachmentTransaction = null;
+  try {
+    attachmentTransaction = await reserveAttachmentCharge(senderId, messageId, message.attachmentBytes, message.contentType);
+  } catch (error) {
+    send(socket, { type: "message-error", messageId, groupId: String(message.groupId || ""), message: error.message });
+    return;
+  }
   const senderProfile = localProfile(senderId);
   const senderEncrypted = message.senderEncrypted;
   const deliveries = recipients.map(async (recipient) => {
@@ -2413,10 +2720,14 @@ async function relayGroupMessage(socket, message) {
       groupName: group.name,
       members: group.members,
       from: senderId,
+      to: targetId,
       profile: senderProfile,
       publicKeyJwk: socket.publicKeyJwk,
       encrypted: recipient.encrypted,
-      sentAt
+      sentAt,
+      contentType: String(message.contentType || "text").slice(0, 40),
+      attachmentBytes: Math.max(0, Math.round(Number(message.attachmentBytes) || 0)),
+      attachmentTransactionId: attachmentTransaction?.transactionId || ""
     };
     const targets = clients.get(targetId);
     if (targets?.size) {
@@ -2427,18 +2738,30 @@ async function relayGroupMessage(socket, message) {
     await queueForDelivery(targetId, envelope, { awaitWrite: true });
     return targetId;
   });
-  const [deliveryResults] = await Promise.all([
-    Promise.all(deliveries),
-    storeGroupMessageHistory(senderId, group, {
+  let deliveryResults;
+  try {
+    [deliveryResults] = await Promise.all([
+      Promise.all(deliveries),
+      storeGroupMessageHistory(senderId, group, {
       messageId,
       sentAt,
       senderProfile,
       senderPublicKeyJwk: socket.publicKeyJwk,
       senderEncrypted,
       recipients
-    })
-  ]);
+      })
+    ]);
+  } catch (error) {
+    await refundAttachmentCharge(attachmentTransaction?.transactionId, "The group attachment could not be stored.");
+    throw error;
+  }
   const deliveredTo = deliveryResults.filter(Boolean);
+  if (!deliveredTo.length) {
+    await refundAttachmentCharge(attachmentTransaction?.transactionId, "No group recipient could receive this attachment.");
+    send(socket, { type: "message-error", messageId, groupId: group.id, message: "No group member was ready to receive this attachment." });
+    return;
+  }
+  if (attachmentTransaction) await notifyWalletUpdated(senderId, attachmentTransaction);
   send(socket, {
     type: "message-status",
     messageId,
@@ -2464,6 +2787,8 @@ async function acknowledgeMessage(socket, message) {
   const envelope = pendingQueuedEnvelopes.get(pendingKey) || await getOfflineMessage(targetId, messageId);
   await removeOfflineMessage(targetId, messageId);
   if (envelope?.from && (envelope.type === "direct-message" || envelope.type === "group-message")) {
+    const settledCharge = await settleAttachmentCharge(envelope);
+    if (settledCharge?.senderId) await notifyWalletUpdated(settledCharge.senderId, settledCharge);
     sendToClient(envelope.from, {
       type: "message-status",
       messageId: envelope.messageId || messageId,
@@ -2562,8 +2887,16 @@ async function relayCallSignal(socket, message) {
     sentAt: new Date().toISOString()
   };
 
+  let billingSession = groupId ? null : await getCallBilling(callId);
+  if (!groupId && ["ring", "invite"].includes(action)) {
+    if (!billingSession) billingSession = await ensureCallBilling(senderId, targetId, callId);
+    if (!billingSession.participants.has(senderId) || !billingSession.participants.has(targetId)) return;
+    envelope.billing = publicCallBilling(billingSession);
+  }
+
   const targets = clients.get(targetId);
   if (!targets?.size) {
+    if (billingSession) await finishCallBilling(billingSession, "Contact was offline");
     send(socket, {
       type: "call-signal",
       callId,
@@ -2584,6 +2917,7 @@ async function relayCallSignal(socket, message) {
     }
   }
   if (!delivered) {
+    if (billingSession) await finishCallBilling(billingSession, "Call could not be delivered");
     send(socket, {
       type: "call-signal",
       callId,
@@ -2593,6 +2927,16 @@ async function relayCallSignal(socket, message) {
       reason: "That contact is already connected from this browser only.",
       sentAt: envelope.sentAt
     });
+    return;
+  }
+  if (billingSession && action === "answer" && !billingSession.connectedAt) {
+    billingSession.connectedAt = Date.now();
+    billingSession.lastTickAt = billingSession.connectedAt;
+    await saveCallBilling(billingSession);
+    broadcastCallBilling(billingSession);
+  }
+  if (billingSession && ["end", "decline", "cancel", "busy", "unavailable"].includes(action)) {
+    await finishCallBilling(billingSession, action === "end" ? "Call ended" : "Call was not accepted");
   }
 }
 
@@ -2616,14 +2960,22 @@ async function startGroupCall(socket, message = {}) {
 
   let room = activeGroupCallForGroup(group.id);
   const created = !room;
+  let billing = room ? await getCallBilling(room.billingCallId || room.callId) : null;
   if (!room) {
     const callId = cleanGroupCallId(message.callId) || randomUUID();
+    try {
+      billing = await ensureGroupCallBilling(peerId, group, callId);
+    } catch (error) {
+      sendGroupCallResult(socket, message, false, error.message || "The group call could not be funded.");
+      return;
+    }
     room = {
       callId,
       groupId: group.id,
       startedBy: peerId,
       joined: new Set(),
-      createdAt: Date.now()
+      createdAt: Date.now(),
+      billingCallId: billing.callId
     };
     groupCallRooms.set(callId, room);
   }
@@ -2637,13 +2989,15 @@ async function startGroupCall(socket, message = {}) {
       from: peerId,
       profile: localProfile(peerId),
       group: publicGroupCallGroup(group),
-      sentAt: new Date().toISOString()
+      sentAt: new Date().toISOString(),
+      billing: publicCallBilling(billing)
     };
     for (const memberId of group.members) {
       if (memberId !== peerId) sendToClient(memberId, invite);
     }
   }
 
+  const roomBilling = await getCallBilling(room.billingCallId || room.callId);
   send(socket, {
     type: "group-call-started",
     requestId: String(message.requestId || ""),
@@ -2651,7 +3005,8 @@ async function startGroupCall(socket, message = {}) {
     callId: room.callId,
     groupId: room.groupId,
     existing: !created,
-    peers: groupCallPeerList(peers)
+    peers: groupCallPeerList(peers),
+    billing: roomBilling ? publicCallBilling(roomBilling) : null
   });
 }
 
@@ -2672,13 +3027,21 @@ async function joinGroupCall(socket, message = {}) {
     return;
   }
   const peers = joinGroupCallRoom(room, peerId);
+  const billing = await getCallBilling(room.billingCallId || room.callId);
+  if (billing && !billing.connectedAt && peers.length) {
+    billing.connectedAt = Date.now();
+    billing.lastTickAt = billing.connectedAt;
+    await saveCallBilling(billing);
+    broadcastCallBilling(billing);
+  }
   send(socket, {
     type: "group-call-joined",
     requestId: String(message.requestId || ""),
     ok: true,
     callId: room.callId,
     groupId: room.groupId,
-    peers: groupCallPeerList(peers)
+    peers: groupCallPeerList(peers),
+    billing: billing ? publicCallBilling(billing) : null
   });
 }
 
@@ -2722,7 +3085,10 @@ function removeGroupCallPeer(room, peerId, reason = "Left the call.") {
       reason
     });
   }
-  if (!room.joined.size) groupCallRooms.delete(room.callId);
+  if (!room.joined.size) {
+    groupCallRooms.delete(room.callId);
+    void getCallBilling(room.billingCallId || room.callId).then((billing) => finishCallBilling(billing, "Group call ended")).catch(() => {});
+  }
 }
 
 function leaveAllGroupCalls(peerId, reason) {
@@ -3837,9 +4203,10 @@ async function getStoriesForViewer(viewerId) {
     ids = await upstashCommand(["ZRANGEBYSCORE", storyIndexKey(viewerId), Date.now(), "+inf"]);
   }
   const stories = [];
-  for (const storyId of [...new Set(ids)].slice(-100)) {
-    const story = await getStoryRecord(storyId);
-    if (story?.encryptedKeys?.[viewerId]) stories.push(story);
+  const uniqueIds = [...new Set(ids)].slice(-100);
+  for (let index = 0; index < uniqueIds.length; index += 12) {
+    const batch = await Promise.all(uniqueIds.slice(index, index + 12).map(getStoryRecord));
+    for (const story of batch) if (story?.encryptedKeys?.[viewerId]) stories.push(story);
   }
   return stories.sort((first, second) => Date.parse(first.createdAt) - Date.parse(second.createdAt));
 }
@@ -3847,7 +4214,12 @@ async function getStoriesForViewer(viewerId) {
 async function storyEnvelopeForViewer(story, viewerId) {
   const encryptedKey = story?.encryptedKeys?.[viewerId];
   if (!encryptedKey) return null;
-  const allFeedback = await getStoryFeedback(story.storyId);
+  const [allFeedback, ownerPublicKey, viewers, shareCount] = await Promise.all([
+    getStoryFeedback(story.storyId),
+    getPublicKey(story.ownerId),
+    story.ownerId === viewerId ? getStoryViews(story.storyId) : Promise.resolve([]),
+    story.ownerId === viewerId ? getStoryShares(story.storyId) : Promise.resolve(0)
+  ]);
   const feedback = story.ownerId === viewerId
     ? allFeedback
     : allFeedback.filter((record) => record.viewerId === viewerId || (record.kind === "comment" && record.encryptionMode === "story"));
@@ -3858,22 +4230,22 @@ async function storyEnvelopeForViewer(story, viewerId) {
     createdAt: story.createdAt,
     expiresAt: story.expiresAt,
     profile: story.profile,
-    publicKeyJwk: await getPublicKey(story.ownerId),
+    publicKeyJwk: ownerPublicKey,
     encryptedContent: story.encryptedContent,
     encryptedKey,
-    viewers: story.ownerId === viewerId ? await getStoryViews(story.storyId) : [],
+    viewers,
     feedback: await Promise.all(feedback.map((record) => storyFeedbackEnvelope(record, story))),
-    shareCount: story.ownerId === viewerId ? await getStoryShares(story.storyId) : 0
+    shareCount
   };
 }
 
-async function addStoryView(storyId, viewerId, profile = {}, story = {}) {
+async function addStoryView(storyId, viewerId, profile = {}, story = {}, details = {}) {
   const ttl = contentRecordTtlSeconds(story);
   if (!memoryStoryViews.has(storyId) || !(memoryStoryViews.get(storyId) instanceof Map)) memoryStoryViews.set(storyId, new Map());
   const existing = memoryStoryViews.get(storyId).get(viewerId);
   const record = existing
-    ? { ...existing, profile: Object.keys(profile || {}).length ? profile : existing.profile || {} }
-    : { viewerId, viewedAt: new Date().toISOString(), profile };
+    ? { ...existing, ...details, profile: Object.keys(profile || {}).length ? profile : existing.profile || {} }
+    : { viewerId, viewedAt: new Date().toISOString(), profile, ...details };
   memoryStoryViews.get(storyId).set(viewerId, record);
   if (redis) {
     await redis.hset(storyViewDetailsKey(storyId), viewerId, JSON.stringify(record));
@@ -4023,6 +4395,13 @@ async function deleteStoriesOwnedBy(peerId) {
   if (upstashRestEnabled) await upstashCommand(["DEL", storyOwnerIndexKey(peerId)]);
 }
 
+async function deleteSocialDrafts(peerId) {
+  memorySocialDrafts.delete(peerId);
+  const keys = [socialDraftKey(peerId, "story"), socialDraftKey(peerId, "reel")];
+  if (redis) await redis.del(...keys);
+  if (upstashRestEnabled) await upstashCommand(["DEL", ...keys]);
+}
+
 async function deleteAccountData(peerId) {
   await Promise.all([
     removeAccount(peerId),
@@ -4033,8 +4412,17 @@ async function deleteAccountData(peerId) {
     deleteAllQueuedMessages(peerId),
     deleteAllHistoryMessages(peerId),
     deleteStoriesOwnedBy(peerId),
-    removeAccountIndex(peerId)
+    deleteSocialDrafts(peerId),
+    removeAccountIndex(peerId),
+    removeWalletForDeletedAccount(peerId)
   ]);
+}
+
+async function removeWalletForDeletedAccount(peerId) {
+  memoryWallets.delete(peerId);
+  memoryWalletIndexes.delete(peerId);
+  if (redis) await redis.del(walletKey(peerId), walletTransactionIndexKey(peerId));
+  if (upstashRestEnabled) await upstashCommand(["DEL", walletKey(peerId), walletTransactionIndexKey(peerId)]);
 }
 
 async function deleteAccountBySupport(peerId) {
@@ -4446,6 +4834,7 @@ async function adminAccountDetail(peerId) {
   if (!account && !profile && !publicKey) return null;
   return {
     ...(await adminAccountSummary(peerId)),
+    wallet: await walletSummary(peerId, 40),
     queuedMessages: await countQueuedMessages(peerId),
     sessionCount: await countPeerSessions(peerId),
     groupCount: (await getGroupsForMember(peerId)).length,
@@ -5179,6 +5568,718 @@ function storageMode() {
   return "memory";
 }
 
+function sanitizePrice(value, fallback, { min = 0, max = 1_000_000 } = {}) {
+  const parsed = Math.round(Number(value));
+  return Number.isSafeInteger(parsed) ? Math.max(min, Math.min(max, parsed)) : fallback;
+}
+
+function normalizePricing(candidate = {}) {
+  const next = {};
+  for (const [key, fallback] of Object.entries(DEFAULT_PRICING)) {
+    const isSeconds = key.endsWith("Seconds");
+    next[key] = sanitizePrice(candidate[key], fallback, { min: isSeconds ? 0 : 0, max: isSeconds ? 86_400 : 1_000_000 });
+  }
+  return next;
+}
+
+function publicPricing() {
+  return { ...pricing, callBlockSeconds: CALL_BLOCK_SECONDS };
+}
+
+async function loadPricingConfig() {
+  let stored = null;
+  if (redis) stored = await redis.get(PRICING_STORAGE_KEY);
+  else if (upstashRestEnabled) stored = await upstashCommand(["GET", PRICING_STORAGE_KEY]);
+  if (stored) pricing = normalizePricing(safeJsonParse(stored) || {});
+  return pricing;
+}
+
+async function savePricingConfig(candidate = {}) {
+  pricing = normalizePricing({ ...pricing, ...candidate });
+  const payload = JSON.stringify(pricing);
+  if (redis) await redis.set(PRICING_STORAGE_KEY, payload);
+  if (upstashRestEnabled) await upstashCommand(["SET", PRICING_STORAGE_KEY, payload]);
+  return pricing;
+}
+
+function broadcastPricingUpdated() {
+  for (const sockets of clients.values()) {
+    for (const socket of sockets) send(socket, { type: "pricing-updated", pricing: publicPricing() });
+  }
+}
+
+// Serializes wallet mutations inside this server process. Render currently runs
+// one Bypassium server instance, while each mutation is persisted as one Redis
+// MULTI/Upstash pipeline so balances and ledger indexes move together.
+function withWalletLock(operation) {
+  const run = walletOperationQueue.then(operation, operation);
+  walletOperationQueue = run.catch(() => {});
+  return run;
+}
+
+function cleanWalletAmount(value) {
+  const amount = Number(value);
+  return Number.isSafeInteger(amount) && amount > 0 ? amount : 0;
+}
+
+function walletRecord(peerId, value = {}) {
+  return {
+    accountId: peerId,
+    balance: Math.max(0, Math.round(Number(value.balance ?? WALLET_STARTING_BALANCE))),
+    frozen: Boolean(value.frozen),
+    freezeReason: String(value.freezeReason || "").slice(0, 240),
+    initializedAt: String(value.initializedAt || new Date().toISOString()),
+    updatedAt: String(value.updatedAt || new Date().toISOString())
+  };
+}
+
+async function readWallet(peerId) {
+  const clean = cleanPeerId(peerId);
+  if (!clean) return null;
+  if (memoryWallets.has(clean)) return walletRecord(clean, memoryWallets.get(clean));
+  let stored = null;
+  if (redis) stored = await redis.get(walletKey(clean));
+  if (upstashRestEnabled) stored = await upstashCommand(["GET", walletKey(clean)]);
+  if (stored) {
+    const record = walletRecord(clean, JSON.parse(stored));
+    memoryWallets.set(clean, record);
+    return record;
+  }
+  const record = walletRecord(clean);
+  await writeWallet(record);
+  return record;
+}
+
+async function writeWallet(record) {
+  const clean = walletRecord(record.accountId, record);
+  memoryWallets.set(clean.accountId, clean);
+  const serialized = JSON.stringify(clean);
+  if (redis) await redis.set(walletKey(clean.accountId), serialized);
+  if (upstashRestEnabled) await upstashCommand(["SET", walletKey(clean.accountId), serialized]);
+  return clean;
+}
+
+async function readWalletTransaction(transactionId) {
+  const id = String(transactionId || "").trim();
+  if (!id) return null;
+  if (memoryWalletTransactions.has(id)) return memoryWalletTransactions.get(id);
+  let stored = null;
+  if (redis) stored = await redis.get(walletTransactionKey(id));
+  if (upstashRestEnabled) stored = await upstashCommand(["GET", walletTransactionKey(id)]);
+  if (!stored) return null;
+  const record = JSON.parse(stored);
+  memoryWalletTransactions.set(id, record);
+  return record;
+}
+
+async function persistWalletMutation(wallets, transaction) {
+  const cleanWallets = wallets.map((item) => walletRecord(item.accountId, item));
+  memoryWalletTransactions.set(transaction.transactionId, transaction);
+  for (const wallet of cleanWallets) {
+    memoryWallets.set(wallet.accountId, wallet);
+    if (!memoryWalletIndexes.has(wallet.accountId)) memoryWalletIndexes.set(wallet.accountId, []);
+    const index = memoryWalletIndexes.get(wallet.accountId);
+    if (!index.includes(transaction.transactionId)) index.unshift(transaction.transactionId);
+    if (index.length > 500) index.length = 500;
+  }
+  const commands = [
+    ["SET", walletTransactionKey(transaction.transactionId), JSON.stringify(transaction)],
+    ...cleanWallets.flatMap((wallet) => [
+      ["SET", walletKey(wallet.accountId), JSON.stringify(wallet)],
+      ["ZADD", walletTransactionIndexKey(wallet.accountId), Date.parse(transaction.createdAt) || Date.now(), transaction.transactionId]
+    ])
+  ];
+  if (redis) {
+    const multi = redis.multi();
+    for (const command of commands) multi.call(...command);
+    await multi.exec();
+  }
+  if (upstashRestEnabled) await upstashPipeline(commands);
+  return transaction;
+}
+
+// Updates a pending ledger entry without indexing it a second time.
+async function updateWalletTransaction(transaction) {
+  memoryWalletTransactions.set(transaction.transactionId, transaction);
+  if (redis) await redis.set(walletTransactionKey(transaction.transactionId), JSON.stringify(transaction));
+  if (upstashRestEnabled) await upstashCommand(["SET", walletTransactionKey(transaction.transactionId), JSON.stringify(transaction)]);
+  return transaction;
+}
+
+function attachmentPrice(bytes) {
+  const size = Math.max(0, Math.round(Number(bytes) || 0));
+  if (!size) return 0;
+  const tiers = [
+    [256 * 1024, pricing.attachmentUpTo256Kb],
+    [1024 * 1024, pricing.attachmentUpTo1Mb],
+    [5 * 1024 * 1024, pricing.attachmentUpTo5Mb],
+    [10 * 1024 * 1024, pricing.attachmentUpTo10Mb],
+    [Number.MAX_SAFE_INTEGER, pricing.attachmentOver10Mb]
+  ];
+  return tiers.find(([limit]) => size <= limit)?.[1] || 0;
+}
+
+function attachmentTransactionId(senderId, messageId) {
+  return `attachment_${senderId}_${String(messageId || "").replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 70)}`;
+}
+
+async function reserveAttachmentCharge(senderId, messageId, bytes, contentType = "attachment") {
+  const amount = attachmentPrice(bytes);
+  if (!amount) return null;
+  const transactionId = attachmentTransactionId(senderId, messageId);
+  const prior = await readWalletTransaction(transactionId);
+  if (prior) return prior;
+  return withWalletLock(async () => {
+    const duplicate = await readWalletTransaction(transactionId);
+    if (duplicate) return duplicate;
+    const wallet = await readWallet(senderId);
+    if (wallet.frozen) throw new Error(`Your wallet is frozen${wallet.freezeReason ? `: ${wallet.freezeReason}` : "."}`);
+    if (wallet.balance < amount) throw new Error(`This attachment costs ${amount} B-Coins after delivery. You need ${amount - wallet.balance} more.`);
+    const now = new Date().toISOString();
+    wallet.balance -= amount;
+    wallet.updatedAt = now;
+    const transaction = {
+      transactionId,
+      type: "attachment",
+      status: "pending",
+      senderId,
+      recipientId: "delivery",
+      amount,
+      reservedAmount: amount,
+      attachmentBytes: Math.max(0, Math.round(Number(bytes) || 0)),
+      contentType: String(contentType || "attachment").slice(0, 40),
+      messageId: String(messageId || "").slice(0, 100),
+      caption: `${contentType || "Attachment"} delivery reservation`,
+      reason: "Charged only after successful delivery",
+      createdAt: now,
+      updatedAt: now
+    };
+    await persistWalletMutation([wallet], transaction);
+    return transaction;
+  });
+}
+
+async function settleAttachmentCharge(envelope) {
+  if (!envelope?.attachmentTransactionId) return null;
+  return withWalletLock(async () => {
+    const transaction = await readWalletTransaction(envelope.attachmentTransactionId);
+    if (!transaction || transaction.status !== "pending") return transaction;
+    transaction.status = "completed";
+    transaction.recipientId = String(envelope.from === envelope.to ? "delivery" : envelope.to || "delivery");
+    transaction.deliveredAt = new Date().toISOString();
+    transaction.updatedAt = transaction.deliveredAt;
+    await updateWalletTransaction(transaction);
+    return transaction;
+  });
+}
+
+async function refundAttachmentCharge(transactionId, reason = "Attachment was not delivered") {
+  if (!transactionId) return null;
+  return withWalletLock(async () => {
+    const transaction = await readWalletTransaction(transactionId);
+    if (!transaction || transaction.status !== "pending") return transaction;
+    const wallet = await readWallet(transaction.senderId);
+    const now = new Date().toISOString();
+    wallet.balance += transaction.amount;
+    wallet.updatedAt = now;
+    transaction.status = "refunded";
+    transaction.refundedAt = now;
+    transaction.updatedAt = now;
+    transaction.refundReason = String(reason).slice(0, 180);
+    const refund = {
+      transactionId: `refund_${transactionId}`,
+      type: "attachment_refund",
+      status: "completed",
+      senderId: "system",
+      recipientId: transaction.senderId,
+      amount: transaction.amount,
+      caption: "Attachment delivery refund",
+      reason: transaction.refundReason,
+      reversesTransactionId: transactionId,
+      createdAt: now
+    };
+    await updateWalletTransaction(transaction);
+    await persistWalletMutation([wallet], refund);
+    return refund;
+  });
+}
+
+function callUsageDate() {
+  return new Date().toISOString().slice(0, 10);
+}
+
+async function readCallFreeUsage(peerId) {
+  const key = callFreeUsageKey(peerId, callUsageDate());
+  if (memoryCallFreeUsage.has(key)) return Number(memoryCallFreeUsage.get(key) || 0);
+  let value = 0;
+  if (redis) value = Number(await redis.get(key) || 0);
+  if (upstashRestEnabled) value = Number(await upstashCommand(["GET", key]) || 0);
+  memoryCallFreeUsage.set(key, value);
+  return value;
+}
+
+async function writeCallFreeUsage(peerId, seconds) {
+  const key = callFreeUsageKey(peerId, callUsageDate());
+  const value = Math.max(0, Math.min(pricing.directCallDailyFreeSeconds, Math.round(Number(seconds) || 0)));
+  memoryCallFreeUsage.set(key, value);
+  if (redis) await redis.set(key, value, "EX", 172800);
+  if (upstashRestEnabled) await upstashCommand(["SET", key, value, "EX", 172800]);
+}
+
+function publicCallBilling(session) {
+  return {
+    callId: session.callId,
+    remainingSeconds: Math.max(0, Math.ceil(session.remainingSeconds)),
+    freeSeconds: Math.max(0, Math.ceil(session.freeRemaining || 0)),
+    blockSeconds: CALL_BLOCK_SECONDS,
+    blockCost: session.blockCost,
+    dailyFreeSeconds: session.mode === "group" ? 0 : pricing.directCallDailyFreeSeconds,
+    mode: session.mode || "direct",
+    connected: Boolean(session.connectedAt),
+    participants: [...session.participants]
+  };
+}
+
+async function saveCallBilling(session) {
+  memoryCallBilling.set(session.callId, session);
+  const stored = { ...session, participants: [...session.participants] };
+  if (redis) await redis.set(callBillingKey(session.callId), JSON.stringify(stored), "EX", CALL_BILLING_TTL_SECONDS);
+  if (upstashRestEnabled) await upstashCommand(["SET", callBillingKey(session.callId), JSON.stringify(stored), "EX", CALL_BILLING_TTL_SECONDS]);
+}
+
+async function getCallBilling(callId) {
+  if (memoryCallBilling.has(callId)) return memoryCallBilling.get(callId);
+  let stored = null;
+  if (redis) stored = await redis.get(callBillingKey(callId));
+  if (upstashRestEnabled) stored = await upstashCommand(["GET", callBillingKey(callId)]);
+  if (!stored) return null;
+  const parsed = JSON.parse(stored);
+  parsed.participants = new Set(parsed.participants || []);
+  memoryCallBilling.set(callId, parsed);
+  return parsed;
+}
+
+async function reserveCallBlocks(peerId, callId, blocks, session) {
+  const amount = session.blockCost * blocks;
+  const transactionId = `call_${callId}_${peerId}_${randomUUID()}`;
+  return withWalletLock(async () => {
+    const wallet = await readWallet(peerId);
+    if (wallet.frozen) throw new Error(`Your wallet is frozen${wallet.freezeReason ? `: ${wallet.freezeReason}` : "."}`);
+    if (wallet.balance < amount) throw new Error(`You need ${amount - wallet.balance} more B-Coins for ${blocks} call minute${blocks === 1 ? "" : "s"}.`);
+    const now = new Date().toISOString();
+    wallet.balance -= amount;
+    wallet.updatedAt = now;
+    const transaction = { transactionId, type: "call_reservation", status: "pending", senderId: peerId, recipientId: "call", amount, reservedAmount: amount, callId, seconds: blocks * CALL_BLOCK_SECONDS, caption: `${blocks} call minute${blocks === 1 ? "" : "s"} reserved`, reason: "Unused paid call time is refunded", createdAt: now, updatedAt: now };
+    await persistWalletMutation([wallet], transaction);
+    session.contributions.push({ peerId, transactionId, credits: amount, seconds: blocks * CALL_BLOCK_SECONDS, usedSeconds: 0 });
+    session.remainingSeconds += blocks * CALL_BLOCK_SECONDS;
+    await notifyWalletUpdated(peerId, transaction);
+    return transaction;
+  });
+}
+
+async function startCallBilling(socket, message = {}) {
+  const peerId = getRegisteredSender(socket);
+  const requestId = String(message.requestId || "");
+  const targetId = cleanPeerId(message.targetId);
+  const callId = String(message.callId || "").trim().slice(0, 80);
+  if (!peerId || !targetId || targetId === peerId || !callId) return send(socket, { type: "call-billing-start-result", requestId, ok: false, message: "Call billing details are invalid." });
+  if (!clients.get(targetId)?.size) return send(socket, { type: "call-billing-start-result", requestId, ok: false, message: "That contact is not online. You were not charged." });
+  const session = await ensureCallBilling(peerId, targetId, callId);
+  send(socket, { type: "call-billing-start-result", requestId, ok: true, billing: publicCallBilling(session), wallet: await walletSummary(peerId) });
+}
+
+async function ensureCallBilling(peerId, targetId, callId) {
+  let session = await getCallBilling(callId);
+  if (session) return session;
+  const used = await readCallFreeUsage(peerId);
+  const free = Math.max(0, pricing.directCallDailyFreeSeconds - used);
+  session = { callId, mode: "direct", blockCost: pricing.directCallPerMinute, ownerId: peerId, participants: new Set([peerId, targetId]), remainingSeconds: free, freeAllocated: free, freeRemaining: free, freeOwnerId: peerId, contributions: [], createdAt: Date.now(), connectedAt: 0, lastTickAt: 0 };
+  if (!free) await reserveCallBlocks(peerId, callId, 1, session);
+  await saveCallBilling(session);
+  return session;
+}
+
+async function ensureGroupCallBilling(peerId, group, callId) {
+  let session = await getCallBilling(callId);
+  if (session) return session;
+  session = {
+    callId,
+    mode: "group",
+    blockCost: pricing.groupCallPerMinute,
+    ownerId: peerId,
+    participants: new Set(group.members),
+    remainingSeconds: 0,
+    freeAllocated: 0,
+    freeRemaining: 0,
+    freeOwnerId: "",
+    contributions: [],
+    createdAt: Date.now(),
+    connectedAt: 0,
+    lastTickAt: 0
+  };
+  await reserveCallBlocks(peerId, callId, 1, session);
+  await saveCallBilling(session);
+  return session;
+}
+
+async function topUpCallBilling(socket, message = {}) {
+  const peerId = getRegisteredSender(socket);
+  const requestId = String(message.requestId || "");
+  const callId = String(message.callId || "").trim().slice(0, 80);
+  const blocks = Math.max(1, Math.min(10, Math.round(Number(message.blocks) || 1)));
+  const session = await getCallBilling(callId);
+  if (!peerId || !session || !session.participants.has(peerId)) return send(socket, { type: "call-billing-top-up-result", requestId, ok: false, message: "That active call could not be found." });
+  try {
+    const transaction = await reserveCallBlocks(peerId, callId, blocks, session);
+    await saveCallBilling(session);
+    broadcastCallBilling(session);
+    send(socket, { type: "call-billing-top-up-result", requestId, ok: true, billing: publicCallBilling(session), transaction, wallet: await walletSummary(peerId) });
+  } catch (error) {
+    send(socket, { type: "call-billing-top-up-result", requestId, ok: false, message: error.message });
+  }
+}
+
+async function syncCallBilling(socket, message = {}) {
+  const peerId = getRegisteredSender(socket);
+  const requestId = String(message.requestId || "");
+  const session = await getCallBilling(String(message.callId || "").trim().slice(0, 80));
+  if (!peerId || !session?.participants.has(peerId)) return send(socket, { type: "call-billing-sync-result", requestId, ok: false, message: "That active call could not be found." });
+  send(socket, { type: "call-billing-sync-result", requestId, ok: true, billing: publicCallBilling(session) });
+}
+
+function broadcastCallBilling(session) {
+  for (const peerId of session.participants) sendToClient(peerId, { type: "call-billing-updated", billing: publicCallBilling(session) });
+}
+
+async function finishCallBilling(session, reason = "Call ended") {
+  if (!session || session.finishedAt) return;
+  session.finishedAt = Date.now();
+  const freeUsed = Math.max(0, Number(session.freeAllocated || 0) - Number(session.freeRemaining || 0));
+  if (session.freeOwnerId && freeUsed) await writeCallFreeUsage(session.freeOwnerId, (await readCallFreeUsage(session.freeOwnerId)) + freeUsed);
+  for (const contribution of session.contributions) {
+    const original = await readWalletTransaction(contribution.transactionId);
+    if (!original || original.status !== "pending") continue;
+    const billedSeconds = Math.min(contribution.seconds, Math.ceil(contribution.usedSeconds / 5) * 5);
+    const usedCredits = Math.min(contribution.credits, Math.ceil((contribution.credits * billedSeconds) / contribution.seconds));
+    const refund = contribution.credits - usedCredits;
+    original.status = "completed";
+    original.amount = usedCredits;
+    original.usedSeconds = contribution.usedSeconds;
+    original.updatedAt = new Date().toISOString();
+    original.reason = reason;
+    await updateWalletTransaction(original);
+    if (refund > 0) {
+      const wallet = await readWallet(contribution.peerId);
+      wallet.balance += refund;
+      wallet.updatedAt = original.updatedAt;
+      await persistWalletMutation([wallet], { transactionId: `refund_${contribution.transactionId}`, type: "call_refund", status: "completed", senderId: "system", recipientId: contribution.peerId, amount: refund, callId: session.callId, caption: "Unused call time refunded", reason, reversesTransactionId: contribution.transactionId, createdAt: original.updatedAt });
+      await notifyWalletUpdated(contribution.peerId);
+    }
+  }
+  memoryCallBilling.delete(session.callId);
+  if (redis) await redis.del(callBillingKey(session.callId));
+  if (upstashRestEnabled) await upstashCommand(["DEL", callBillingKey(session.callId)]);
+}
+
+// Consumes call allowance centrally so both clients display the same timer.
+setInterval(() => {
+  void (async () => {
+    for (const session of memoryCallBilling.values()) {
+      if (!session.connectedAt || session.finishedAt) continue;
+      const now = Date.now();
+      const elapsed = Math.max(0, Math.floor((now - (session.lastTickAt || session.connectedAt)) / 1000));
+      if (!elapsed) continue;
+      session.lastTickAt = now;
+      let remaining = Math.min(elapsed, session.remainingSeconds);
+      const freeUsed = Math.min(remaining, session.freeRemaining || 0);
+      session.freeRemaining = Math.max(0, (session.freeRemaining || 0) - freeUsed);
+      remaining -= freeUsed;
+      for (const contribution of session.contributions) {
+        if (!remaining) break;
+        const available = contribution.seconds - contribution.usedSeconds;
+        const used = Math.min(available, remaining);
+        contribution.usedSeconds += used;
+        remaining -= used;
+      }
+      session.remainingSeconds = Math.max(0, session.remainingSeconds - elapsed);
+      await saveCallBilling(session);
+      broadcastCallBilling(session);
+      if (session.remainingSeconds <= 0) {
+        for (const peerId of session.participants) sendToClient(peerId, { type: "call-billing-ended", callId: session.callId, reason: "Call time ran out. Top up B-Coins to call again." });
+        await finishCallBilling(session, "Call allowance used");
+      }
+    }
+  })().catch((error) => console.error("Call billing timer failed:", error.message));
+}, 1000).unref?.();
+
+async function walletHistory(peerId, limit = WALLET_HISTORY_LIMIT) {
+  const clean = cleanPeerId(peerId);
+  const safeLimit = Math.max(1, Math.min(200, Math.round(Number(limit) || WALLET_HISTORY_LIMIT)));
+  let ids = memoryWalletIndexes.get(clean) || [];
+  if (redis) ids = await redis.zrevrange(walletTransactionIndexKey(clean), 0, safeLimit - 1);
+  if (upstashRestEnabled) ids = await upstashCommand(["ZREVRANGE", walletTransactionIndexKey(clean), 0, safeLimit - 1]) || [];
+  const records = [];
+  for (const id of ids.slice(0, safeLimit)) {
+    const transaction = await readWalletTransaction(id);
+    if (transaction) records.push(transaction);
+  }
+  return records;
+}
+
+async function walletSummary(peerId, limit = WALLET_HISTORY_LIMIT) {
+  const wallet = await readWallet(peerId);
+  if (!wallet) return null;
+  return {
+    ...wallet,
+    startingBalance: WALLET_STARTING_BALANCE,
+    maximumPayment: WALLET_MAX_TRANSFER,
+    dailyTransferLimit: WALLET_DAILY_TRANSFER_LIMIT,
+    history: await walletHistory(peerId, limit)
+  };
+}
+
+async function notifyWalletUpdated(peerId, transaction = null) {
+  const wallet = await walletSummary(peerId);
+  sendToClient(peerId, { type: "wallet-updated", wallet, transaction });
+}
+
+async function syncWallet(socket, message = {}) {
+  const peerId = getRegisteredSender(socket);
+  if (!peerId) return;
+  send(socket, { type: "wallet-sync-result", requestId: String(message.requestId || ""), ok: true, wallet: await walletSummary(peerId) });
+}
+
+async function dailyWalletSpend(peerId) {
+  const key = walletDailySpendKey(peerId);
+  if (memoryWalletDailySpend.has(key)) return memoryWalletDailySpend.get(key);
+  let value = 0;
+  if (redis) value = Number(await redis.get(key) || 0);
+  if (upstashRestEnabled) value = Number(await upstashCommand(["GET", key]) || 0);
+  memoryWalletDailySpend.set(key, value);
+  return value;
+}
+
+async function setDailyWalletSpend(peerId, amount) {
+  const key = walletDailySpendKey(peerId);
+  memoryWalletDailySpend.set(key, amount);
+  if (redis) await redis.set(key, amount, "EX", 172800);
+  if (upstashRestEnabled) await upstashCommand(["SET", key, amount, "EX", 172800]);
+}
+
+async function payWalletUser(socket, message = {}) {
+  const senderId = getRegisteredSender(socket);
+  const requestId = String(message.requestId || "");
+  if (!senderId) return;
+  if (!allowUserAction(socket, "wallet")) return send(socket, { type: "wallet-pay-result", requestId, ok: false, message: "Too many wallet requests. Try again shortly." });
+  const recipientId = cleanPeerId(message.recipientId);
+  const amount = cleanWalletAmount(message.amount);
+  const transactionId = String(message.clientRequestId || "").trim().slice(0, 80);
+  const caption = String(message.caption || "").trim().slice(0, 300);
+  if (!recipientId || recipientId === senderId) return send(socket, { type: "wallet-pay-result", requestId, ok: false, message: "Choose another Bypassium account." });
+  if (!amount || amount > WALLET_MAX_TRANSFER) return send(socket, { type: "wallet-pay-result", requestId, ok: false, message: `Payments must be whole B-Coins from 1 to ${WALLET_MAX_TRANSFER.toLocaleString()}.` });
+  if (!/^[A-Za-z0-9_-]{16,80}$/.test(transactionId)) return send(socket, { type: "wallet-pay-result", requestId, ok: false, message: "That payment request is invalid." });
+  const existing = await readWalletTransaction(transactionId);
+  if (existing) return send(socket, { type: "wallet-pay-result", requestId, ok: true, duplicate: true, transaction: existing, wallet: await walletSummary(senderId) });
+  const [senderBlock, recipientBlock, recipientAccount, contacts] = await Promise.all([
+    accountBlockInfo(senderId, "send"), accountBlockInfo(recipientId, "send"), getAccount(recipientId), getSyncedContacts(senderId)
+  ]);
+  if (senderBlock) return send(socket, { type: "wallet-pay-result", requestId, ok: false, message: senderBlock.message });
+  if (recipientBlock) return send(socket, { type: "wallet-pay-result", requestId, ok: false, message: "That account cannot receive payments right now." });
+  if (!recipientAccount && !await getPublicKey(recipientId)) return send(socket, { type: "wallet-pay-result", requestId, ok: false, message: "That account no longer exists." });
+  const contact = contacts.find((item) => item.id === recipientId);
+  if (!contact || contact.accepted === false || contact.blocked) return send(socket, { type: "wallet-pay-result", requestId, ok: false, message: "You can only pay accepted, unblocked contacts." });
+  try {
+    const transaction = await withWalletLock(async () => {
+      const duplicate = await readWalletTransaction(transactionId);
+      if (duplicate) return duplicate;
+      const sender = await readWallet(senderId);
+      const recipient = await readWallet(recipientId);
+      if (sender.frozen) throw new Error(`Your wallet is frozen${sender.freezeReason ? `: ${sender.freezeReason}` : "."}`);
+      if (recipient.frozen) throw new Error("That wallet is frozen and cannot receive payments.");
+      if (sender.balance < amount) throw new Error("You do not have enough B-Coins.");
+      const spent = await dailyWalletSpend(senderId);
+      if (spent + amount > WALLET_DAILY_TRANSFER_LIMIT) throw new Error("This payment would exceed your daily transfer limit.");
+      const now = new Date().toISOString();
+      sender.balance -= amount; sender.updatedAt = now;
+      recipient.balance += amount; recipient.updatedAt = now;
+      const record = { transactionId, type: "payment", status: "completed", senderId, recipientId, amount, caption, reason: "Payment", createdAt: now };
+      await persistWalletMutation([sender, recipient], record);
+      await setDailyWalletSpend(senderId, spent + amount);
+      return record;
+    });
+    send(socket, { type: "wallet-pay-result", requestId, ok: true, transaction, wallet: await walletSummary(senderId) });
+    await notifyWalletUpdated(recipientId, transaction);
+  } catch (error) {
+    send(socket, { type: "wallet-pay-result", requestId, ok: false, message: error.message || "Payment failed." });
+  }
+}
+
+async function startArcadeRound(socket, message = {}) {
+  const peerId = getRegisteredSender(socket);
+  const requestId = String(message.requestId || "");
+  if (!peerId) return;
+  if (String(message.gameId || "") !== "animated-memory") return send(socket, { type: "arcade-round-result", requestId, ok: false, message: "That game is not available." });
+  const roundId = randomUUID();
+  const round = { roundId, peerId, gameId: "animated-memory", startedAt: Date.now(), deckFlipPurchased: false };
+  memoryArcadeRounds.set(roundId, round);
+  if (redis) await redis.set(arcadeRoundKey(roundId), JSON.stringify(round), "EX", 900);
+  if (upstashRestEnabled) await upstashCommand(["SET", arcadeRoundKey(roundId), JSON.stringify(round), "EX", 900]);
+  send(socket, { type: "arcade-round-result", requestId, ok: true, roundId, startedAt: round.startedAt });
+}
+
+async function getArcadeRound(roundId) {
+  if (memoryArcadeRounds.has(roundId)) return memoryArcadeRounds.get(roundId);
+  let stored = null;
+  if (redis) stored = await redis.get(arcadeRoundKey(roundId));
+  if (upstashRestEnabled) stored = await upstashCommand(["GET", arcadeRoundKey(roundId)]);
+  if (!stored) return null;
+  const round = JSON.parse(stored);
+  memoryArcadeRounds.set(roundId, round);
+  return round;
+}
+
+async function saveArcadeRound(round) {
+  memoryArcadeRounds.set(round.roundId, round);
+  if (redis) await redis.set(arcadeRoundKey(round.roundId), JSON.stringify(round), "EX", 900);
+  if (upstashRestEnabled) await upstashCommand(["SET", arcadeRoundKey(round.roundId), JSON.stringify(round), "EX", 900]);
+}
+
+async function purchaseArcadeItem(socket, message = {}) {
+  const peerId = getRegisteredSender(socket);
+  const requestId = String(message.requestId || "");
+  const roundId = String(message.roundId || "");
+  if (!peerId) return;
+  try {
+    const transaction = await withWalletLock(async () => {
+      const round = await getArcadeRound(roundId);
+      if (!round || round.peerId !== peerId || round.gameId !== "animated-memory") throw new Error("That Memory Flip round has expired.");
+      if (String(message.itemId || "") !== "memory-deck-flip") throw new Error("That arcade item is not available.");
+      if (round.deckFlipPurchased) throw new Error("Deck Flip can only be used once per round.");
+      const wallet = await readWallet(peerId);
+      if (wallet.frozen) throw new Error(`Your wallet is frozen${wallet.freezeReason ? `: ${wallet.freezeReason}` : "."}`);
+      if (wallet.balance < pricing.memoryDeckFlip) throw new Error(`You need ${pricing.memoryDeckFlip} B-Coins for Deck Flip.`);
+      const now = new Date().toISOString();
+      wallet.balance -= pricing.memoryDeckFlip; wallet.updatedAt = now;
+      round.deckFlipPurchased = true;
+      await saveArcadeRound(round);
+      const record = { transactionId: randomUUID(), type: "arcade_purchase", status: "completed", senderId: peerId, recipientId: "", amount: pricing.memoryDeckFlip, caption: "Memory Flip: Deck Flip", reason: "Arcade purchase", gameId: round.gameId, roundId, createdAt: now };
+      await persistWalletMutation([wallet], record);
+      return record;
+    });
+    send(socket, { type: "arcade-purchase-result", requestId, ok: true, transaction, wallet: await walletSummary(peerId) });
+  } catch (error) {
+    send(socket, { type: "arcade-purchase-result", requestId, ok: false, message: error.message || "Purchase failed." });
+  }
+}
+
+function memoryRewardForElapsed(elapsedMs) {
+  if (elapsedMs <= 10_000) return pricing.memoryUnder10Seconds;
+  if (elapsedMs <= 20_000) return pricing.memoryUnder20Seconds;
+  if (elapsedMs <= 30_000) return pricing.memoryUnder30Seconds;
+  if (elapsedMs <= 40_000) return pricing.memoryUnder40Seconds;
+  if (elapsedMs <= 50_000) return pricing.memoryUnder50Seconds;
+  if (elapsedMs <= 60_000) return pricing.memoryUnder60Seconds;
+  return pricing.memoryOver60Seconds;
+}
+
+async function claimArcadeReward(socket, message = {}) {
+  const peerId = getRegisteredSender(socket);
+  const requestId = String(message.requestId || "");
+  const roundId = String(message.roundId || "");
+  const claimId = String(message.claimId || "").slice(0, 80);
+  const elapsedMs = Math.round(Number(message.elapsedMs));
+  if (!peerId) return;
+  if (!/^[A-Za-z0-9_-]{16,80}$/.test(claimId)) return send(socket, { type: "arcade-reward-result", requestId, ok: false, message: "That reward claim is invalid." });
+  const prior = await readWalletTransaction(claimId);
+  if (prior) return send(socket, { type: "arcade-reward-result", requestId, ok: true, duplicate: true, transaction: prior, reward: prior.amount, wallet: await walletSummary(peerId) });
+  const cooldownKey = arcadeRewardCooldownKey(peerId, "animated-memory");
+  let lastClaimAt = Number(memoryArcadeCooldowns.get(cooldownKey) || 0);
+  if (redis && !lastClaimAt) lastClaimAt = Number(await redis.get(cooldownKey) || 0);
+  if (upstashRestEnabled && !lastClaimAt) lastClaimAt = Number(await upstashCommand(["GET", cooldownKey]) || 0);
+  if (lastClaimAt && Date.now() - lastClaimAt < MEMORY_REWARD_COOLDOWN_MS) {
+    return send(socket, { type: "arcade-reward-result", requestId, ok: false, message: "Memory Flip rewards are cooling down. Start the next round in a few seconds." });
+  }
+  try {
+    const transaction = await withWalletLock(async () => {
+      const round = await getArcadeRound(roundId);
+      if (!round || round.peerId !== peerId || round.gameId !== "animated-memory" || round.claimedAt) throw new Error("That Memory Flip round is invalid or already claimed.");
+      if (Number(message.matchedPairs) !== 16 || !Number.isSafeInteger(elapsedMs) || elapsedMs < 3000 || elapsedMs > 600000) throw new Error("That Memory Flip result could not be verified.");
+      const serverElapsed = Date.now() - Number(round.startedAt || 0);
+      if (serverElapsed + 2500 < elapsedMs || Math.abs(serverElapsed - elapsedMs) > 20_000) throw new Error("That Memory Flip timing could not be verified.");
+      const wallet = await readWallet(peerId);
+      if (wallet.frozen) throw new Error(`Your wallet is frozen${wallet.freezeReason ? `: ${wallet.freezeReason}` : "."}`);
+      const reward = memoryRewardForElapsed(elapsedMs);
+      const now = new Date().toISOString();
+      wallet.balance += reward; wallet.updatedAt = now;
+      round.claimedAt = Date.now();
+      await saveArcadeRound(round);
+      const record = { transactionId: claimId, type: "game_reward", status: "completed", senderId: "", recipientId: peerId, amount: reward, caption: `Memory Flip cleared in ${(elapsedMs / 1000).toFixed(1)}s`, reason: "Arcade reward", gameId: round.gameId, roundId, elapsedMs, createdAt: now };
+      await persistWalletMutation([wallet], record);
+      memoryArcadeCooldowns.set(cooldownKey, Date.now());
+      if (redis) await redis.set(cooldownKey, Date.now(), "PX", MEMORY_REWARD_COOLDOWN_MS);
+      if (upstashRestEnabled) await upstashCommand(["SET", cooldownKey, Date.now(), "PX", MEMORY_REWARD_COOLDOWN_MS]);
+      return record;
+    });
+    send(socket, { type: "arcade-reward-result", requestId, ok: true, transaction, reward: transaction.amount, wallet: await walletSummary(peerId) });
+  } catch (error) {
+    send(socket, { type: "arcade-reward-result", requestId, ok: false, message: error.message || "Reward claim failed." });
+  }
+}
+
+async function adjustWalletByAdmin(peerId, delta, reason) {
+  return withWalletLock(async () => {
+    const wallet = await readWallet(peerId);
+    if (!wallet) throw new Error("Account wallet was not found.");
+    if (!Number.isSafeInteger(delta) || delta === 0) throw new Error("Enter a non-zero whole B-Coin adjustment.");
+    if (wallet.balance + delta < 0) throw new Error("That adjustment would make the wallet negative.");
+    const now = new Date().toISOString();
+    wallet.balance += delta; wallet.updatedAt = now;
+    const transaction = { transactionId: randomUUID(), type: "admin_adjustment", status: "completed", senderId: delta < 0 ? peerId : "admin", recipientId: delta > 0 ? peerId : "admin", amount: Math.abs(delta), signedAmount: delta, caption: reason, reason, createdAt: now };
+    await persistWalletMutation([wallet], transaction);
+    return transaction;
+  });
+}
+
+async function setWalletFrozen(peerId, frozen, reason) {
+  return withWalletLock(async () => {
+    const wallet = await readWallet(peerId);
+    wallet.frozen = Boolean(frozen);
+    wallet.freezeReason = wallet.frozen ? String(reason || "Frozen by Bypassium Support").slice(0, 240) : "";
+    wallet.updatedAt = new Date().toISOString();
+    await writeWallet(wallet);
+    return wallet;
+  });
+}
+
+async function reverseWalletTransaction(transactionId, reason) {
+  return withWalletLock(async () => {
+    const original = await readWalletTransaction(transactionId);
+    if (!original || original.status !== "completed") throw new Error("That completed transaction was not found.");
+    const reverseId = `reverse_${transactionId}`;
+    const existing = await readWalletTransaction(reverseId);
+    if (existing) return existing;
+    const now = new Date().toISOString();
+    let wallets = [];
+    if (original.type === "payment") {
+      const sender = await readWallet(original.senderId);
+      const recipient = await readWallet(original.recipientId);
+      if (recipient.balance < original.amount) throw new Error("The recipient no longer has enough B-Coins to reverse this payment.");
+      recipient.balance -= original.amount; sender.balance += original.amount;
+      recipient.updatedAt = now; sender.updatedAt = now; wallets = [sender, recipient];
+    } else if (original.type === "admin_adjustment") {
+      const peerId = original.senderId === "admin" ? original.recipientId : original.senderId;
+      const wallet = await readWallet(peerId);
+      const delta = -Number(original.signedAmount || 0);
+      if (wallet.balance + delta < 0) throw new Error("That reversal would make the wallet negative.");
+      wallet.balance += delta; wallet.updatedAt = now; wallets = [wallet];
+    } else throw new Error("That transaction type cannot be reversed.");
+    const reversal = { transactionId: reverseId, type: "reversal", status: "completed", senderId: original.recipientId, recipientId: original.senderId, amount: original.amount, caption: reason, reason, reversesTransactionId: transactionId, createdAt: now };
+    await persistWalletMutation(wallets, reversal);
+    return reversal;
+  });
+}
+
 function sanitizeProfile(profile = {}, stampUpdate = false) {
   const status = activeProfileStatus(profile);
   const cleanProfile = {
@@ -5473,6 +6574,7 @@ function enforceSocketRateLimit(socket, action = "general") {
     story: 30,
     "directory-search": 80,
     "account-recovery": 50,
+    wallet: 30,
     general: 90
   };
   const limit = limits[action] || limits.general;
@@ -5527,6 +6629,38 @@ function accountKey(peerId) {
 
 function contactListKey(peerId) {
   return `bypassium:contacts:${peerId}`;
+}
+
+function walletKey(peerId) {
+  return `bypassium:wallet:${peerId}`;
+}
+
+function walletTransactionKey(transactionId) {
+  return `bypassium:wallet-transaction:${transactionId}`;
+}
+
+function walletTransactionIndexKey(peerId) {
+  return `bypassium:wallet-transactions:${peerId}`;
+}
+
+function walletDailySpendKey(peerId) {
+  return `bypassium:wallet-daily:${peerId}:${new Date().toISOString().slice(0, 10)}`;
+}
+
+function callBillingKey(callId) {
+  return `bypassium:call-billing:${callId}`;
+}
+
+function callFreeUsageKey(peerId, date) {
+  return `bypassium:call-free:${peerId}:${date}`;
+}
+
+function arcadeRoundKey(roundId) {
+  return `bypassium:arcade-round:${roundId}`;
+}
+
+function arcadeRewardCooldownKey(peerId, gameId) {
+  return `bypassium:arcade-cooldown:${peerId}:${gameId}`;
 }
 
 function sessionKey(token) {
@@ -5633,6 +6767,10 @@ function storySharesKey(storyId) {
   return `bypassium:story-shares:${storyId}`;
 }
 
+function socialDraftKey(peerId, kind) {
+  return `bypassium:social-draft:${peerId}:${kind}`;
+}
+
 function safeJsonParse(value) {
   try {
     return typeof value === "string" ? JSON.parse(value) : value;
@@ -5658,6 +6796,8 @@ function send(socket, message) {
   const serialized = JSON.stringify(message);
   socket.send(serialized);
 }
+
+await loadPricingConfig().catch((error) => console.error("Pricing configuration could not be loaded:", error.message));
 
 server.listen(PORT, () => {
   console.log(`Bypassium message server listening on ${PORT}`);

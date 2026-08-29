@@ -483,14 +483,42 @@ class SupportBot {
 
   // Uses Groq's OpenAI-compatible Chat Completions endpoint.
   async callGroq(context) {
-    const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+    const fallbackModel = "llama-3.1-8b-instant";
+    const models = [...new Set([this.options.groqModel, fallbackModel].filter(Boolean))];
+    let lastError = null;
+    for (const model of models) {
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        try {
+          return await this.requestGroqCompletion(context, model);
+        } catch (error) {
+          lastError = error;
+          const modelFailure = [400, 404].includes(error.status) || /model|decommission|not found/i.test(error.message);
+          if (modelFailure) break;
+          if (attempt === 0 && (error.status === 429 || error.status >= 500 || error.name === "AbortError")) {
+            await sleep(700);
+            continue;
+          }
+          break;
+        }
+      }
+    }
+    throw lastError || new Error("Groq did not return a response.");
+  }
+
+  async requestGroqCompletion(context, model) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 18000);
+    let response;
+    try {
+      response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
       method: "POST",
+      signal: controller.signal,
       headers: {
         authorization: `Bearer ${this.options.groqApiKey}`,
         "content-type": "application/json"
       },
       body: JSON.stringify({
-        model: this.options.groqModel,
+        model,
         messages: [
           { role: "system", content: SUPPORT_SYSTEM_PROMPT },
           { role: "user", content: context }
@@ -498,10 +526,15 @@ class SupportBot {
         temperature: 0.3,
         max_completion_tokens: 450
       })
-    });
+      });
+    } finally {
+      clearTimeout(timeout);
+    }
     const payload = await response.json().catch(() => ({}));
     if (!response.ok) {
-      throw new Error(payload.error?.message || `Groq request failed with ${response.status}`);
+      const error = new Error(payload.error?.message || `Groq request failed with ${response.status}`);
+      error.status = response.status;
+      throw error;
     }
     return extractChatCompletionText(payload);
   }
