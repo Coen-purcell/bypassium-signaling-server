@@ -87,6 +87,7 @@ class SupportBot {
     this.relayKeys = new Map();
     this.seenMessages = new Set();
     this.conversationMemory = new Map();
+    this.statusTimer = null;
   }
 
   // Keeps the bot online. If Render restarts the connection or the relay disconnects, it signs in again.
@@ -147,6 +148,7 @@ class SupportBot {
     this.identity.sessionToken = signIn.sessionToken;
     this.sessionToken = signIn.sessionToken;
     await this.register();
+    this.startStatusReports();
     if (this.options.publishProfile) this.publishProfile();
     this.send({ type: "sync" });
 
@@ -156,14 +158,45 @@ class SupportBot {
   // Sends a request that expects an account-response with the same requestId.
   request(command, timeoutMs = 12000) {
     const requestId = randomUUID();
-    this.send({ ...command, requestId });
     return new Promise((resolve, reject) => {
       const timeout = setTimeout(() => {
         this.pendingRequests.delete(requestId);
         reject(new Error("Server request timed out."));
       }, timeoutMs);
       this.pendingRequests.set(requestId, { resolve, reject, timeout });
+      try {
+        this.send({ ...command, requestId });
+      } catch (error) {
+        clearTimeout(timeout);
+        this.pendingRequests.delete(requestId);
+        reject(error);
+      }
     });
+  }
+
+  // Reports only operational counters so the main /health endpoint can explain
+  // why an online bot is not replying without exposing prompts or secrets.
+  startStatusReports() {
+    if (this.statusTimer) clearInterval(this.statusTimer);
+    const report = () => {
+      if (!this.ws || this.ws.readyState !== WebSocket.OPEN || !metrics.registered) return;
+      this.send({
+        type: "support-bot-status",
+        status: {
+          directReplies: metrics.directReplies,
+          groupReplies: metrics.groupReplies,
+          ignored: metrics.ignored,
+          errors: metrics.errors,
+          lastError: metrics.lastError,
+          lastIncomingAt: metrics.lastIncomingAt,
+          lastReplyAt: metrics.lastReplyAt,
+          lastIgnoredReason: metrics.lastIgnoredReason,
+        }
+      });
+    };
+    report();
+    this.statusTimer = setInterval(report, 5000);
+    this.statusTimer.unref?.();
   }
 
   // Registers the Support account as an online encrypted client.

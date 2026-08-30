@@ -101,6 +101,7 @@ const adminHubTyping = new Map();
 const pendingQueuedEnvelopes = new Map();
 const cancelledQueuedEnvelopes = new Set();
 const groupCallRooms = new Map();
+let supportBotStatus = null;
 let accountIndexHydrated = false;
 let accountIndexHydrationPromise = null;
 const redis = createRedisClient();
@@ -132,6 +133,7 @@ const server = http.createServer(async (request, response) => {
       onlineClients: clients.size,
       supportBotConfigured,
       supportBotOnline: supportBotConfigured && Boolean(clients.get(supportBotId)?.size),
+      supportBot: supportBotConfigured ? supportBotStatus : null,
       uptimeSeconds: Math.round(process.uptime())
     }));
     return;
@@ -238,6 +240,7 @@ wss.on("connection", (socket, request) => {
       if (message.type === "arcade-round-start") await startArcadeRound(socket, message);
       if (message.type === "arcade-reward") await claimArcadeReward(socket, message);
       if (message.type === "arcade-purchase") await purchaseArcadeItem(socket, message);
+      if (message.type === "support-bot-status") updateSupportBotStatus(socket, message.status);
       if (message.type === "sync") await syncClient(socket);
     } catch (error) {
       console.error("Message handler failed:", error.message);
@@ -257,6 +260,22 @@ wss.on("connection", (socket, request) => {
 
   socket.on("close", () => unregisterClient(socket));
 });
+
+function updateSupportBotStatus(socket, status = {}) {
+  const supportBotId = String(process.env.BOT_PEER_ID || "").trim();
+  if (!supportBotId || socket.bypassiumId !== supportBotId) return;
+  supportBotStatus = {
+    directReplies: Math.max(0, Math.round(Number(status.directReplies) || 0)),
+    groupReplies: Math.max(0, Math.round(Number(status.groupReplies) || 0)),
+    ignored: Math.max(0, Math.round(Number(status.ignored) || 0)),
+    errors: Math.max(0, Math.round(Number(status.errors) || 0)),
+    lastError: String(status.lastError || "").slice(0, 240),
+    lastIncomingAt: String(status.lastIncomingAt || "").slice(0, 40),
+    lastReplyAt: String(status.lastReplyAt || "").slice(0, 40),
+    lastIgnoredReason: String(status.lastIgnoredReason || "").replace(/\b\d{6}\b/g, "account").slice(0, 120),
+    reportedAt: new Date().toISOString()
+  };
+}
 
 function createRedisClient() {
   if (!REDIS_URL) return null;
