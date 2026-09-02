@@ -180,6 +180,9 @@ class SupportBot {
     if (this.statusTimer) clearInterval(this.statusTimer);
     const report = () => {
       if (!this.ws || this.ws.readyState !== WebSocket.OPEN || !metrics.registered) return;
+      // Messages remain in the durable inbox until acknowledged. Polling that
+      // inbox recovers anything missed during registration or a reconnect.
+      this.send({ type: "support-bot-inbox-sync" });
       this.send({
         type: "support-bot-status",
         status: {
@@ -195,7 +198,7 @@ class SupportBot {
       });
     };
     report();
-    this.statusTimer = setInterval(report, 5000);
+    this.statusTimer = setInterval(report, 3000);
     this.statusTimer.unref?.();
   }
 

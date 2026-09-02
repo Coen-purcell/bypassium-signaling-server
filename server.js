@@ -16,10 +16,10 @@ const DEFAULT_HISTORY_SYNC_LIMIT = Number(process.env.DEFAULT_HISTORY_SYNC_LIMIT
 const MAX_HISTORY_SYNC_LIMIT = Number(process.env.MAX_HISTORY_SYNC_LIMIT || 5000);
 const MAX_PROFILE_PICTURE_CHARS = 18000;
 const MAX_UPSTASH_RPUSH_ITEMS = 4;
-const MAX_UPSTASH_RPUSH_CHARS = 6_000_000;
-const MAX_UPSTASH_COMMAND_CHARS = 8_500_000;
+const MAX_UPSTASH_RPUSH_CHARS = 18_000_000;
+const MAX_UPSTASH_COMMAND_CHARS = 20_000_000;
 const MAX_QUEUED_ENVELOPE_CHARS = 7_500_000;
-const MAX_WEBSOCKET_PAYLOAD_CHARS = 8_500_000;
+const MAX_WEBSOCKET_PAYLOAD_CHARS = 20_000_000;
 const MAX_HISTORY_BATCH_CHARS = 240_000;
 const OFFLINE_DELIVERY_BATCH_SIZE = 6;
 const BACKGROUND_DELIVERY_YIELD_MS = 8;
@@ -54,7 +54,8 @@ const CALL_BLOCK_SECONDS = 60;
 const CALL_BILLING_TTL_SECONDS = 6 * 60 * 60;
 const STORY_TTL_SECONDS = 24 * 60 * 60;
 const SOCIAL_DRAFT_TTL_SECONDS = 30 * 24 * 60 * 60;
-const REEL_TTL_SECONDS = Math.max(7 * 24 * 60 * 60, Number(process.env.REEL_TTL_SECONDS || 365 * 24 * 60 * 60));
+const REEL_TTL_SECONDS = 10 * 365 * 24 * 60 * 60;
+const MAX_SOCIAL_ITEMS_PER_VIEWER = Math.max(1000, Number(process.env.MAX_SOCIAL_ITEMS_PER_VIEWER) || 1000);
 const MAX_STORY_RECIPIENTS = 250;
 const REDIS_URL = process.env.REDIS_URL || process.env.RENDER_REDIS_URL || process.env.KEY_VALUE_URL || "";
 const UPSTASH_REST_URL = process.env.UPSTASH_REDIS_REST_URL || "";
@@ -241,6 +242,7 @@ wss.on("connection", (socket, request) => {
       if (message.type === "arcade-reward") await claimArcadeReward(socket, message);
       if (message.type === "arcade-purchase") await purchaseArcadeItem(socket, message);
       if (message.type === "support-bot-status") updateSupportBotStatus(socket, message.status);
+      if (message.type === "support-bot-inbox-sync") await syncSupportBotInbox(socket);
       if (message.type === "sync") await syncClient(socket);
     } catch (error) {
       console.error("Message handler failed:", error.message);
@@ -275,6 +277,14 @@ function updateSupportBotStatus(socket, status = {}) {
     lastIgnoredReason: String(status.lastIgnoredReason || "").replace(/\b\d{6}\b/g, "account").slice(0, 120),
     reportedAt: new Date().toISOString()
   };
+}
+
+// Gives the first-party Support bot a cheap durable-inbox poll without sending
+// the full account, group, contact and presence sync every few seconds.
+async function syncSupportBotInbox(socket) {
+  const supportBotId = String(process.env.BOT_PEER_ID || "").trim();
+  if (!supportBotId || socket.bypassiumId !== supportBotId) return;
+  await deliverOfflineMessages(socket);
 }
 
 function createRedisClient() {
@@ -764,6 +774,34 @@ async function handleAdminHubApi(request, response, url, corsHeaders) {
       return;
     }
 
+    if (request.method === "POST" && url.pathname === "/admin-hub/api/updates") {
+      const body = await readRequestJson(request);
+      const version = String(body.version || "").trim().replace(/^v/i, "").slice(0, 24);
+      if (!/^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/.test(version)) throw new Error("Use a version like 5.5.8.");
+      const state = await getAdminHubState();
+      state.updates ||= [];
+      const existing = state.updates.find((item) => item.version === version);
+      if (body.remove === true) {
+        if (!existing) throw new Error("That version does not have release notes.");
+        state.updates = state.updates.filter((item) => item.version !== version);
+      } else {
+        const description = String(body.description || "").trim().slice(0, 5000);
+        if (!description) throw new Error("Write an update description first.");
+        const now = new Date().toISOString();
+        if (existing) {
+          existing.description = description;
+          existing.updatedAt = now;
+          existing.updatedBy = peerId;
+        } else {
+          state.updates.push({ id: randomUUID(), version, description, createdAt: now, createdBy: peerId, updatedAt: now, updatedBy: peerId });
+        }
+        state.updates = state.updates.slice(-100);
+      }
+      await setAdminHubState(state);
+      sendJson(response, 200, { ok: true, state: visibleAdminHubState(state, peerId) }, corsHeaders);
+      return;
+    }
+
     if (request.method === "POST" && url.pathname === "/admin-hub/api/chat") {
       const body = await readRequestJson(request);
       const text = String(body.text || "").trim().slice(0, 2000);
@@ -1038,7 +1076,7 @@ function defaultAdminHubState() {
       updatedBy: ""
     };
   }
-  return { version: 2, chat: [], boards, reads: {}, notifications: [] };
+  return { version: 3, chat: [], boards, reads: {}, notifications: [], updates: [] };
 }
 
 async function getAdminHubState() {
@@ -1060,7 +1098,7 @@ async function getAdminHubState() {
       attachments: Array.isArray(savedBoard.attachments) ? savedBoard.attachments : []
     };
   }
-  return { ...fallback, ...parsed, boards, reads: parsed.reads || {}, notifications: Array.isArray(parsed.notifications) ? parsed.notifications : [], chat: Array.isArray(parsed.chat) ? parsed.chat : [] };
+  return { ...fallback, ...parsed, boards, reads: parsed.reads || {}, notifications: Array.isArray(parsed.notifications) ? parsed.notifications : [], chat: Array.isArray(parsed.chat) ? parsed.chat : [], updates: Array.isArray(parsed.updates) ? parsed.updates : [] };
 }
 
 async function setAdminHubState(state) {
@@ -1085,7 +1123,7 @@ function visibleAdminHubState(state, peerId) {
   }).map(([section]) => section);
   const notifications = (state.notifications || []).filter((item) => item.targetId === peerId && !item.read).slice(-100);
   const typing = [...adminHubTyping.entries()].filter(([id, expiresAt]) => id !== peerId && Number(expiresAt) > Date.now()).map(([id]) => id);
-  return { version: state.version || 2, chat: state.chat || [], boards, unreadSections, notifications, typing };
+  return { version: state.version || 3, chat: state.chat || [], boards, updates: state.updates || [], unreadSections, notifications, typing };
 }
 
 function addAdminHubNotifications(state, targetIds, authorId, scope, section, message) {
@@ -4200,7 +4238,7 @@ async function setStoryRecord(record) {
 
 async function getStoryRecord(storyId) {
   const cached = memoryStories.get(storyId);
-  if (cached && Date.parse(cached.expiresAt) > Date.now()) return cached;
+  if (cached && Date.parse(cached.expiresAt) > Date.now()) return refreshReelRetention(cached);
   let stored = null;
   if (redis) stored = await redis.get(storyKey(storyId));
   if (upstashRestEnabled) stored = await upstashCommand(["GET", storyKey(storyId)]);
@@ -4208,7 +4246,19 @@ async function getStoryRecord(storyId) {
   const story = JSON.parse(stored);
   if (Date.parse(story.expiresAt) <= Date.now()) return null;
   memoryStories.set(storyId, story);
-  return story;
+  return refreshReelRetention(story);
+}
+
+async function refreshReelRetention(story) {
+  if (!story || !["reel", "highlight"].includes(story.contentKind)) return story;
+  const refreshThreshold = Date.now() + 5 * 365 * 24 * 60 * 60 * 1000;
+  if (Date.parse(story.expiresAt) >= refreshThreshold) return story;
+  const refreshed = {
+    ...story,
+    expiresAt: new Date(Date.now() + REEL_TTL_SECONDS * 1000).toISOString()
+  };
+  await setStoryRecord(refreshed);
+  return refreshed;
 }
 
 async function getStoriesForViewer(viewerId) {
@@ -4223,7 +4273,7 @@ async function getStoriesForViewer(viewerId) {
     ids = await upstashCommand(["ZRANGEBYSCORE", storyIndexKey(viewerId), Date.now(), "+inf"]);
   }
   const stories = [];
-  const uniqueIds = [...new Set(ids)].slice(-100);
+  const uniqueIds = [...new Set(ids)].slice(-MAX_SOCIAL_ITEMS_PER_VIEWER);
   for (let index = 0; index < uniqueIds.length; index += 12) {
     const batch = await Promise.all(uniqueIds.slice(index, index + 12).map(getStoryRecord));
     for (const story of batch) if (story?.encryptedKeys?.[viewerId]) stories.push(story);
