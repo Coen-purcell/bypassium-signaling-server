@@ -3,7 +3,7 @@ import { randomBytes, randomUUID, scryptSync, timingSafeEqual } from "node:crypt
 import Redis from "ioredis";
 import { WebSocketServer } from "ws";
 
-const SERVER_VERSION = "5.5.9";
+const SERVER_VERSION = "5.5.10";
 const PORT = Number(process.env.PORT || 10000);
 const OFFLINE_MESSAGE_TTL_SECONDS = 90 * 24 * 60 * 60;
 const HISTORY_TTL_SECONDS = Number(process.env.HISTORY_TTL_SECONDS || 0);
@@ -15,7 +15,7 @@ const MAX_OFFLINE_MESSAGES_PER_USER = 500;
 const MAX_HISTORY_MESSAGES_PER_USER = Number(process.env.MAX_HISTORY_MESSAGES_PER_USER || 0);
 const DEFAULT_HISTORY_SYNC_LIMIT = Number(process.env.DEFAULT_HISTORY_SYNC_LIMIT || 300);
 const MAX_HISTORY_SYNC_LIMIT = Number(process.env.MAX_HISTORY_SYNC_LIMIT || 5000);
-const MAX_PROFILE_PICTURE_CHARS = 18000;
+const MAX_PROFILE_PICTURE_CHARS = 96000;
 const MAX_UPSTASH_RPUSH_ITEMS = 4;
 const MAX_UPSTASH_RPUSH_CHARS = 18_000_000;
 const MAX_UPSTASH_COMMAND_CHARS = 20_000_000;
@@ -6643,10 +6643,12 @@ function sanitizeProfileBadge(value = "") {
 }
 
 function sanitizeProfilePicture(value = "") {
-  const picture = String(value || "");
+  const picture = String(value || "").trim();
   if (!picture) return "";
-  if (!picture.startsWith("data:image/")) return "";
-  return picture.slice(0, MAX_PROFILE_PICTURE_CHARS);
+  if (/^https:\/\/[^\s]{1,2040}$/i.test(picture)) return picture;
+  if (!/^data:image\/[a-z0-9.+-]+;base64,/i.test(picture)) return "";
+  // Slicing a data URL corrupts the image while still making it look valid.
+  return picture.length <= MAX_PROFILE_PICTURE_CHARS ? picture : "";
 }
 
 function sanitizeCallDescription(description = null) {
