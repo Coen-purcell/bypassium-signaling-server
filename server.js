@@ -3,6 +3,7 @@ import { randomBytes, randomUUID, scryptSync, timingSafeEqual } from "node:crypt
 import Redis from "ioredis";
 import { WebSocketServer } from "ws";
 
+const SERVER_VERSION = "5.5.9";
 const PORT = Number(process.env.PORT || 10000);
 const OFFLINE_MESSAGE_TTL_SECONDS = 90 * 24 * 60 * 60;
 const HISTORY_TTL_SECONDS = Number(process.env.HISTORY_TTL_SECONDS || 0);
@@ -16,10 +17,17 @@ const DEFAULT_HISTORY_SYNC_LIMIT = Number(process.env.DEFAULT_HISTORY_SYNC_LIMIT
 const MAX_HISTORY_SYNC_LIMIT = Number(process.env.MAX_HISTORY_SYNC_LIMIT || 5000);
 const MAX_PROFILE_PICTURE_CHARS = 18000;
 const MAX_UPSTASH_RPUSH_ITEMS = 4;
-const MAX_UPSTASH_RPUSH_CHARS = 6_000_000;
-const MAX_UPSTASH_COMMAND_CHARS = 8_500_000;
+const MAX_UPSTASH_RPUSH_CHARS = 18_000_000;
+const MAX_UPSTASH_COMMAND_CHARS = 20_000_000;
 const MAX_QUEUED_ENVELOPE_CHARS = 7_500_000;
-const MAX_WEBSOCKET_PAYLOAD_CHARS = 8_500_000;
+const MAX_WEBSOCKET_PAYLOAD_CHARS = 20_000_000;
+const MEDIA_CHUNK_BYTES = 512 * 1024;
+const MAX_PERSISTENT_MEDIA_BYTES = Math.max(25 * 1024 * 1024, Number(process.env.MAX_MEDIA_UPLOAD_BYTES) || 250 * 1024 * 1024);
+const MAX_MEMORY_MEDIA_BYTES = 25 * 1024 * 1024;
+const MAX_MEMORY_MEDIA_TOTAL_BYTES = 100 * 1024 * 1024;
+const MEDIA_UPLOAD_TTL_SECONDS = 24 * 60 * 60;
+const MEDIA_CONTENT_TTL_SECONDS = 10 * 365 * 24 * 60 * 60;
+const MEMORY_MEDIA_CONTENT_TTL_SECONDS = 6 * 60 * 60;
 const MAX_HISTORY_BATCH_CHARS = 240_000;
 const OFFLINE_DELIVERY_BATCH_SIZE = 6;
 const BACKGROUND_DELIVERY_YIELD_MS = 8;
@@ -87,6 +95,8 @@ const memoryStoryReactions = new Map();
 const memoryStoryComments = new Map();
 const memoryStoryShares = new Map();
 const memorySocialDrafts = new Map();
+const memoryMediaUploads = new Map();
+const memoryMediaChunks = new Map();
 const memoryWallets = new Map();
 const memoryWalletTransactions = new Map();
 const memoryWalletIndexes = new Map();
@@ -102,6 +112,7 @@ const adminHubTyping = new Map();
 const pendingQueuedEnvelopes = new Map();
 const cancelledQueuedEnvelopes = new Set();
 const groupCallRooms = new Map();
+const httpRateWindows = new Map();
 let supportBotStatus = null;
 let accountIndexHydrated = false;
 let accountIndexHydrationPromise = null;
@@ -111,7 +122,7 @@ const upstashRestEnabled = Boolean(!redis && UPSTASH_REST_URL && UPSTASH_REST_TO
 const server = http.createServer(async (request, response) => {
   const corsHeaders = {
     "access-control-allow-origin": "*",
-    "access-control-allow-methods": "GET, POST, OPTIONS",
+    "access-control-allow-methods": "GET, POST, PUT, DELETE, OPTIONS",
     "access-control-allow-headers": "content-type, authorization, x-admin-token, x-bypassium-id"
   };
   if (request.method === "OPTIONS") {
@@ -130,6 +141,7 @@ const server = http.createServer(async (request, response) => {
     response.writeHead(200, { ...corsHeaders, "content-type": "application/json" });
     response.end(JSON.stringify({
       ok: true,
+      version: SERVER_VERSION,
       storage: storageMode(),
       onlineClients: clients.size,
       supportBotConfigured,
@@ -137,6 +149,33 @@ const server = http.createServer(async (request, response) => {
       supportBot: supportBotConfigured ? supportBotStatus : null,
       uptimeSeconds: Math.round(process.uptime())
     }));
+    return;
+  }
+
+  if (request.method === "GET" && url.pathname === "/updates") {
+    const state = await getAdminHubState();
+    const updates = (Array.isArray(state.updates) ? state.updates : [])
+      .slice(-100)
+      .reverse()
+      .map(({ id, version, title, description, createdAt, updatedAt }) => ({
+        id,
+        version,
+        title: String(title || "Bypassium update").slice(0, 80),
+        description,
+        createdAt,
+        updatedAt
+      }));
+    sendJson(response, 200, { ok: true, updates }, { ...corsHeaders, "cache-control": "no-store" });
+    return;
+  }
+
+  if (url.pathname.startsWith("/account/")) {
+    await handlePublicAccountApi(request, response, url, corsHeaders);
+    return;
+  }
+
+  if (url.pathname === "/media/uploads" || url.pathname.startsWith("/media/uploads/") || url.pathname.startsWith("/media/content/")) {
+    await handleMediaRequest(request, response, url, corsHeaders);
     return;
   }
 
@@ -163,6 +202,167 @@ const server = http.createServer(async (request, response) => {
   response.writeHead(200, { ...corsHeaders, "content-type": "text/plain" });
   response.end("Bypassium message server is running.");
 });
+
+async function handleMediaRequest(request, response, url, corsHeaders) {
+  try {
+    const contentMatch = url.pathname.match(/^\/media\/content\/([a-f0-9-]{36})$/i);
+    if (request.method === "GET" && contentMatch) {
+      const record = await getMediaUpload(contentMatch[1]);
+      if (!record?.completed || !safeEqualString(String(url.searchParams.get("token") || ""), record.accessToken)) {
+        sendJson(response, 404, { ok: false, message: "Media not found." }, corsHeaders);
+        return;
+      }
+      response.writeHead(200, { ...corsHeaders, "content-type": "application/octet-stream", "content-length": String(record.uploadedBytes), "cache-control": "private, max-age=3600" });
+      for (let index = 0; index < record.chunkCount; index += 1) {
+        const chunk = await getMediaChunk(record.uploadId, index);
+        if (!chunk) throw new Error("Stored media is incomplete.");
+        if (!response.write(chunk)) await new Promise((resolve) => response.once("drain", resolve));
+      }
+      response.end();
+      return;
+    }
+
+    const peerId = String(request.headers["x-bypassium-id"] || "").trim();
+    const sessionToken = String(request.headers.authorization || "").replace(/^Bearer\s+/i, "").trim();
+    if (!(await validSession(peerId, sessionToken))) {
+      sendJson(response, 401, { ok: false, message: "Sign in again before uploading media." }, corsHeaders);
+      return;
+    }
+
+    if (request.method === "POST" && url.pathname === "/media/uploads") {
+      await cleanupExpiredMemoryMedia();
+      const body = await readRequestJson(request);
+      const uploadId = /^[a-f0-9-]{36}$/i.test(String(body.uploadId || "")) ? String(body.uploadId) : randomUUID();
+      const existing = await getMediaUpload(uploadId);
+      if (existing) {
+        if (existing.ownerId !== peerId) throw new Error("That upload identifier is already in use.");
+        sendJson(response, 200, mediaUploadResponse(existing, request), corsHeaders);
+        return;
+      }
+      const originalBytes = Math.max(0, Math.round(Number(body.originalBytes) || 0));
+      if (!originalBytes || originalBytes > mediaUploadMaxBytes()) throw new Error(`Choose media under ${Math.floor(mediaUploadMaxBytes() / 1024 / 1024)} MB.`);
+      const chunkCount = Math.ceil(originalBytes / MEDIA_CHUNK_BYTES);
+      const record = { uploadId, ownerId: peerId, accessToken: randomBytes(24).toString("base64url"), originalBytes, uploadedBytes: 0, chunkBytes: MEDIA_CHUNK_BYTES, chunkCount, received: [], completed: false, name: String(body.name || "Encrypted media").slice(0, 120), mediaType: String(body.mediaType || "application/octet-stream").slice(0, 100), createdAt: new Date().toISOString(), expiresAt: new Date(Date.now() + MEDIA_UPLOAD_TTL_SECONDS * 1000).toISOString() };
+      await setMediaUpload(record);
+      sendJson(response, 201, mediaUploadResponse(record, request), corsHeaders);
+      return;
+    }
+
+    const chunkMatch = url.pathname.match(/^\/media\/uploads\/([a-f0-9-]{36})\/chunks\/(\d+)$/i);
+    if (request.method === "PUT" && chunkMatch) {
+      const record = await getMediaUpload(chunkMatch[1]);
+      const index = Number(chunkMatch[2]);
+      if (!record || record.ownerId !== peerId || record.completed) throw new Error("Upload session is unavailable.");
+      if (!Number.isInteger(index) || index < 0 || index >= record.chunkCount) throw new Error("Invalid media chunk.");
+      const encryptedChunk = await readBinaryBody(request, MEDIA_CHUNK_BYTES + 64);
+      if (encryptedChunk.length < 29 || encryptedChunk.length > MEDIA_CHUNK_BYTES + 64) throw new Error("Invalid encrypted media chunk size.");
+      const previous = await getMediaChunk(record.uploadId, index);
+      if (!redis && !upstashRestEnabled && memoryMediaStoredBytes() - (previous?.length || 0) + encryptedChunk.length > MAX_MEMORY_MEDIA_TOTAL_BYTES) throw new Error("Temporary media storage is full. Try again after restarting the local server.");
+      await setMediaChunk(record.uploadId, index, encryptedChunk);
+      const received = new Set(record.received || []); received.add(index);
+      record.received = [...received].sort((a, b) => a - b);
+      record.uploadedBytes = Math.max(0, Number(record.uploadedBytes) || 0) - (previous?.length || 0) + encryptedChunk.length;
+      await setMediaUpload(record);
+      sendJson(response, 200, { ok: true, uploadId: record.uploadId, index, receivedChunks: record.received.length, chunkCount: record.chunkCount }, corsHeaders);
+      return;
+    }
+
+    const completeMatch = url.pathname.match(/^\/media\/uploads\/([a-f0-9-]{36})\/complete$/i);
+    if (request.method === "POST" && completeMatch) {
+      const record = await getMediaUpload(completeMatch[1]);
+      if (!record || record.ownerId !== peerId) throw new Error("Upload session is unavailable.");
+      if (!record.completed && (record.received || []).length !== record.chunkCount) throw new Error("Upload is incomplete.");
+      record.completed = true;
+      record.completedAt ||= new Date().toISOString();
+      const completedTtl = storageMode() === "memory" ? MEMORY_MEDIA_CONTENT_TTL_SECONDS : MEDIA_CONTENT_TTL_SECONDS;
+      record.expiresAt = new Date(Date.now() + completedTtl * 1000).toISOString();
+      await setMediaUpload(record, completedTtl);
+      if (redis) {
+        const pipeline = redis.multi();
+        for (let index = 0; index < record.chunkCount; index += 1) pipeline.expire(mediaChunkKey(record.uploadId, index), MEDIA_CONTENT_TTL_SECONDS);
+        await pipeline.exec();
+      } else if (upstashRestEnabled) {
+        await upstashPipeline(Array.from({ length: record.chunkCount }, (_, index) => ["EXPIRE", mediaChunkKey(record.uploadId, index), MEDIA_CONTENT_TTL_SECONDS]));
+      }
+      sendJson(response, 200, mediaUploadResponse(record, request), corsHeaders);
+      return;
+    }
+
+    const uploadMatch = url.pathname.match(/^\/media\/uploads\/([a-f0-9-]{36})$/i);
+    if (request.method === "DELETE" && uploadMatch) {
+      const record = await getMediaUpload(uploadMatch[1]);
+      if (record?.ownerId === peerId && !record.completed) await deleteMediaUpload(record);
+      sendJson(response, 200, { ok: true, cancelled: true }, corsHeaders);
+      return;
+    }
+    sendJson(response, 404, { ok: false, message: "Unknown media endpoint." }, corsHeaders);
+  } catch (error) {
+    sendJson(response, 400, { ok: false, message: error.message || "Media request failed." }, corsHeaders);
+  }
+}
+
+function mediaUploadMaxBytes() { return storageMode() === "memory" ? MAX_MEMORY_MEDIA_BYTES : MAX_PERSISTENT_MEDIA_BYTES; }
+function mediaUploadKey(uploadId) { return `bypassium:media:upload:${uploadId}`; }
+function mediaChunkKey(uploadId, index) { return `bypassium:media:chunk:${uploadId}:${index}`; }
+function mediaUploadResponse(record, request) {
+  const protocol = String(request.headers["x-forwarded-proto"] || "http").split(",")[0];
+  const origin = `${protocol}://${request.headers.host}`;
+  return { ok: true, uploadId: record.uploadId, chunkBytes: record.chunkBytes, chunkCount: record.chunkCount, received: record.received || [], completed: Boolean(record.completed), persistent: storageMode() !== "memory", maximumBytes: mediaUploadMaxBytes(), mediaUrl: `${origin}/media/content/${record.uploadId}?token=${encodeURIComponent(record.accessToken)}` };
+}
+async function setMediaUpload(record, ttlSeconds = MEDIA_UPLOAD_TTL_SECONDS) {
+  memoryMediaUploads.set(record.uploadId, record);
+  const value = JSON.stringify(record);
+  if (redis) await redis.set(mediaUploadKey(record.uploadId), value, "EX", ttlSeconds);
+  else if (upstashRestEnabled) await upstashCommand(["SET", mediaUploadKey(record.uploadId), value, "EX", ttlSeconds]);
+}
+async function getMediaUpload(uploadId) {
+  const cached = memoryMediaUploads.get(uploadId);
+  if (cached) return cached;
+  const value = redis ? await redis.get(mediaUploadKey(uploadId)) : upstashRestEnabled ? await upstashCommand(["GET", mediaUploadKey(uploadId)]) : null;
+  const record = value ? safeJsonParse(value) : null;
+  if (record) memoryMediaUploads.set(uploadId, record);
+  return record;
+}
+async function setMediaChunk(uploadId, index, chunk) {
+  if (!redis && !upstashRestEnabled) memoryMediaChunks.set(mediaChunkKey(uploadId, index), chunk);
+  const value = chunk.toString("base64");
+  if (redis) await redis.set(mediaChunkKey(uploadId, index), value, "EX", MEDIA_UPLOAD_TTL_SECONDS);
+  else if (upstashRestEnabled) await upstashCommand(["SET", mediaChunkKey(uploadId, index), value, "EX", MEDIA_UPLOAD_TTL_SECONDS]);
+}
+async function getMediaChunk(uploadId, index) {
+  const key = mediaChunkKey(uploadId, index);
+  const cached = !redis && !upstashRestEnabled ? memoryMediaChunks.get(key) : null;
+  if (cached) return cached;
+  const value = redis ? await redis.get(key) : upstashRestEnabled ? await upstashCommand(["GET", key]) : null;
+  if (!value) return null;
+  const chunk = Buffer.from(value, "base64");
+  if (!redis && !upstashRestEnabled) memoryMediaChunks.set(key, chunk);
+  return chunk;
+}
+async function deleteMediaUpload(record) {
+  memoryMediaUploads.delete(record.uploadId);
+  for (let index = 0; index < record.chunkCount; index += 1) memoryMediaChunks.delete(mediaChunkKey(record.uploadId, index));
+  const keys = [mediaUploadKey(record.uploadId), ...Array.from({ length: record.chunkCount }, (_, index) => mediaChunkKey(record.uploadId, index))];
+  if (redis && keys.length) await redis.del(...keys);
+  else if (upstashRestEnabled && keys.length) await upstashPipeline(keys.map((key) => ["DEL", key]));
+}
+function memoryMediaStoredBytes() {
+  let total = 0;
+  for (const chunk of memoryMediaChunks.values()) total += chunk.length;
+  return total;
+}
+async function cleanupExpiredMemoryMedia() {
+  if (redis || upstashRestEnabled) return;
+  const now = Date.now();
+  for (const record of [...memoryMediaUploads.values()]) {
+    if (Date.parse(record.expiresAt || "") <= now) await deleteMediaUpload(record);
+  }
+}
+async function readBinaryBody(request, maximumBytes) {
+  const chunks = []; let total = 0;
+  for await (const chunk of request) { total += chunk.length; if (total > maximumBytes) throw new Error("Media chunk is too large."); chunks.push(chunk); }
+  return Buffer.concat(chunks, total);
+}
 
 const wss = new WebSocketServer({ server, maxPayload: MAX_WEBSOCKET_PAYLOAD_CHARS });
 
@@ -785,15 +985,17 @@ async function handleAdminHubApi(request, response, url, corsHeaders) {
         if (!existing) throw new Error("That version does not have release notes.");
         state.updates = state.updates.filter((item) => item.version !== version);
       } else {
+        const title = String(body.title || "Bypassium update").trim().slice(0, 80) || "Bypassium update";
         const description = String(body.description || "").trim().slice(0, 5000);
         if (!description) throw new Error("Write an update description first.");
         const now = new Date().toISOString();
         if (existing) {
+          existing.title = title;
           existing.description = description;
           existing.updatedAt = now;
           existing.updatedBy = peerId;
         } else {
-          state.updates.push({ id: randomUUID(), version, description, createdAt: now, createdBy: peerId, updatedAt: now, updatedBy: peerId });
+          state.updates.push({ id: randomUUID(), version, title, description, createdAt: now, createdBy: peerId, updatedAt: now, updatedBy: peerId });
         }
         state.updates = state.updates.slice(-100);
       }
@@ -1205,6 +1407,63 @@ function sendJson(response, status, payload, corsHeaders = {}) {
     "cache-control": "no-store"
   });
   response.end(JSON.stringify(payload));
+}
+
+async function handlePublicAccountApi(request, response, url, corsHeaders) {
+  const remoteAddress = String(request.socket?.remoteAddress || "unknown");
+  try {
+    if (request.method === "GET" && url.pathname === "/account/search") {
+      if (!allowHttpAction(remoteAddress, "account-search", 60)) {
+        sendJson(response, 429, { ok: false, message: "Too many searches. Try again shortly." }, corsHeaders);
+        return;
+      }
+      const query = String(url.searchParams.get("q") || "").trim().toLowerCase().slice(0, 50);
+      const limit = Math.min(20, Math.max(1, Number(url.searchParams.get("limit")) || 12));
+      const results = query.length < 2 ? [] : await findPublicAccounts(query, limit);
+      sendJson(response, 200, { ok: true, query, results }, corsHeaders);
+      return;
+    }
+
+    if (request.method === "POST" && ["/account/sign-in", "/account/session-sign-in"].includes(url.pathname)) {
+      if (!String(request.headers["content-type"] || "").toLowerCase().includes("application/json")) {
+        sendJson(response, 415, { ok: false, message: "This account request must use JSON." }, corsHeaders);
+        return;
+      }
+      if (!allowHttpAction(remoteAddress, "account-sign-in", 30)) {
+        sendJson(response, 429, { ok: false, message: "Too many sign-in attempts. Try again shortly." }, corsHeaders);
+        return;
+      }
+      const body = await readRequestJson(request);
+      const result = url.pathname === "/account/session-sign-in"
+        ? await authenticateAccountSession(body, remoteAddress)
+        : await authenticateAccountPassword(body, remoteAddress);
+      sendJson(response, result.status, result.payload, corsHeaders);
+      return;
+    }
+
+    sendJson(response, 404, { ok: false, message: "Unknown account endpoint." }, corsHeaders);
+  } catch (error) {
+    const message = error instanceof SyntaxError ? "The account request was not valid JSON." : error.message || "The account request could not be completed.";
+    sendJson(response, 400, { ok: false, message }, corsHeaders);
+  }
+}
+
+function allowHttpAction(remoteAddress, action, limit, windowMs = 60000) {
+  const now = Date.now();
+  const key = `${remoteAddress}:${action}`;
+  const current = httpRateWindows.get(key) || { startedAt: now, count: 0 };
+  if (now - current.startedAt >= windowMs) {
+    current.startedAt = now;
+    current.count = 0;
+  }
+  current.count += 1;
+  httpRateWindows.set(key, current);
+  if (httpRateWindows.size > 5000) {
+    for (const [entryKey, entry] of httpRateWindows) {
+      if (now - entry.startedAt > windowMs * 2) httpRateWindows.delete(entryKey);
+    }
+  }
+  return current.count <= limit;
 }
 
 function adminPageHtml() {
@@ -1786,6 +2045,7 @@ async function registerClient(socket, message) {
   send(socket, {
     type: "registered",
     peerId: byPassiumId,
+    serverVersion: SERVER_VERSION,
     groups: await getGroupsForMember(byPassiumId),
     features: {
       encryptedRelay: true,
@@ -1808,6 +2068,10 @@ async function registerClient(socket, message) {
       encryptedStories: true,
       encryptedStoryFeedback: true,
       encryptedReels: true,
+      encryptedMediaUploads: true,
+      mediaUploadChunkBytes: MEDIA_CHUNK_BYTES,
+      mediaUploadMaxBytes: mediaUploadMaxBytes(),
+      persistentMediaUploads: storageMode() !== "memory",
       encryptedSocialDrafts: true,
       storyWatchAnalytics: true,
       accounts: true,
@@ -2381,47 +2645,46 @@ async function claimLegacyAccount(socket, message = {}) {
 }
 
 async function signInAccount(socket, message = {}) {
+  const result = await authenticateAccountPassword(message, socket.remoteAddress);
+  sendAccountResponse(socket, message, result.payload.ok, result.payload.message, result.payload);
+}
+
+async function authenticateAccountPassword(message = {}, remoteAddress = "") {
   const peerId = String(message.peerId || "").trim();
   const password = String(message.password || "");
   const account = /^\d{6}$/.test(peerId) ? await getAccount(peerId) : null;
   const accountBlock = await accountBlockInfo(peerId, "account");
   if (accountBlock) {
-    sendAccountResponse(socket, message, false, accountBlock.message, accountBlock);
-    return;
+    return { status: 403, payload: { ok: false, message: accountBlock.message, ...accountBlock } };
   }
   if (!account?.passwordHash || !verifyPassword(password, account)) {
-    void recordSafetyLog("failed-sign-in", peerId, { reason: "bad-credentials", remoteAddress: socket.remoteAddress }).catch((error) => console.error("Safety log write failed:", error.message));
-    sendAccountResponse(socket, message, false, "Code or password is incorrect.");
-    return;
+    void recordSafetyLog("failed-sign-in", peerId, { reason: "bad-credentials", remoteAddress }).catch((error) => console.error("Safety log write failed:", error.message));
+    return { status: 401, payload: { ok: false, message: "Code or password is incorrect." } };
   }
   const sessionToken = issueSession(peerId);
-  void recordSafetyLog("sign-in", peerId, { remoteAddress: socket.remoteAddress }).catch((error) => console.error("Safety log write failed:", error.message));
-  sendAccountResponse(socket, message, true, "Signed in.", {
-    sessionToken,
-    account: publicAccountStatus(account, true),
-    encryptedIdentityBackup: account.encryptedIdentityBackup || null
-  });
+  void recordSafetyLog("sign-in", peerId, { remoteAddress }).catch((error) => console.error("Safety log write failed:", error.message));
+  return { status: 200, payload: { ok: true, message: "Signed in.", sessionToken, account: publicAccountStatus(account, true), encryptedIdentityBackup: account.encryptedIdentityBackup || null } };
 }
 
 async function signInWithSession(socket, message = {}) {
+  const result = await authenticateAccountSession(message, socket.remoteAddress);
+  sendAccountResponse(socket, message, result.payload.ok, result.payload.message, result.payload);
+}
+
+async function authenticateAccountSession(message = {}, remoteAddress = "") {
   const peerId = String(message.peerId || "").trim();
   const sessionToken = String(message.sessionToken || "");
   const account = /^\d{6}$/.test(peerId) ? await getAccount(peerId) : null;
   const accountBlock = await accountBlockInfo(peerId, "account");
   if (accountBlock) {
-    sendAccountResponse(socket, message, false, accountBlock.message, accountBlock);
-    return;
+    return { status: 403, payload: { ok: false, message: accountBlock.message, ...accountBlock } };
   }
   if (!account?.passwordHash || !(await validSession(peerId, sessionToken))) {
-    void recordSafetyLog("failed-session-sign-in", peerId, { reason: "expired-session", remoteAddress: socket.remoteAddress }).catch((error) => console.error("Safety log write failed:", error.message));
-    sendAccountResponse(socket, message, false, "Saved sign-in expired. Enter your password once to trust this device again.");
-    return;
+    void recordSafetyLog("failed-session-sign-in", peerId, { reason: "expired-session", remoteAddress }).catch((error) => console.error("Safety log write failed:", error.message));
+    return { status: 401, payload: { ok: false, code: "session-expired", message: "Saved sign-in expired. Enter your password once to trust this device again." } };
   }
-  void recordSafetyLog("session-sign-in", peerId, { remoteAddress: socket.remoteAddress }).catch((error) => console.error("Safety log write failed:", error.message));
-  sendAccountResponse(socket, message, true, "Trusted device signed in.", {
-    sessionToken,
-    account: publicAccountStatus(account, true)
-  });
+  void recordSafetyLog("session-sign-in", peerId, { remoteAddress }).catch((error) => console.error("Safety log write failed:", error.message));
+  return { status: 200, payload: { ok: true, message: "Trusted device signed in.", sessionToken, account: publicAccountStatus(account, true) } };
 }
 
 async function changePassword(socket, message = {}) {
@@ -3367,23 +3630,23 @@ async function searchAccounts(socket, message = {}) {
   if (!allowUserAction(socket, "directory-search")) return;
   const query = String(message.query || "").trim().toLowerCase().slice(0, 50);
   const limit = Math.min(30, Math.max(5, Number(message.limit) || 18));
-  if (query.length < 2) {
-    send(socket, {
-      type: "account-search-results",
-      requestId: String(message.requestId || ""),
-      ok: true,
-      query,
-      results: []
-    });
-    return;
-  }
+  const results = query.length < 2 ? [] : await findPublicAccounts(query, limit);
+  send(socket, {
+    type: "account-search-results",
+    requestId: String(message.requestId || ""),
+    ok: true,
+    query,
+    results
+  });
+}
 
+async function findPublicAccounts(query, limit = 18) {
   if (!accountIndexHydrated) scheduleAccountIndexHydration();
   let entries = await getAccountSearchEntries();
   if (!entries.length) entries = await getQuickAddDirectoryEntries();
   const matches = [];
   for (const { id, profile } of entries) {
-    if (!isDiscoverableProfile(profile) && !id.includes(query)) continue;
+    if (await accountQuickAddHidden(id) || !isDiscoverableProfile(profile)) continue;
     const score = accountSearchScore(query, id, profile.displayName || "");
     if (score === null) continue;
     matches.push({
@@ -3398,13 +3661,7 @@ async function searchAccounts(socket, message = {}) {
   }
 
   matches.sort((first, second) => first.score - second.score || first.displayName.localeCompare(second.displayName));
-  send(socket, {
-    type: "account-search-results",
-    requestId: String(message.requestId || ""),
-    ok: true,
-    query,
-    results: matches.slice(0, limit).map(({ score, ...result }) => result)
-  });
+  return matches.slice(0, limit).map(({ score, ...result }) => result);
 }
 
 function accountSearchScore(query, id, displayName) {
