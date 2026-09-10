@@ -3,7 +3,7 @@ import { randomBytes, randomUUID, scryptSync, timingSafeEqual } from "node:crypt
 import Redis from "ioredis";
 import { WebSocketServer } from "ws";
 
-const SERVER_VERSION = "5.5.10";
+const SERVER_VERSION = "5.5.11";
 const PORT = Number(process.env.PORT || 10000);
 const OFFLINE_MESSAGE_TTL_SECONDS = 90 * 24 * 60 * 60;
 const HISTORY_TTL_SECONDS = Number(process.env.HISTORY_TTL_SECONDS || 0);
@@ -123,7 +123,7 @@ const server = http.createServer(async (request, response) => {
   const corsHeaders = {
     "access-control-allow-origin": "*",
     "access-control-allow-methods": "GET, POST, PUT, DELETE, OPTIONS",
-    "access-control-allow-headers": "content-type, authorization, x-admin-token, x-bypassium-id"
+    "access-control-allow-headers": "content-type, authorization, x-admin-token, x-bypassium-id, x-idempotency-key"
   };
   if (request.method === "OPTIONS") {
     response.writeHead(204, corsHeaders);
@@ -174,6 +174,11 @@ const server = http.createServer(async (request, response) => {
     return;
   }
 
+  if (url.pathname === "/reports") {
+    await handleMessageReport(request, response, corsHeaders);
+    return;
+  }
+
   if (url.pathname === "/media/uploads" || url.pathname.startsWith("/media/uploads/") || url.pathname.startsWith("/media/content/")) {
     await handleMediaRequest(request, response, url, corsHeaders);
     return;
@@ -202,6 +207,66 @@ const server = http.createServer(async (request, response) => {
   response.writeHead(200, { ...corsHeaders, "content-type": "text/plain" });
   response.end("Bypassium message server is running.");
 });
+
+async function handleMessageReport(request, response, corsHeaders) {
+  const remoteAddress = String(request.socket?.remoteAddress || "unknown");
+  try {
+    if (request.method !== "POST") {
+      sendJson(response, 405, { ok: false, message: "Method not allowed." }, corsHeaders);
+      return;
+    }
+    const reporterId = String(request.headers["x-bypassium-id"] || "").trim();
+    const sessionToken = String(request.headers.authorization || "").replace(/^Bearer\s+/i, "").trim();
+    if (!(await validSession(reporterId, sessionToken))) {
+      sendJson(response, 401, { ok: false, message: "Sign in again before reporting a message." }, corsHeaders);
+      return;
+    }
+    const body = await readRequestJson(request);
+    const idempotencyKey = String(request.headers["x-idempotency-key"] || body.idempotencyKey || "").trim().slice(0, 100);
+    if (!/^[A-Za-z0-9_-]{12,100}$/.test(idempotencyKey)) throw new Error("A valid report request identifier is required.");
+    const reportedSenderId = cleanPeerId(body.reportedSenderId);
+    if (!reportedSenderId) throw new Error("The reported sender is invalid.");
+    if (reportedSenderId === reporterId) throw new Error("You cannot report your own message.");
+    const messageId = String(body.messageId || "").trim().slice(0, 120);
+    const conversationId = String(body.conversationId || "").trim().slice(0, 120);
+    if (!messageId || !conversationId) throw new Error("The exact message and conversation identifiers are required.");
+    const state = await getAdminHubState();
+    state.reports ||= [];
+    const existing = state.reports.find((item) => item.reporterId === reporterId && item.idempotencyKey === idempotencyKey);
+    if (existing) {
+      sendJson(response, 200, { ok: true, duplicate: true, report: publicReportReceipt(existing) }, corsHeaders);
+      return;
+    }
+    if (!allowHttpAction(remoteAddress, `message-report:${reporterId}`, 12, 60 * 60 * 1000)) {
+      sendJson(response, 429, { ok: false, message: "Too many reports were submitted. Try again later." }, corsHeaders);
+      return;
+    }
+    const now = new Date().toISOString();
+    const report = {
+      reportId: randomUUID(), idempotencyKey, messageId, conversationId,
+      groupId: String(body.groupId || "").trim().slice(0, 120), reporterId, reportedSenderId,
+      category: String(body.category || "other").replace(/[^a-z0-9-]/gi, "").slice(0, 40) || "other",
+      explanation: cleanReportText(body.explanation, 500), messageType: String(body.messageType || "text").slice(0, 100),
+      submittedContent: cleanReportText(body.submittedContent, 4000), messageTimestamp: String(body.messageTimestamp || "").slice(0, 40),
+      status: "open", assignedModerator: "", resolution: "", moderatorReason: "", createdAt: now, updatedAt: now,
+      audit: [{ action: "submitted", actorId: reporterId, reason: "User submitted selected message", createdAt: now }]
+    };
+    state.reports.push(report);
+    state.reports = state.reports.slice(-1000);
+    await setAdminHubState(state);
+    sendJson(response, 201, { ok: true, report: publicReportReceipt(report) }, corsHeaders);
+  } catch (error) {
+    sendJson(response, 400, { ok: false, message: error.message || "The report could not be submitted." }, corsHeaders);
+  }
+}
+
+function cleanReportText(value, limit) {
+  return String(value || "").replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, "").trim().slice(0, limit);
+}
+
+function publicReportReceipt(report) {
+  return { reportId: report.reportId, status: report.status, createdAt: report.createdAt };
+}
 
 async function handleMediaRequest(request, response, url, corsHeaders) {
   try {
@@ -962,6 +1027,37 @@ async function handleAdminHubApi(request, response, url, corsHeaders) {
       return;
     }
 
+    if (request.method === "GET" && url.pathname === "/admin-hub/api/reports") {
+      const state = await getAdminHubState();
+      const query = String(url.searchParams.get("q") || "").trim().toLowerCase().slice(0, 120);
+      const status = String(url.searchParams.get("status") || "").trim().toLowerCase();
+      const reports = (state.reports || []).filter((report) => (!status || report.status === status) && (!query || [report.reportId, report.messageId, report.conversationId, report.groupId, report.reporterId, report.reportedSenderId].some((value) => String(value || "").toLowerCase().includes(query)))).slice(-500).reverse();
+      sendJson(response, 200, { ok: true, reports }, corsHeaders);
+      return;
+    }
+
+    if (request.method === "POST" && url.pathname === "/admin-hub/api/reports") {
+      const body = await readRequestJson(request);
+      const state = await getAdminHubState();
+      const report = (state.reports || []).find((item) => item.reportId === String(body.reportId || ""));
+      if (!report) { sendJson(response, 404, { ok: false, message: "Report not found." }, corsHeaders); return; }
+      const status = String(body.status || report.status).toLowerCase();
+      if (!["open", "under-review", "resolved", "rejected"].includes(status)) throw new Error("Choose a valid report status.");
+      const reason = cleanReportText(body.reason, 1000);
+      if (["resolved", "rejected"].includes(status) && !reason) throw new Error("A moderator reason is required.");
+      const now = new Date().toISOString();
+      report.status = status;
+      report.assignedModerator = body.assignToSelf === false ? String(body.assignedModerator || "").slice(0, 6) : peerId;
+      report.resolution = cleanReportText(body.resolution, 1000);
+      report.moderatorReason = reason;
+      report.updatedAt = now;
+      report.audit ||= [];
+      report.audit.push({ action: status, actorId: peerId, reason, note: cleanReportText(body.note, 1000), createdAt: now });
+      await setAdminHubState(state);
+      sendJson(response, 200, { ok: true, report }, corsHeaders);
+      return;
+    }
+
     if (request.method === "GET" && url.pathname === "/admin-hub/api/state") {
       const state = await getAdminHubState();
       const admins = await Promise.all([...ADMIN_HUB_IDS].map(adminHubUserFromId));
@@ -1278,7 +1374,7 @@ function defaultAdminHubState() {
       updatedBy: ""
     };
   }
-  return { version: 3, chat: [], boards, reads: {}, notifications: [], updates: [] };
+  return { version: 3, chat: [], boards, reads: {}, notifications: [], updates: [], reports: [] };
 }
 
 async function getAdminHubState() {
@@ -1300,7 +1396,7 @@ async function getAdminHubState() {
       attachments: Array.isArray(savedBoard.attachments) ? savedBoard.attachments : []
     };
   }
-  return { ...fallback, ...parsed, boards, reads: parsed.reads || {}, notifications: Array.isArray(parsed.notifications) ? parsed.notifications : [], chat: Array.isArray(parsed.chat) ? parsed.chat : [], updates: Array.isArray(parsed.updates) ? parsed.updates : [] };
+  return { ...fallback, ...parsed, boards, reads: parsed.reads || {}, notifications: Array.isArray(parsed.notifications) ? parsed.notifications : [], chat: Array.isArray(parsed.chat) ? parsed.chat : [], updates: Array.isArray(parsed.updates) ? parsed.updates : [], reports: Array.isArray(parsed.reports) ? parsed.reports : [] };
 }
 
 async function setAdminHubState(state) {
