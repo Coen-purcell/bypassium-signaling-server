@@ -492,6 +492,7 @@ wss.on("connection", (socket, request) => {
       if (message.type === "story-sync") await syncStories(socket);
       if (message.type === "story-view") await viewStory(socket, message);
       if (message.type === "story-feedback") await submitStoryFeedback(socket, message);
+      if (message.type === "story-feedback-delete") await deleteStoryFeedback(socket, message);
       if (message.type === "story-share") await recordStoryShare(socket, message);
       if (message.type === "story-delete") await deleteStory(socket, message);
       if (message.type === "story-watch") await recordStoryWatch(socket, message);
@@ -2519,6 +2520,39 @@ async function submitStoryFeedback(socket, message = {}) {
     ok: true,
     feedback: envelope
   });
+}
+
+async function deleteStoryFeedback(socket, message = {}) {
+  const viewerId = getRegisteredSender(socket);
+  const storyId = String(message.storyId || "").trim();
+  const feedbackId = String(message.feedbackId || "").trim();
+  const requestId = String(message.requestId || "");
+  const story = viewerId && storyId ? await getStoryRecord(storyId) : null;
+  if (!story || !story.encryptedKeys?.[viewerId] || !feedbackId) {
+    send(socket, { type: "story-feedback-delete-result", requestId, ok: false, message: "That comment is no longer available." });
+    return;
+  }
+  const comments = (await getStoryFeedback(storyId)).filter(record => record.kind === "comment");
+  const owned = comments.find(record => record.feedbackId === feedbackId && record.viewerId === viewerId);
+  if (!owned) {
+    send(socket, { type: "story-feedback-delete-result", requestId, ok: false, message: "You can only delete your own comment." });
+    return;
+  }
+  const retained = comments.filter(record => record.feedbackId !== feedbackId);
+  memoryStoryComments.set(storyId, retained);
+  const key = storyCommentsKey(storyId);
+  const ttl = contentRecordTtlSeconds(story) + 300;
+  if (redis) {
+    await redis.del(key);
+    if (retained.length) { await redis.rpush(key, ...retained.map(JSON.stringify)); await redis.expire(key, ttl); }
+  }
+  if (upstashRestEnabled) {
+    const commands = [["DEL", key], ...retained.map(record => ["RPUSH", key, JSON.stringify(record)])];
+    if (retained.length) commands.push(["EXPIRE", key, ttl]);
+    await upstashPipeline(commands);
+  }
+  for (const recipientId of Object.keys(story.encryptedKeys || {})) sendToClient(recipientId, { type: "story-feedback-deleted", storyId, feedbackId });
+  send(socket, { type: "story-feedback-delete-result", requestId, ok: true, storyId, feedbackId });
 }
 
 async function recordStoryShare(socket, message = {}) {
