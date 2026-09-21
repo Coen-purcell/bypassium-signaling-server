@@ -1,9 +1,11 @@
 import http from "node:http";
 import { randomBytes, randomUUID, scryptSync, timingSafeEqual } from "node:crypto";
+import { CopyObjectCommand, DeleteObjectsCommand, GetObjectCommand, HeadObjectCommand, PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
+import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import Redis from "ioredis";
 import { WebSocketServer } from "ws";
 
-const SERVER_VERSION = "5.5.11";
+const SERVER_VERSION = "5.5.12";
 const PORT = Number(process.env.PORT || 10000);
 const OFFLINE_MESSAGE_TTL_SECONDS = 90 * 24 * 60 * 60;
 const HISTORY_TTL_SECONDS = Number(process.env.HISTORY_TTL_SECONDS || 0);
@@ -20,9 +22,13 @@ const MAX_UPSTASH_RPUSH_ITEMS = 4;
 const MAX_UPSTASH_RPUSH_CHARS = 18_000_000;
 const MAX_UPSTASH_COMMAND_CHARS = 20_000_000;
 const MAX_QUEUED_ENVELOPE_CHARS = 7_500_000;
-const MAX_WEBSOCKET_PAYLOAD_CHARS = 20_000_000;
+const MAX_WEBSOCKET_PAYLOAD_CHARS = Math.max(8_500_000, Number(process.env.MAX_WEBSOCKET_PAYLOAD_CHARS) || 8_500_000);
 const MEDIA_CHUNK_BYTES = 512 * 1024;
+const R2_MEDIA_CHUNK_BYTES = Math.max(1024 * 1024, Number(process.env.R2_MEDIA_CHUNK_BYTES) || 4 * 1024 * 1024);
+const R2_FREE_TIER_BUDGET_BYTES = Math.max(1024 * 1024 * 1024, Number(process.env.R2_FREE_TIER_BUDGET_BYTES) || 8 * 1024 * 1024 * 1024);
+const R2_SIGNED_URL_TTL_SECONDS = Math.min(3600, Math.max(60, Number(process.env.R2_SIGNED_URL_TTL_SECONDS) || 900));
 const MAX_PERSISTENT_MEDIA_BYTES = Math.max(25 * 1024 * 1024, Number(process.env.MAX_MEDIA_UPLOAD_BYTES) || 250 * 1024 * 1024);
+const MAX_LEGACY_MEDIA_BYTES = Math.max(1024 * 1024, Number(process.env.MAX_LEGACY_MEDIA_UPLOAD_BYTES) || 10 * 1024 * 1024);
 const MAX_MEMORY_MEDIA_BYTES = 25 * 1024 * 1024;
 const MAX_MEMORY_MEDIA_TOTAL_BYTES = 100 * 1024 * 1024;
 const MEDIA_UPLOAD_TTL_SECONDS = 24 * 60 * 60;
@@ -68,6 +74,10 @@ const MAX_STORY_RECIPIENTS = 250;
 const REDIS_URL = process.env.REDIS_URL || process.env.RENDER_REDIS_URL || process.env.KEY_VALUE_URL || "";
 const UPSTASH_REST_URL = process.env.UPSTASH_REDIS_REST_URL || "";
 const UPSTASH_REST_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN || "";
+const R2_ACCOUNT_ID = String(process.env.R2_ACCOUNT_ID || "").trim();
+const R2_ACCESS_KEY_ID = String(process.env.R2_ACCESS_KEY_ID || "").trim();
+const R2_SECRET_ACCESS_KEY = String(process.env.R2_SECRET_ACCESS_KEY || "").trim();
+const R2_BUCKET = String(process.env.R2_BUCKET || "").trim();
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "";
 const ADMIN_HUB_IDS = new Set(String(process.env.ADMIN_HUB_IDS || "904674,907623,137096,396172,767838")
   .split(",").map((value) => value.trim()).filter((value) => /^\d{6}$/.test(value)));
@@ -107,6 +117,7 @@ const memoryCallBilling = new Map();
 const memoryCallFreeUsage = new Map();
 const PRICING_STORAGE_KEY = "bypassium:pricing:v1";
 let walletOperationQueue = Promise.resolve();
+let memoryCompletedMediaBytes = 0;
 let memoryAdminHubState = null;
 const adminHubTyping = new Map();
 const pendingQueuedEnvelopes = new Map();
@@ -118,6 +129,8 @@ let accountIndexHydrated = false;
 let accountIndexHydrationPromise = null;
 const redis = createRedisClient();
 const upstashRestEnabled = Boolean(!redis && UPSTASH_REST_URL && UPSTASH_REST_TOKEN);
+const r2 = createR2Client();
+const r2Enabled = Boolean(r2 && R2_BUCKET);
 
 const server = http.createServer(async (request, response) => {
   const corsHeaders = {
@@ -143,11 +156,17 @@ const server = http.createServer(async (request, response) => {
       ok: true,
       version: SERVER_VERSION,
       storage: storageMode(),
+      mediaStorage: r2Enabled ? "r2" : storageMode(),
+      directMediaUploads: r2Enabled,
       onlineClients: clients.size,
       supportBotConfigured,
       supportBotOnline: supportBotConfigured && Boolean(clients.get(supportBotId)?.size),
       supportBot: supportBotConfigured ? supportBotStatus : null,
-      uptimeSeconds: Math.round(process.uptime())
+      uptimeSeconds: Math.round(process.uptime()),
+      memoryMb: {
+        rss: Math.round(process.memoryUsage().rss / 1024 / 1024),
+        heapUsed: Math.round(process.memoryUsage().heapUsed / 1024 / 1024)
+      }
     }));
     return;
   }
@@ -279,9 +298,17 @@ async function handleMediaRequest(request, response, url, corsHeaders) {
       }
       response.writeHead(200, { ...corsHeaders, "content-type": "application/octet-stream", "content-length": String(record.uploadedBytes), "cache-control": "private, max-age=3600" });
       for (let index = 0; index < record.chunkCount; index += 1) {
-        const chunk = await getMediaChunk(record.uploadId, index);
-        if (!chunk) throw new Error("Stored media is incomplete.");
-        if (!response.write(chunk)) await new Promise((resolve) => response.once("drain", resolve));
+        if (record.storage === "r2") {
+          const object = await r2.send(new GetObjectCommand({ Bucket: R2_BUCKET, Key: completedMediaObjectKey(record.uploadId, index) }));
+          if (!object.Body) throw new Error("Stored media is incomplete.");
+          for await (const chunk of object.Body) {
+            if (!response.write(chunk)) await new Promise((resolve) => response.once("drain", resolve));
+          }
+        } else {
+          const chunk = await getMediaChunk(record.uploadId, index);
+          if (!chunk) throw new Error("Stored media is incomplete.");
+          if (!response.write(chunk)) await new Promise((resolve) => response.once("drain", resolve));
+        }
       }
       response.end();
       return;
@@ -306,8 +333,11 @@ async function handleMediaRequest(request, response, url, corsHeaders) {
       }
       const originalBytes = Math.max(0, Math.round(Number(body.originalBytes) || 0));
       if (!originalBytes || originalBytes > mediaUploadMaxBytes()) throw new Error(`Choose media under ${Math.floor(mediaUploadMaxBytes() / 1024 / 1024)} MB.`);
-      const chunkCount = Math.ceil(originalBytes / MEDIA_CHUNK_BYTES);
-      const record = { uploadId, ownerId: peerId, accessToken: randomBytes(24).toString("base64url"), originalBytes, uploadedBytes: 0, chunkBytes: MEDIA_CHUNK_BYTES, chunkCount, received: [], completed: false, name: String(body.name || "Encrypted media").slice(0, 120), mediaType: String(body.mediaType || "application/octet-stream").slice(0, 100), createdAt: new Date().toISOString(), expiresAt: new Date(Date.now() + MEDIA_UPLOAD_TTL_SECONDS * 1000).toISOString() };
+      if (r2Enabled && !redis && !upstashRestEnabled && process.env.NODE_ENV === "production") throw new Error("Persistent upload metadata is required before large media can be stored safely.");
+      if (r2Enabled && await mediaBudgetWouldBeExceeded(originalBytes)) throw new Error("The free media storage allowance is currently full. Remove older media before uploading more.");
+      const chunkBytes = r2Enabled ? R2_MEDIA_CHUNK_BYTES : MEDIA_CHUNK_BYTES;
+      const chunkCount = Math.ceil(originalBytes / chunkBytes);
+      const record = { uploadId, ownerId: peerId, accessToken: randomBytes(24).toString("base64url"), originalBytes, uploadedBytes: 0, chunkBytes, chunkCount, received: [], completed: false, storage: r2Enabled ? "r2" : storageMode(), name: String(body.name || "Encrypted media").slice(0, 120), mediaType: String(body.mediaType || "application/octet-stream").slice(0, 100), createdAt: new Date().toISOString(), expiresAt: new Date(Date.now() + MEDIA_UPLOAD_TTL_SECONDS * 1000).toISOString() };
       await setMediaUpload(record);
       sendJson(response, 201, mediaUploadResponse(record, request), corsHeaders);
       return;
@@ -318,6 +348,7 @@ async function handleMediaRequest(request, response, url, corsHeaders) {
       const record = await getMediaUpload(chunkMatch[1]);
       const index = Number(chunkMatch[2]);
       if (!record || record.ownerId !== peerId || record.completed) throw new Error("Upload session is unavailable.");
+      if (record.storage === "r2") throw new Error("This upload must use its direct storage URL.");
       if (!Number.isInteger(index) || index < 0 || index >= record.chunkCount) throw new Error("Invalid media chunk.");
       const encryptedChunk = await readBinaryBody(request, MEDIA_CHUNK_BYTES + 64);
       if (encryptedChunk.length < 29 || encryptedChunk.length > MEDIA_CHUNK_BYTES + 64) throw new Error("Invalid encrypted media chunk size.");
@@ -332,17 +363,56 @@ async function handleMediaRequest(request, response, url, corsHeaders) {
       return;
     }
 
+    const chunkUrlMatch = url.pathname.match(/^\/media\/uploads\/([a-f0-9-]{36})\/chunks\/(\d+)\/url$/i);
+    if (request.method === "POST" && chunkUrlMatch) {
+      const record = await getMediaUpload(chunkUrlMatch[1]);
+      const index = Number(chunkUrlMatch[2]);
+      if (!record || record.ownerId !== peerId || record.completed || record.storage !== "r2") throw new Error("Direct upload session is unavailable.");
+      validateMediaChunkIndex(record, index);
+      const uploadUrl = await getSignedUrl(r2, new PutObjectCommand({ Bucket: R2_BUCKET, Key: pendingMediaObjectKey(record.uploadId, index), ContentType: "application/octet-stream" }), { expiresIn: R2_SIGNED_URL_TTL_SECONDS });
+      sendJson(response, 200, { ok: true, uploadId: record.uploadId, index, uploadUrl, expiresInSeconds: R2_SIGNED_URL_TTL_SECONDS }, corsHeaders);
+      return;
+    }
+
+    const chunkConfirmMatch = url.pathname.match(/^\/media\/uploads\/([a-f0-9-]{36})\/chunks\/(\d+)\/confirm$/i);
+    if (request.method === "POST" && chunkConfirmMatch) {
+      const record = await getMediaUpload(chunkConfirmMatch[1]);
+      const index = Number(chunkConfirmMatch[2]);
+      if (!record || record.ownerId !== peerId || record.completed || record.storage !== "r2") throw new Error("Direct upload session is unavailable.");
+      validateMediaChunkIndex(record, index);
+      const head = await r2.send(new HeadObjectCommand({ Bucket: R2_BUCKET, Key: pendingMediaObjectKey(record.uploadId, index) }));
+      const encryptedBytes = Number(head.ContentLength) || 0;
+      const maximumEncryptedBytes = record.chunkBytes + 64;
+      if (encryptedBytes < 29 || encryptedBytes > maximumEncryptedBytes) throw new Error("The uploaded media chunk has an invalid size.");
+      const received = new Set(record.received || []);
+      if (!received.has(index)) record.uploadedBytes += encryptedBytes;
+      received.add(index);
+      record.received = [...received].sort((a, b) => a - b);
+      await setMediaUpload(record);
+      sendJson(response, 200, { ok: true, uploadId: record.uploadId, index, receivedChunks: record.received.length, chunkCount: record.chunkCount }, corsHeaders);
+      return;
+    }
+
     const completeMatch = url.pathname.match(/^\/media\/uploads\/([a-f0-9-]{36})\/complete$/i);
     if (request.method === "POST" && completeMatch) {
       const record = await getMediaUpload(completeMatch[1]);
       if (!record || record.ownerId !== peerId) throw new Error("Upload session is unavailable.");
       if (!record.completed && (record.received || []).length !== record.chunkCount) throw new Error("Upload is incomplete.");
+      if (!record.completed && record.storage === "r2") {
+        for (let index = 0; index < record.chunkCount; index += 1) {
+          await r2.send(new CopyObjectCommand({ Bucket: R2_BUCKET, CopySource: `${R2_BUCKET}/${pendingMediaObjectKey(record.uploadId, index)}`, Key: completedMediaObjectKey(record.uploadId, index), ContentType: "application/octet-stream", MetadataDirective: "REPLACE" }));
+        }
+        await addCompletedMediaBytes(record.uploadedBytes);
+      }
       record.completed = true;
       record.completedAt ||= new Date().toISOString();
-      const completedTtl = storageMode() === "memory" ? MEMORY_MEDIA_CONTENT_TTL_SECONDS : MEDIA_CONTENT_TTL_SECONDS;
+      const completedTtl = record.storage === "r2" || storageMode() !== "memory" ? MEDIA_CONTENT_TTL_SECONDS : MEMORY_MEDIA_CONTENT_TTL_SECONDS;
       record.expiresAt = new Date(Date.now() + completedTtl * 1000).toISOString();
       await setMediaUpload(record, completedTtl);
-      if (redis) {
+      if (record.storage === "r2") {
+        deleteR2Objects(Array.from({ length: record.chunkCount }, (_, index) => pendingMediaObjectKey(record.uploadId, index)))
+          .catch((error) => console.warn("Pending R2 cleanup failed:", safeOperationalError(error)));
+      } else if (redis) {
         const pipeline = redis.multi();
         for (let index = 0; index < record.chunkCount; index += 1) pipeline.expire(mediaChunkKey(record.uploadId, index), MEDIA_CONTENT_TTL_SECONDS);
         await pipeline.exec();
@@ -356,7 +426,10 @@ async function handleMediaRequest(request, response, url, corsHeaders) {
     const uploadMatch = url.pathname.match(/^\/media\/uploads\/([a-f0-9-]{36})$/i);
     if (request.method === "DELETE" && uploadMatch) {
       const record = await getMediaUpload(uploadMatch[1]);
-      if (record?.ownerId === peerId && !record.completed) await deleteMediaUpload(record);
+      if (record?.ownerId === peerId && !record.completed) {
+        if (record.storage === "r2") await deleteR2Objects(Array.from({ length: record.chunkCount }, (_, index) => pendingMediaObjectKey(record.uploadId, index)));
+        await deleteMediaUpload(record);
+      }
       sendJson(response, 200, { ok: true, cancelled: true }, corsHeaders);
       return;
     }
@@ -366,13 +439,39 @@ async function handleMediaRequest(request, response, url, corsHeaders) {
   }
 }
 
-function mediaUploadMaxBytes() { return storageMode() === "memory" ? MAX_MEMORY_MEDIA_BYTES : MAX_PERSISTENT_MEDIA_BYTES; }
+function mediaUploadMaxBytes() { return r2Enabled ? MAX_PERSISTENT_MEDIA_BYTES : Math.min(MAX_LEGACY_MEDIA_BYTES, storageMode() === "memory" ? MAX_MEMORY_MEDIA_BYTES : MAX_PERSISTENT_MEDIA_BYTES); }
 function mediaUploadKey(uploadId) { return `bypassium:media:upload:${uploadId}`; }
 function mediaChunkKey(uploadId, index) { return `bypassium:media:chunk:${uploadId}:${index}`; }
+function mediaBudgetKey() { return "bypassium:media:r2-completed-bytes:v1"; }
+function pendingMediaObjectKey(uploadId, index) { return `pending/${uploadId}/${String(index).padStart(5, "0")}.bin`; }
+function completedMediaObjectKey(uploadId, index) { return `media/${uploadId}/${String(index).padStart(5, "0")}.bin`; }
+function validateMediaChunkIndex(record, index) {
+  if (!Number.isInteger(index) || index < 0 || index >= record.chunkCount) throw new Error("Invalid media chunk.");
+}
+async function completedMediaBytes() {
+  if (redis) return Math.max(0, Number(await redis.get(mediaBudgetKey())) || 0);
+  if (upstashRestEnabled) return Math.max(0, Number(await upstashCommand(["GET", mediaBudgetKey()])) || 0);
+  return memoryCompletedMediaBytes;
+}
+async function mediaBudgetWouldBeExceeded(additionalBytes) {
+  return (await completedMediaBytes()) + Math.max(0, Number(additionalBytes) || 0) > R2_FREE_TIER_BUDGET_BYTES;
+}
+async function addCompletedMediaBytes(bytes) {
+  const amount = Math.max(0, Math.round(Number(bytes) || 0));
+  if (redis) await redis.incrby(mediaBudgetKey(), amount);
+  else if (upstashRestEnabled) await upstashCommand(["INCRBY", mediaBudgetKey(), amount]);
+  else memoryCompletedMediaBytes += amount;
+}
+async function deleteR2Objects(keys) {
+  if (!r2Enabled || !keys.length) return;
+  for (let index = 0; index < keys.length; index += 1000) {
+    await r2.send(new DeleteObjectsCommand({ Bucket: R2_BUCKET, Delete: { Quiet: true, Objects: keys.slice(index, index + 1000).map((Key) => ({ Key })) } }));
+  }
+}
 function mediaUploadResponse(record, request) {
   const protocol = String(request.headers["x-forwarded-proto"] || "http").split(",")[0];
   const origin = `${protocol}://${request.headers.host}`;
-  return { ok: true, uploadId: record.uploadId, chunkBytes: record.chunkBytes, chunkCount: record.chunkCount, received: record.received || [], completed: Boolean(record.completed), persistent: storageMode() !== "memory", maximumBytes: mediaUploadMaxBytes(), mediaUrl: `${origin}/media/content/${record.uploadId}?token=${encodeURIComponent(record.accessToken)}` };
+  return { ok: true, uploadId: record.uploadId, chunkBytes: record.chunkBytes, chunkCount: record.chunkCount, received: record.received || [], completed: Boolean(record.completed), directUpload: record.storage === "r2", persistent: record.storage === "r2" || storageMode() !== "memory", maximumBytes: mediaUploadMaxBytes(), mediaUrl: `${origin}/media/content/${record.uploadId}?token=${encodeURIComponent(record.accessToken)}` };
 }
 async function setMediaUpload(record, ttlSeconds = MEDIA_UPLOAD_TTL_SECONDS) {
   memoryMediaUploads.set(record.uploadId, record);
@@ -564,6 +663,18 @@ function createRedisClient() {
     console.error("Redis storage error:", error.message);
   });
   return client;
+}
+
+function createR2Client() {
+  const configured = R2_ACCOUNT_ID && R2_ACCESS_KEY_ID && R2_SECRET_ACCESS_KEY && R2_BUCKET;
+  if (!configured) return null;
+  return new S3Client({
+    region: "auto",
+    endpoint: `https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
+    credentials: { accessKeyId: R2_ACCESS_KEY_ID, secretAccessKey: R2_SECRET_ACCESS_KEY },
+    requestChecksumCalculation: "WHEN_REQUIRED",
+    responseChecksumValidation: "WHEN_REQUIRED"
+  });
 }
 
 async function handleAdminApi(request, response, url, corsHeaders) {
@@ -7257,6 +7368,25 @@ function send(socket, message) {
   const serialized = JSON.stringify(message);
   socket.send(serialized);
 }
+
+function safeOperationalError(error) {
+  return String(error?.message || error || "Unknown error")
+    .replace(/https?:\/\/\S+/gi, "[url removed]")
+    .replace(/(token|password|secret|authorization)=?\S*/gi, "$1=[removed]")
+    .slice(0, 500);
+}
+
+process.on("warning", (warning) => console.warn("Node warning:", warning.name, safeOperationalError(warning)));
+process.on("unhandledRejection", (reason) => {
+  console.error("Unhandled rejection:", safeOperationalError(reason));
+  setTimeout(() => process.exit(1), 100).unref();
+});
+process.on("uncaughtExceptionMonitor", (error) => console.error("Uncaught exception:", safeOperationalError(error)));
+
+setInterval(() => {
+  const memory = process.memoryUsage();
+  console.log("Runtime health", JSON.stringify({ rssMb: Math.round(memory.rss / 1024 / 1024), heapUsedMb: Math.round(memory.heapUsed / 1024 / 1024), clients: clients.size, mediaStorage: r2Enabled ? "r2" : storageMode() }));
+}, 60_000).unref();
 
 await loadPricingConfig().catch((error) => console.error("Pricing configuration could not be loaded:", error.message));
 

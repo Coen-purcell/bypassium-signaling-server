@@ -1,6 +1,6 @@
 {
   "name": "bypassium-signaling-server",
-  "version": "5.5.11",
+  "version": "5.5.12",
   "description": "Encrypted relay and persistent offline inbox server for Bypassium Messenger.",
   "main": "server.js",
   "type": "module",
@@ -13,6 +13,8 @@
     "node": ">=20"
   },
   "dependencies": {
+    "@aws-sdk/client-s3": "^3.883.0",
+    "@aws-sdk/s3-request-presigner": "^3.883.0",
     "ioredis": "^5.4.1",
     "ws": "^8.17.1"
   }

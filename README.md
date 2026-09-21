@@ -11,6 +11,7 @@ The server:
 - Stores public profiles, public encryption keys, group membership, ownership, and group roles.
 - Never receives plaintext message bodies.
 - Keeps B-Coin balances, transfers, attachment charges, call reservations, refunds, and Arcade rewards authoritative on the server.
+- Sends encrypted large-media chunks directly to a private Cloudflare R2 bucket so the Node process never buffers a complete Reel or attachment.
 
 ## Admin pricing
 
@@ -41,6 +42,25 @@ Create a **Web Service** from this repo.
 - Start command: `npm start`
 - Health check path: `/health`
 - Configure `UPSTASH_REDIS_REST_URL` and `UPSTASH_REDIS_REST_TOKEN` for persistent offline delivery.
+
+## Free-tier large media
+
+Cloudflare R2 Standard storage currently includes 10 GB-month of storage, one million Class A operations, ten million Class B operations, and free Internet egress each month. Bypassium defaults to an 8 GiB completed-media ceiling so it stops accepting new media before the storage allowance is intentionally approached. This is a safety ceiling, not a Cloudflare billing guarantee; keep Cloudflare billing notifications enabled and do not change the ceiling above your chosen allowance.
+
+Create a private R2 Standard bucket, apply `r2-cors.json`, create an R2 API token restricted to that bucket, and add these secret environment variables to Render:
+
+```env
+R2_ACCOUNT_ID=your-cloudflare-account-id
+R2_ACCESS_KEY_ID=your-r2-token-access-key
+R2_SECRET_ACCESS_KEY=your-r2-token-secret
+R2_BUCKET=bypassium-media
+R2_FREE_TIER_BUDGET_BYTES=8589934592
+MAX_MEDIA_UPLOAD_BYTES=262144000
+```
+
+Do not put these values in the extension or commit them. Production R2 uploads also require Redis or Upstash for durable upload metadata. Without R2, the legacy server upload route is deliberately capped at 10 MiB to protect Render's 512 MB free instance from memory exhaustion.
+
+The bucket must remain private. Browser uploads use short-lived, object-specific signed URLs; stored content remains encrypted by the extension. The server verifies every uploaded object before completion and streams encrypted downloads without buffering the complete file.
 
 To enable the Support bot in this same service, add these environment variables to the same Render service:
 
