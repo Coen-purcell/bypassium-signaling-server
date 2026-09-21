@@ -5,7 +5,7 @@ import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import Redis from "ioredis";
 import { WebSocketServer } from "ws";
 
-const SERVER_VERSION = "5.5.12";
+const SERVER_VERSION = "5.5.13";
 const PORT = Number(process.env.PORT || 10000);
 const OFFLINE_MESSAGE_TTL_SECONDS = 90 * 24 * 60 * 60;
 const HISTORY_TTL_SECONDS = Number(process.env.HISTORY_TTL_SECONDS || 0);
@@ -24,10 +24,10 @@ const MAX_UPSTASH_COMMAND_CHARS = 20_000_000;
 const MAX_QUEUED_ENVELOPE_CHARS = 7_500_000;
 const MAX_WEBSOCKET_PAYLOAD_CHARS = Math.max(8_500_000, Number(process.env.MAX_WEBSOCKET_PAYLOAD_CHARS) || 8_500_000);
 const MEDIA_CHUNK_BYTES = 512 * 1024;
-const R2_MEDIA_CHUNK_BYTES = Math.max(1024 * 1024, Number(process.env.R2_MEDIA_CHUNK_BYTES) || 4 * 1024 * 1024);
+const R2_MEDIA_CHUNK_BYTES = Math.min(32 * 1024 * 1024, Math.max(1024 * 1024, Number(process.env.R2_MEDIA_CHUNK_BYTES) || 8 * 1024 * 1024));
 const R2_FREE_TIER_BUDGET_BYTES = Math.max(1024 * 1024 * 1024, Number(process.env.R2_FREE_TIER_BUDGET_BYTES) || 8 * 1024 * 1024 * 1024);
 const R2_SIGNED_URL_TTL_SECONDS = Math.min(3600, Math.max(60, Number(process.env.R2_SIGNED_URL_TTL_SECONDS) || 900));
-const MAX_PERSISTENT_MEDIA_BYTES = Math.max(25 * 1024 * 1024, Number(process.env.MAX_MEDIA_UPLOAD_BYTES) || 250 * 1024 * 1024);
+const MAX_PERSISTENT_MEDIA_BYTES = Math.min(2 * 1024 * 1024 * 1024, Math.max(25 * 1024 * 1024, Number(process.env.MAX_MEDIA_UPLOAD_BYTES) || 1024 * 1024 * 1024));
 const MAX_LEGACY_MEDIA_BYTES = Math.max(1024 * 1024, Number(process.env.MAX_LEGACY_MEDIA_UPLOAD_BYTES) || 10 * 1024 * 1024);
 const MAX_MEMORY_MEDIA_BYTES = 25 * 1024 * 1024;
 const MAX_MEMORY_MEDIA_TOTAL_BYTES = 100 * 1024 * 1024;
@@ -337,7 +337,7 @@ async function handleMediaRequest(request, response, url, corsHeaders) {
       if (r2Enabled && await mediaBudgetWouldBeExceeded(originalBytes)) throw new Error("The free media storage allowance is currently full. Remove older media before uploading more.");
       const chunkBytes = r2Enabled ? R2_MEDIA_CHUNK_BYTES : MEDIA_CHUNK_BYTES;
       const chunkCount = Math.ceil(originalBytes / chunkBytes);
-      const record = { uploadId, ownerId: peerId, accessToken: randomBytes(24).toString("base64url"), originalBytes, uploadedBytes: 0, chunkBytes, chunkCount, received: [], completed: false, storage: r2Enabled ? "r2" : storageMode(), name: String(body.name || "Encrypted media").slice(0, 120), mediaType: String(body.mediaType || "application/octet-stream").slice(0, 100), createdAt: new Date().toISOString(), expiresAt: new Date(Date.now() + MEDIA_UPLOAD_TTL_SECONDS * 1000).toISOString() };
+      const record = { uploadId, ownerId: peerId, accessToken: randomBytes(24).toString("base64url"), originalBytes, uploadedBytes: 0, chunkBytes, chunkCount, received: [], completed: false, storage: r2Enabled ? "r2" : storageMode(), objectLayoutVersion: r2Enabled ? 2 : 1, name: String(body.name || "Encrypted media").slice(0, 120), mediaType: String(body.mediaType || "application/octet-stream").slice(0, 100), createdAt: new Date().toISOString(), expiresAt: new Date(Date.now() + MEDIA_UPLOAD_TTL_SECONDS * 1000).toISOString() };
       await setMediaUpload(record);
       sendJson(response, 201, mediaUploadResponse(record, request), corsHeaders);
       return;
@@ -369,7 +369,7 @@ async function handleMediaRequest(request, response, url, corsHeaders) {
       const index = Number(chunkUrlMatch[2]);
       if (!record || record.ownerId !== peerId || record.completed || record.storage !== "r2") throw new Error("Direct upload session is unavailable.");
       validateMediaChunkIndex(record, index);
-      const uploadUrl = await getSignedUrl(r2, new PutObjectCommand({ Bucket: R2_BUCKET, Key: pendingMediaObjectKey(record.uploadId, index), ContentType: "application/octet-stream" }), { expiresIn: R2_SIGNED_URL_TTL_SECONDS });
+      const uploadUrl = await getSignedUrl(r2, new PutObjectCommand({ Bucket: R2_BUCKET, Key: mediaObjectKey(record, index), ContentType: "application/octet-stream" }), { expiresIn: R2_SIGNED_URL_TTL_SECONDS });
       sendJson(response, 200, { ok: true, uploadId: record.uploadId, index, uploadUrl, expiresInSeconds: R2_SIGNED_URL_TTL_SECONDS }, corsHeaders);
       return;
     }
@@ -380,7 +380,7 @@ async function handleMediaRequest(request, response, url, corsHeaders) {
       const index = Number(chunkConfirmMatch[2]);
       if (!record || record.ownerId !== peerId || record.completed || record.storage !== "r2") throw new Error("Direct upload session is unavailable.");
       validateMediaChunkIndex(record, index);
-      const head = await r2.send(new HeadObjectCommand({ Bucket: R2_BUCKET, Key: pendingMediaObjectKey(record.uploadId, index) }));
+      const head = await r2.send(new HeadObjectCommand({ Bucket: R2_BUCKET, Key: mediaObjectKey(record, index) }));
       const encryptedBytes = Number(head.ContentLength) || 0;
       const maximumEncryptedBytes = record.chunkBytes + 64;
       if (encryptedBytes < 29 || encryptedBytes > maximumEncryptedBytes) throw new Error("The uploaded media chunk has an invalid size.");
@@ -399,8 +399,12 @@ async function handleMediaRequest(request, response, url, corsHeaders) {
       if (!record || record.ownerId !== peerId) throw new Error("Upload session is unavailable.");
       if (!record.completed && (record.received || []).length !== record.chunkCount) throw new Error("Upload is incomplete.");
       if (!record.completed && record.storage === "r2") {
-        for (let index = 0; index < record.chunkCount; index += 1) {
-          await r2.send(new CopyObjectCommand({ Bucket: R2_BUCKET, CopySource: `${R2_BUCKET}/${pendingMediaObjectKey(record.uploadId, index)}`, Key: completedMediaObjectKey(record.uploadId, index), ContentType: "application/octet-stream", MetadataDirective: "REPLACE" }));
+        // Version 2 uploads already write to their final private keys. Keep the
+        // legacy copy path only for sessions created before this deployment.
+        if (Number(record.objectLayoutVersion || 1) < 2) {
+          for (let index = 0; index < record.chunkCount; index += 1) {
+            await r2.send(new CopyObjectCommand({ Bucket: R2_BUCKET, CopySource: `${R2_BUCKET}/${pendingMediaObjectKey(record.uploadId, index)}`, Key: completedMediaObjectKey(record.uploadId, index), ContentType: "application/octet-stream", MetadataDirective: "REPLACE" }));
+          }
         }
         await addCompletedMediaBytes(record.uploadedBytes);
       }
@@ -409,7 +413,7 @@ async function handleMediaRequest(request, response, url, corsHeaders) {
       const completedTtl = record.storage === "r2" || storageMode() !== "memory" ? MEDIA_CONTENT_TTL_SECONDS : MEMORY_MEDIA_CONTENT_TTL_SECONDS;
       record.expiresAt = new Date(Date.now() + completedTtl * 1000).toISOString();
       await setMediaUpload(record, completedTtl);
-      if (record.storage === "r2") {
+      if (record.storage === "r2" && Number(record.objectLayoutVersion || 1) < 2) {
         deleteR2Objects(Array.from({ length: record.chunkCount }, (_, index) => pendingMediaObjectKey(record.uploadId, index)))
           .catch((error) => console.warn("Pending R2 cleanup failed:", safeOperationalError(error)));
       } else if (redis) {
@@ -427,7 +431,7 @@ async function handleMediaRequest(request, response, url, corsHeaders) {
     if (request.method === "DELETE" && uploadMatch) {
       const record = await getMediaUpload(uploadMatch[1]);
       if (record?.ownerId === peerId && !record.completed) {
-        if (record.storage === "r2") await deleteR2Objects(Array.from({ length: record.chunkCount }, (_, index) => pendingMediaObjectKey(record.uploadId, index)));
+        if (record.storage === "r2") await deleteR2Objects(Array.from({ length: record.chunkCount }, (_, index) => mediaObjectKey(record, index)));
         await deleteMediaUpload(record);
       }
       sendJson(response, 200, { ok: true, cancelled: true }, corsHeaders);
@@ -445,6 +449,11 @@ function mediaChunkKey(uploadId, index) { return `bypassium:media:chunk:${upload
 function mediaBudgetKey() { return "bypassium:media:r2-completed-bytes:v1"; }
 function pendingMediaObjectKey(uploadId, index) { return `pending/${uploadId}/${String(index).padStart(5, "0")}.bin`; }
 function completedMediaObjectKey(uploadId, index) { return `media/${uploadId}/${String(index).padStart(5, "0")}.bin`; }
+function mediaObjectKey(record, index) {
+  return Number(record?.objectLayoutVersion || 1) >= 2
+    ? completedMediaObjectKey(record.uploadId, index)
+    : pendingMediaObjectKey(record.uploadId, index);
+}
 function validateMediaChunkIndex(record, index) {
   if (!Number.isInteger(index) || index < 0 || index >= record.chunkCount) throw new Error("Invalid media chunk.");
 }
