@@ -5,7 +5,7 @@ import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import Redis from "ioredis";
 import { WebSocketServer } from "ws";
 
-const SERVER_VERSION = "5.5.13";
+const SERVER_VERSION = "5.5.14";
 const PORT = Number(process.env.PORT || 10000);
 const OFFLINE_MESSAGE_TTL_SECONDS = 90 * 24 * 60 * 60;
 const HISTORY_TTL_SECONDS = Number(process.env.HISTORY_TTL_SECONDS || 0);
@@ -78,6 +78,7 @@ const R2_ACCOUNT_ID = String(process.env.R2_ACCOUNT_ID || "").trim();
 const R2_ACCESS_KEY_ID = String(process.env.R2_ACCESS_KEY_ID || "").trim();
 const R2_SECRET_ACCESS_KEY = String(process.env.R2_SECRET_ACCESS_KEY || "").trim();
 const R2_BUCKET = String(process.env.R2_BUCKET || "").trim();
+const OFFICIAL_REELS_PEER_ID = cleanConfiguredPeerId(process.env.OFFICIAL_REELS_PEER_ID || "701337");
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "";
 const ADMIN_HUB_IDS = new Set(String(process.env.ADMIN_HUB_IDS || "904674,907623,137096,396172,767838")
   .split(",").map((value) => value.trim()).filter((value) => /^\d{6}$/.test(value)));
@@ -2758,9 +2759,10 @@ async function syncContacts(socket, message = {}) {
   const existing = await getSyncedContacts(peerId);
   const contacts = mergeSyncedContacts(existing, incoming);
   await setSyncedContacts(peerId, contacts);
+  const synchronized = await getSyncedContacts(peerId);
   send(socket, {
     type: "contact-sync",
-    contacts,
+    contacts: synchronized,
     syncedAt: new Date().toISOString()
   });
 }
@@ -2782,6 +2784,10 @@ async function deleteSyncedContact(socket, message = {}) {
   if (!peerId) return;
   const contactId = String(message.contactId || "").trim();
   if (!/^\d{6}$/.test(contactId) || contactId === peerId) return;
+  if (systemContactIds().has(contactId)) {
+    await sendSyncedContacts(socket);
+    return;
+  }
   const contacts = (await getSyncedContacts(peerId)).filter((contact) => contact.id !== contactId);
   await setSyncedContacts(peerId, contacts);
   send(socket, {
@@ -4691,14 +4697,49 @@ async function setSyncedContacts(peerId, contacts = []) {
 }
 
 async function getSyncedContacts(peerId) {
-  if (memoryContactLists.has(peerId)) return memoryContactLists.get(peerId);
+  if (memoryContactLists.has(peerId)) return addSystemContacts(peerId, memoryContactLists.get(peerId));
   let stored = null;
   if (redis) stored = await redis.get(contactListKey(peerId));
   if (upstashRestEnabled) stored = await upstashCommand(["GET", contactListKey(peerId)]);
-  if (!stored) return [];
+  if (!stored) return addSystemContacts(peerId, []);
   const contacts = sanitizeSyncedContacts(JSON.parse(stored), peerId);
   memoryContactLists.set(peerId, contacts);
-  return contacts;
+  return addSystemContacts(peerId, contacts);
+}
+
+function cleanConfiguredPeerId(value) {
+  const peerId = String(value || "").trim();
+  return /^\d{6}$/.test(peerId) ? peerId : "";
+}
+
+function systemContactIds() {
+  return new Set([
+    cleanConfiguredPeerId(process.env.BOT_PEER_ID),
+    OFFICIAL_REELS_PEER_ID
+  ].filter(Boolean));
+}
+
+async function addSystemContacts(ownerId, contacts = []) {
+  const additions = new Set(systemContactIds());
+  if (ownerId === OFFICIAL_REELS_PEER_ID) {
+    for (const peerId of await getKnownPeerIds()) additions.add(peerId);
+  }
+  additions.delete(ownerId);
+  const existing = new Map(sanitizeSyncedContacts(contacts, ownerId).map((contact) => [contact.id, contact]));
+  for (const id of additions) {
+    if (existing.has(id)) continue;
+    const profile = await getProfile(id);
+    existing.set(id, sanitizeSyncedContact({
+      id,
+      name: profile?.displayName || (id === OFFICIAL_REELS_PEER_ID ? "Official Reels" : "Bypassium Support"),
+      remoteDisplayName: profile?.displayName || "",
+      remoteBadge: profile?.badge || (id === OFFICIAL_REELS_PEER_ID ? "Official" : "Support"),
+      accepted: true,
+      notifications: true,
+      updatedAt: new Date().toISOString()
+    }));
+  }
+  return [...existing.values()].slice(0, 1000);
 }
 
 // Stories expire after 24 hours; Reels remain available for a longer creator
