@@ -158,6 +158,8 @@ const server = http.createServer(async (request, response) => {
       storage: storageMode(),
       mediaStorage: r2Enabled ? "r2" : storageMode(),
       directMediaUploads: r2Enabled,
+      mediaUploadMaxBytes: mediaUploadMaxBytes(),
+      mediaUploadChunkBytes: r2Enabled ? R2_MEDIA_CHUNK_BYTES : MEDIA_CHUNK_BYTES,
       onlineClients: clients.size,
       supportBotConfigured,
       supportBotOnline: supportBotConfigured && Boolean(clients.get(supportBotId)?.size),
