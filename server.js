@@ -65,6 +65,7 @@ const DEFAULT_PRICING = Object.freeze({
 });
 let pricing = { ...DEFAULT_PRICING };
 const CALL_BLOCK_SECONDS = 60;
+const MAX_CALL_TOP_UP_BLOCKS = 180;
 const CALL_BILLING_TTL_SECONDS = 6 * 60 * 60;
 const STORY_TTL_SECONDS = 24 * 60 * 60;
 const SOCIAL_DRAFT_TTL_SECONDS = 30 * 24 * 60 * 60;
@@ -6547,7 +6548,7 @@ async function topUpCallBilling(socket, message = {}) {
   const peerId = getRegisteredSender(socket);
   const requestId = String(message.requestId || "");
   const callId = String(message.callId || "").trim().slice(0, 80);
-  const blocks = Math.max(1, Math.min(10, Math.round(Number(message.blocks) || 1)));
+  const blocks = Math.max(1, Math.min(MAX_CALL_TOP_UP_BLOCKS, Math.round(Number(message.blocks) || 1)));
   const session = await getCallBilling(callId);
   if (!peerId || !session || !session.participants.has(peerId)) return send(socket, { type: "call-billing-top-up-result", requestId, ok: false, message: "That active call could not be found." });
   try {
