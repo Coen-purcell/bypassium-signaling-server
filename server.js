@@ -5,7 +5,7 @@ import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import Redis from "ioredis";
 import { WebSocketServer } from "ws";
 
-const SERVER_VERSION = "5.5.14";
+const SERVER_VERSION = "5.5.15";
 const PORT = Number(process.env.PORT || 10000);
 const OFFLINE_MESSAGE_TTL_SECONDS = 90 * 24 * 60 * 60;
 const HISTORY_TTL_SECONDS = Number(process.env.HISTORY_TTL_SECONDS || 0);
@@ -543,6 +543,10 @@ async function readBinaryBody(request, maximumBytes) {
 
 const wss = new WebSocketServer({ server, maxPayload: MAX_WEBSOCKET_PAYLOAD_CHARS });
 
+wss.on("error", (error) => {
+  console.error("WebSocket server error:", safeOperationalError(error));
+});
+
 wss.on("connection", (socket, request) => {
   socket.bypassiumId = null;
   socket.publicKeyJwk = null;
@@ -638,6 +642,16 @@ wss.on("connection", (socket, request) => {
     }
   });
 
+  socket.on("error", (error) => {
+    // Oversized or malformed frames are client-scoped failures. Handling the
+    // EventEmitter error prevents one upload from terminating the Node process.
+    console.warn("WebSocket client error", JSON.stringify({
+      peerId: socket.bypassiumId || "unregistered",
+      remoteAddress: socket.remoteAddress || "unknown",
+      error: safeOperationalError(error)
+    }));
+    unregisterClient(socket);
+  });
   socket.on("close", () => unregisterClient(socket));
 });
 
