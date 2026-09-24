@@ -5,7 +5,7 @@ import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import Redis from "ioredis";
 import { WebSocketServer } from "ws";
 
-const SERVER_VERSION = "5.5.15";
+const SERVER_VERSION = "5.5.16";
 const PORT = Number(process.env.PORT || 10000);
 const OFFLINE_MESSAGE_TTL_SECONDS = 90 * 24 * 60 * 60;
 const HISTORY_TTL_SECONDS = Number(process.env.HISTORY_TTL_SECONDS || 0);
@@ -3179,6 +3179,9 @@ async function relayDirectMessage(socket, message) {
   }
 
   const messageId = message.messageId || randomUUID();
+  if (message.mutationKind === "message-delete" && message.mutationMessageId) {
+    await removeOwnedDirectMessageHistory(senderId, targetId, String(message.mutationMessageId));
+  }
   let attachmentTransaction = null;
   try {
     attachmentTransaction = await reserveAttachmentCharge(senderId, messageId, message.attachmentBytes, message.contentType);
@@ -3295,6 +3298,9 @@ async function relayGroupMessage(socket, message) {
   const recipients = Array.isArray(message.recipients) ? message.recipients : [];
   const sentAt = message.sentAt || new Date().toISOString();
   const messageId = message.messageId || randomUUID();
+  if (message.mutationKind === "message-delete" && message.mutationMessageId) {
+    await removeOwnedGroupMessageHistory(senderId, group, String(message.mutationMessageId));
+  }
   let attachmentTransaction = null;
   try {
     attachmentTransaction = await reserveAttachmentCharge(senderId, messageId, message.attachmentBytes, message.contentType);
@@ -3914,7 +3920,10 @@ async function searchAccounts(socket, message = {}) {
 }
 
 async function findPublicAccounts(query, limit = 18) {
-  if (!accountIndexHydrated) scheduleAccountIndexHydration();
+  if (!accountIndexHydrated) {
+    scheduleAccountIndexHydration();
+    if (accountIndexHydrationPromise) await accountIndexHydrationPromise;
+  }
   let entries = await getAccountSearchEntries();
   if (!entries.length) entries = await getQuickAddDirectoryEntries();
   const matches = [];
@@ -4611,6 +4620,38 @@ async function deleteHistoryMessage(peerId, historyId) {
   if (upstashRestEnabled) await upstashCommand(["DEL", historyMessageKey(peerId, historyId)]);
 }
 
+async function removeHistoryIds(peerId, predicate) {
+  if (!redis && !upstashRestEnabled) {
+    const history = memoryHistoryMessages.get(peerId) || [];
+    memoryHistoryMessages.set(peerId, history.filter((item) => !predicate(item)));
+    return;
+  }
+  const ids = await getHistoryIds(peerId);
+  const values = await getHistoryMessageValues(peerId, ids);
+  const kept = [];
+  for (let index = 0; index < ids.length; index += 1) {
+    let item = null;
+    try { item = values[index] ? JSON.parse(values[index]) : null; } catch {}
+    if (item && predicate(item)) await deleteHistoryMessage(peerId, ids[index]);
+    else kept.push(ids[index]);
+  }
+  await replaceHistoryIds(peerId, kept);
+}
+
+async function removeOwnedDirectMessageHistory(senderId, targetId, messageId) {
+  const senderHistory = await getHistoryMessages(senderId, maxHistoryMessagesPerUser() || 5000);
+  const owned = senderHistory.some((item) => item.messageId === messageId && item.historyDirection === "outbound" && item.from === senderId && item.historyPeerId === targetId);
+  if (!owned) throw new Error("Only the sender can delete this message for everyone.");
+  await Promise.all([senderId, targetId].map((peerId) => removeHistoryIds(peerId, (item) => item.messageId === messageId && item.historyKind === "direct")));
+}
+
+async function removeOwnedGroupMessageHistory(senderId, group, messageId) {
+  const senderHistory = await getHistoryMessages(senderId, maxHistoryMessagesPerUser() || 5000);
+  const owned = senderHistory.some((item) => item.messageId === messageId && item.historyDirection === "outbound" && item.from === senderId && item.groupId === group.id);
+  if (!owned) throw new Error("Only the sender can delete this group message for everyone.");
+  await Promise.all((group.members || []).map((peerId) => removeHistoryIds(peerId, (item) => item.messageId === messageId && item.historyKind === "group" && item.groupId === group.id)));
+}
+
 async function replaceHistoryIds(peerId, ids) {
   if (redis) {
     const key = historyIndexKey(peerId);
@@ -4746,7 +4787,7 @@ async function addSystemContacts(ownerId, contacts = []) {
     const profile = await getProfile(id);
     existing.set(id, sanitizeSyncedContact({
       id,
-      name: profile?.displayName || (id === OFFICIAL_REELS_PEER_ID ? "Official Reels" : "Bypassium Support"),
+      name: profile?.displayName || (id === OFFICIAL_REELS_PEER_ID ? "Official Reels" : "Your AI"),
       remoteDisplayName: profile?.displayName || "",
       remoteBadge: profile?.badge || (id === OFFICIAL_REELS_PEER_ID ? "Official" : "Support"),
       accepted: true,
