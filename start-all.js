@@ -52,7 +52,7 @@ function botIsConfigured() {
 }
 
 function missingBotConfig() {
-  const provider = String(process.env.AI_PROVIDER || "groq").toLowerCase();
+  const provider = String(process.env.AI_PROVIDER || (process.env.GROQ_API_KEY ? "groq" : "openai")).toLowerCase();
   const missing = [];
   if (!process.env.BOT_PEER_ID) missing.push("BOT_PEER_ID");
   if (!process.env.BOT_PASSWORD) missing.push("BOT_PASSWORD");
