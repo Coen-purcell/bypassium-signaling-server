@@ -944,7 +944,7 @@ async function handleAdminApi(request, response, url, corsHeaders) {
       const walletPeerId = cleanPeerId(body.peerId);
       const delta = Number(body.delta);
       const reason = String(body.reason || "").replace(/\s+/g, " ").trim().slice(0, 240);
-      if (!walletPeerId || !Number.isSafeInteger(delta) || delta === 0 || Math.abs(delta) > 1_000_000 || !reason) {
+      if (!walletPeerId || !Number.isSafeInteger(delta) || delta === 0 || !reason) {
         sendJson(response, 400, { ok: false, message: "Choose an account, enter a whole non-zero amount, and provide a reason." }, corsHeaders);
         return;
       }
@@ -1744,8 +1744,8 @@ function adminPageHtml() {
     .row:hover { border-color:color-mix(in srgb,var(--accent),white 18%); }
     .group-row { grid-template-columns:minmax(0,1fr) auto; }
     .account-open { min-width:0; display:grid; grid-template-columns:46px minmax(0,1fr); align-items:center; gap:10px; padding:0; border-radius:0; color:var(--text); background:transparent; box-shadow:none; text-align:left; }
-    .avatar { width:46px; height:46px; border-radius:15px; overflow:hidden; display:grid; place-items:center; color:white; font-weight:1000; background:linear-gradient(145deg,var(--accent),var(--accent2)); }
-    .avatar img { width:100%; height:100%; object-fit:cover; }
+    .avatar { width:46px; height:46px; border-radius:50%; overflow:hidden; display:grid; place-items:center; color:white; font-weight:1000; background:linear-gradient(145deg,var(--accent),var(--accent2)); flex:0 0 auto; align-self:center; }
+    .avatar img { display:block; width:100%; height:100%; border-radius:50%; object-fit:cover; object-position:center; }
     .account-open strong,.account-open small { display:block; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
     .account-open small { color:var(--muted); margin-top:3px; }
     .badge { display:inline-flex; align-items:center; min-height:25px; border-radius:999px; padding:3px 9px; font-size:12px; font-weight:900; color:var(--text); border:1px solid var(--line); background:rgb(255 255 255 / .07); }
@@ -1753,7 +1753,7 @@ function adminPageHtml() {
     .badge.bad { color:white; background:var(--danger); border-color:transparent; }
     .badge.ok { color:#042016; background:var(--ok); border-color:transparent; }
     .detail-head { display:flex; align-items:center; gap:14px; }
-    .detail-head .avatar { width:72px; height:72px; border-radius:24px; font-size:28px; }
+    .detail-head .avatar { width:72px; height:72px; border-radius:50%; font-size:28px; }
     .profile-edit { display:grid; grid-template-columns:86px minmax(0,1fr); gap:12px; align-items:start; }
     .profile-preview { width:86px; height:86px; border-radius:24px; font-size:32px; }
     .info-grid { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:9px; }
@@ -3158,10 +3158,14 @@ async function deleteAccount(socket, message = {}) {
     sendAccountResponse(socket, message, false, "Password confirmation failed.");
     return;
   }
-  await deleteAccountData(peerId);
-  await revokePeerSessions(peerId);
+  const result = await deleteAccountBySupport(peerId, { disconnect: false });
+  if (!result.cleaned) {
+    sendAccountResponse(socket, message, false, "The account could not be fully deleted. Try again or contact support.");
+    return;
+  }
   void recordSafetyLog("account-deleted-by-owner", peerId, { remoteAddress: socket.remoteAddress }).catch((error) => console.error("Safety log write failed:", error.message));
   sendAccountResponse(socket, message, true, "Account deleted.");
+  setTimeout(() => disconnectPeer(peerId, "This account was deleted."), 50);
 }
 
 // Relays encrypted message envelopes or queues them until the receiver reconnects.
@@ -4753,14 +4757,30 @@ async function setSyncedContacts(peerId, contacts = []) {
 }
 
 async function getSyncedContacts(peerId) {
-  if (memoryContactLists.has(peerId)) return addSystemContacts(peerId, memoryContactLists.get(peerId));
+  if (memoryContactLists.has(peerId)) return addSystemContacts(peerId, await pruneDeletedSyncedContacts(peerId, memoryContactLists.get(peerId)));
   let stored = null;
   if (redis) stored = await redis.get(contactListKey(peerId));
   if (upstashRestEnabled) stored = await upstashCommand(["GET", contactListKey(peerId)]);
   if (!stored) return addSystemContacts(peerId, []);
   const contacts = sanitizeSyncedContacts(JSON.parse(stored), peerId);
   memoryContactLists.set(peerId, contacts);
-  return addSystemContacts(peerId, contacts);
+  return addSystemContacts(peerId, await pruneDeletedSyncedContacts(peerId, contacts));
+}
+
+async function pruneDeletedSyncedContacts(ownerId, contacts = []) {
+  const systemIds = systemContactIds();
+  const checked = await Promise.all(sanitizeSyncedContacts(contacts, ownerId).map(async (contact) => {
+    if (systemIds.has(contact.id)) return contact;
+    const [account, profile, publicKey] = await Promise.all([
+      getAccount(contact.id),
+      getProfile(contact.id),
+      getPublicKey(contact.id)
+    ]);
+    return account || profile || publicKey ? contact : null;
+  }));
+  const active = checked.filter(Boolean);
+  if (active.length !== contacts.length) await setSyncedContacts(ownerId, active);
+  return active;
 }
 
 function cleanConfiguredPeerId(value) {
@@ -4770,8 +4790,7 @@ function cleanConfiguredPeerId(value) {
 
 function systemContactIds() {
   return new Set([
-    cleanConfiguredPeerId(process.env.BOT_PEER_ID),
-    OFFICIAL_REELS_PEER_ID
+    cleanConfiguredPeerId(process.env.BOT_PEER_ID)
   ].filter(Boolean));
 }
 
@@ -4781,7 +4800,10 @@ async function addSystemContacts(ownerId, contacts = []) {
     for (const peerId of await getKnownPeerIds()) additions.add(peerId);
   }
   additions.delete(ownerId);
-  const existing = new Map(sanitizeSyncedContacts(contacts, ownerId).map((contact) => [contact.id, contact]));
+  const visibleContacts = sanitizeSyncedContacts(contacts, ownerId).filter((contact) => (
+    ownerId === OFFICIAL_REELS_PEER_ID || contact.id !== OFFICIAL_REELS_PEER_ID
+  ));
+  const existing = new Map(visibleContacts.map((contact) => [contact.id, contact]));
   for (const id of additions) {
     if (existing.has(id)) continue;
     const profile = await getProfile(id);
@@ -5101,7 +5123,7 @@ async function removeWalletForDeletedAccount(peerId) {
   if (upstashRestEnabled) await upstashCommand(["DEL", walletKey(peerId), walletTransactionIndexKey(peerId)]);
 }
 
-async function deleteAccountBySupport(peerId) {
+async function deleteAccountBySupport(peerId, { disconnect = true } = {}) {
   const clean = cleanPeerId(peerId);
   if (!clean) return { peerId: "", existed: false, cleaned: false };
   const existed = await accountHasAdminFootprint(clean, { includeLiveClient: true });
@@ -5110,9 +5132,16 @@ async function deleteAccountBySupport(peerId) {
   await revokePeerSessions(clean);
   await removeAccountRestriction(clean);
   await consumeOwnerResetCode(clean);
-  disconnectPeer(clean, "This account was deleted by support.");
+  broadcastAccountDeleted(clean);
+  if (disconnect) disconnectPeer(clean, "This account was deleted by support.");
   const remaining = await accountHasAdminFootprint(clean);
   return { peerId: clean, existed, cleaned: !remaining };
+}
+
+function broadcastAccountDeleted(peerId) {
+  for (const sockets of clients.values()) {
+    for (const client of sockets) send(client, { type: "account-deleted", peerId });
+  }
 }
 
 async function accountHasAdminFootprint(peerId, { includeLiveClient = false } = {}) {
